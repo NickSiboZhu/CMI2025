@@ -1,0 +1,99 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyTorch
+*.pth
+*.pt
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Environment variables
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# VS Code
+.vscode/
+.vscode-server/
+
+# Data files (large datasets)
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# Model outputs and logs
+*.log
+*.out
+outputs/*.png
+outputs/*.jpg
+outputs/*.json
+outputs/*.pkl
+development/outputs/*.png
+development/outputs/*.jpg
+development/outputs/*.json
+development/outputs/*.pkl
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Parent directory files (exclude everything from parent dirs)
+../../../*
+
+# ModelArts and cloud platform files
+.ma/
+.modelarts/
+.mag_logs/
+.hat_logs/
+.ml-workspace/
+.ossutilconfig
+.virtual_documents/
+.lsp_symlink
+
+# Other user directories (don't track other users' work)
+../../../*/
+
+# Cache and logs
+*.cache
+logs/ 
