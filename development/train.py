@@ -31,7 +31,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Import our model and data preprocessing
 from models.cnn import Simple1DCNN, GestureDataset
-from data.data_preprocessing import prepare_data_kfold, prepare_data_single_split
+from data.data_preprocessing import (
+    prepare_data_kfold,
+    prepare_data_single_split,
+)
 
 
 def setup_device(gpu_id=None):
@@ -152,7 +155,7 @@ def validate_epoch(model, dataloader, criterion, device):
     return avg_loss, accuracy
 
 
-def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001, device='cpu'):
+def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
     """Train the model with validation"""
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -184,7 +187,8 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), 'development/outputs/best_model.pth')
+            ckpt_name = f'development/outputs/best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth'
+            torch.save(model.state_dict(), ckpt_name)
             patience_counter = 0
         else:
             patience_counter += 1
@@ -207,7 +211,8 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
             break
     
     # Load best model
-    model.load_state_dict(torch.load('development/outputs/best_model.pth'))
+    ckpt_name = f'development/outputs/best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth'
+    model.load_state_dict(torch.load(ckpt_name))
     
     history = {
         'train_loss': train_losses,
@@ -279,7 +284,7 @@ def plot_training_history(history, save_path='training_history.png'):
     print(f"Training history plot saved to {save_path}")
 
 
-def train_single_model(epochs=50, learning_rate=0.001, device=None):
+def train_single_model(epochs=50, learning_rate=0.001, device=None, variant: str = 'full'):
     """Train a single model with single train/val split"""
     print("🎯 TRAINING SINGLE MODEL")
     print("="*60)
@@ -290,7 +295,7 @@ def train_single_model(epochs=50, learning_rate=0.001, device=None):
     
     # Prepare data
     print("Preparing data for single model training...")
-    X_train, X_val, y_train, y_val, label_encoder = prepare_data_single_split()
+    X_train, X_val, y_train, y_val, label_encoder = prepare_data_single_split(variant)
     
     # Model parameters
     input_channels = X_train.shape[2]
@@ -323,23 +328,24 @@ def train_single_model(epochs=50, learning_rate=0.001, device=None):
     
     # Train model
     print("\nTraining model...")
-    history = train_model(model, train_loader, val_loader, epochs, learning_rate, device)
+    history = train_model(model, train_loader, val_loader, epochs, learning_rate, device, variant)
     
     # Evaluate model
     print("\nEvaluating model...")
     y_pred, y_true = evaluate_model(model, val_loader, label_encoder, device)
     
     # Plot training history
-    plot_training_history(history, 'development/outputs/single_model_history.png')
+    plot_training_history(history, f'development/outputs/single_model_history_{variant}.png')
     
     # Save final model
-    torch.save(model.state_dict(), 'development/outputs/single_model.pth')
-    print("\nModel saved as 'development/outputs/single_model.pth'")
+    model_path = f'development/outputs/single_model_{variant}.pth'
+    torch.save(model.state_dict(), model_path)
+    print(f"\nModel saved as '{model_path}'")
     
     return model, history
 
 
-def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False, device=None):
+def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False, device=None, variant: str = 'full'):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -350,7 +356,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         device = setup_device()
     
     # Prepare all folds
-    fold_data, label_encoder = prepare_data_kfold(show_stratification=show_stratification)
+    fold_data, label_encoder = prepare_data_kfold(show_stratification=show_stratification, variant=variant)
     
     # Model parameters (same for all folds)
     input_channels = fold_data[0]['X_train'].shape[2]
@@ -400,7 +406,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
             print(f"\nTraining fold {fold_idx + 1}...")
             history = train_model(
                 model, train_loader, val_loader, 
-                epochs=epochs, learning_rate=learning_rate, device=device
+                epochs=epochs, learning_rate=learning_rate, device=device, variant=variant, fold_tag=f'_{fold_idx+1}'
             )
             
         except RuntimeError as e:
@@ -420,7 +426,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
                 print(f"Retrying training on CPU with batch_size=8...")
                 history = train_model(
                     model, train_loader, val_loader, 
-                    epochs=epochs, learning_rate=learning_rate, device=device_fallback
+                    epochs=epochs, learning_rate=learning_rate, device=device_fallback, variant=variant, fold_tag=f'_{fold_idx+1}'
                 )
                 device = device_fallback  # Update device for evaluation
             else:
@@ -435,7 +441,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         best_val_acc = max(history['val_accuracy'])
         
         # Save model for this fold
-        model_filename = f'development/outputs/model_fold_{fold_idx + 1}.pth'
+        model_filename = f'development/outputs/model_fold_{fold_idx + 1}_{variant}.pth'
         torch.save(model.state_dict(), model_filename)
         print(f"Model saved as '{model_filename}'")
         
@@ -474,8 +480,9 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
     
     # Copy best model as the main model
     best_model_filename = fold_results[best_fold_idx]['model_filename']
-    shutil.copy(best_model_filename, 'development/outputs/best_model.pth')
-    print(f"Best model copied to 'development/outputs/best_model.pth'")
+    dest_best = f'development/outputs/best_model_{variant}.pth'
+    shutil.copy(best_model_filename, dest_best)
+    print(f"Best model copied to '{dest_best}'")
     
     # Save summary
     summary = {
@@ -488,9 +495,9 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         'best_fold_acc': float(best_accs[best_fold_idx])
     }
     
-    with open('development/outputs/kfold_summary.json', 'w') as f:
+    with open(f'development/outputs/kfold_summary_{variant}.json', 'w') as f:
         json.dump(summary, f, indent=2)
-    print("Summary saved to 'development/outputs/kfold_summary.json'")
+    print(f"Summary saved to 'development/outputs/kfold_summary_{variant}.json'")
     
     return fold_models, fold_histories, fold_results
 
@@ -503,6 +510,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--gpu', type=int, help='Specific GPU ID to use')
+    parser.add_argument('--variant', choices=['full', 'imu'], default='full', help='Sensor variant to train (full or imu-only)')
     
     args = parser.parse_args()
     
@@ -514,7 +522,8 @@ def main():
         model, history = train_single_model(
             epochs=args.epochs, 
             learning_rate=args.lr, 
-            device=device
+            device=device,
+            variant=args.variant,
         )
         print("✅ Single model training completed!")
         return model, history
@@ -523,7 +532,8 @@ def main():
             epochs=args.epochs, 
             learning_rate=args.lr, 
             show_stratification=args.stratification,
-            device=device
+            device=device,
+            variant=args.variant,
         )
         print("✅ 5-fold cross-validation training completed!")
         return fold_models, fold_histories, fold_results

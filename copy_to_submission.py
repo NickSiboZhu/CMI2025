@@ -19,45 +19,20 @@ def copy_models_to_submission():
     # Ensure destination directory exists
     dest_dir.mkdir(parents=True, exist_ok=True)
     
-    # Files to copy
-    files_to_copy = [
-        "best_model.pth",
-        "model_fold_1.pth", 
-        "model_fold_2.pth",
-        "model_fold_3.pth", 
-        "model_fold_4.pth",
-        "model_fold_5.pth",
-        "label_encoder.pkl",
-        "scaler.pkl"
-    ]
-    
-    copied_files = []
-    missing_files = []
-    
-    for filename in files_to_copy:
-        source_file = source_dir / filename
-        dest_file = dest_dir / filename
-        
-        if source_file.exists():
-            shutil.copy2(source_file, dest_file)
-            copied_files.append(filename)
-            print(f"✅ Copied {filename}")
-        else:
-            missing_files.append(filename)
-            print(f"⚠️  Missing {filename}")
-    
-    print(f"\n📊 Summary:")
-    print(f"  Copied: {len(copied_files)} files")
-    print(f"  Missing: {len(missing_files)} files")
-    
-    if missing_files:
-        print(f"\n💡 Missing files: {missing_files}")
-        print("   Run training first: cd development && python train.py --epochs 1")
-    
-    if copied_files:
-        print(f"\n🎯 Submission ready! Files in: {dest_dir}")
-    
-    return len(copied_files) > 0
+    # Collect all .pth & .pkl objects lying in outputs/ (handles _full / _imu suffixes)
+    files_to_copy = list(source_dir.glob("*.pth")) + list(source_dir.glob("*.pkl"))
+
+    if not files_to_copy:
+        print("⚠️  No weight or preprocessing files found in development/outputs.")
+        return False
+
+    for src in files_to_copy:
+        dst = dest_dir / src.name
+        shutil.copy2(src, dst)
+        print(f"✅ Copied {src.name}")
+
+    print(f"\n🎯 Submission ready! Copied {len(files_to_copy)} files → {dest_dir}")
+    return True
 
 if __name__ == "__main__":
     success = copy_models_to_submission()

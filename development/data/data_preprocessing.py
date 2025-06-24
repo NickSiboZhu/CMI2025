@@ -4,9 +4,15 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 import pickle
 
-def load_and_preprocess_data():
+def load_and_preprocess_data(variant: str = "full"):
     """
-    Load training data and demographics, preprocess for 1D CNN
+    Load training data and demographics, preprocess for 1D CNN.
+
+    Args:
+        variant (str): Sensor variant to build. "full" keeps all features; 
+                        "imu" drops thermopile (thm_*) and time-of-flight (tof__*) columns so
+                        that a model trained on IMU-only data can generalise to test sequences
+                        where those sensors are absent.
     """
     print("Loading data...")
     
@@ -31,10 +37,15 @@ def load_and_preprocess_data():
     train_df['gesture_encoded'] = label_encoder.fit_transform(train_df['gesture'])
     
     # Get feature columns (exclude metadata and target)
-    metadata_cols = ['row_id',  'sequence_id', 'sequence_type', 'sequence_counter', 
+    metadata_cols = ['row_id',  'sequence_id', 'sequence_type', 'sequence_counter',
                      'subject', 'orientation', 'behavior', 'phase', 'gesture', 'gesture_encoded']
     feature_cols = [col for col in train_df.columns if col not in metadata_cols]
-    
+
+    # Optionally drop THM / TOF sensors for IMU-only variant
+    if variant == "imu":
+        feature_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
+
+    print(f"Variant: {variant}. Feature columns after filtering: {len(feature_cols)}")
     print(f"\nFeature columns: {len(feature_cols)}")
     print(f"Sample features: {feature_cols[:10]}")
     
@@ -135,11 +146,11 @@ def normalize_features(X_train, X_val):
     
     return X_train_normalized, X_val_normalized, scaler
 
-def prepare_data_single_split():
+def prepare_data_single_split(variant: str = "full"):
     """
     Prepare data with single train/val split (for quick testing)
     """
-    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data()
+    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data(variant)
     
     seq_lengths = [len(seq) for seq in sequences]
     max_length = 100  # Fixed length - keeps the critical END part of gestures
@@ -159,15 +170,17 @@ def prepare_data_single_split():
     
     X_train, X_val, scaler = normalize_features(X_train, X_val)
     
-    # Save preprocessing objects
-    with open('development/outputs/label_encoder.pkl', 'wb') as f:
+    # Save preprocessing objects with variant suffix so that both models can coexist
+    le_path = f'development/outputs/label_encoder_{variant}.pkl'
+    scaler_path = f'development/outputs/scaler_{variant}.pkl'
+    with open(le_path, 'wb') as f:
         pickle.dump(label_encoder, f)
-    with open('development/outputs/scaler.pkl', 'wb') as f:
+    with open(scaler_path, 'wb') as f:
         pickle.dump(scaler, f)
     
     return X_train, X_val, y_train, y_val, label_encoder
 
-def prepare_data_kfold(show_stratification=False):
+def prepare_data_kfold(show_stratification=False, variant: str = "full"):
     """
     Prepare data for 5-fold cross-validation
     Returns all folds for training 5 different models
@@ -176,7 +189,7 @@ def prepare_data_kfold(show_stratification=False):
         show_stratification (bool): If True, show detailed stratification analysis
     """
     # Load and preprocess
-    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data()
+    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data(variant)
     
     # Pad sequences (use fixed length of 100, keeping the critical END part)
     seq_lengths = [len(seq) for seq in sequences]
@@ -272,10 +285,12 @@ def prepare_data_kfold(show_stratification=False):
         })
     
     # Save preprocessing objects (using fold 0's scaler as default)
-    with open('development/outputs/label_encoder.pkl', 'wb') as f:
+    le_path = f'development/outputs/label_encoder_{variant}.pkl'
+    scaler_path = f'development/outputs/scaler_{variant}.pkl'
+    with open(le_path, 'wb') as f:
         pickle.dump(label_encoder, f)
-    
-    with open('development/outputs/scaler.pkl', 'wb') as f:
+
+    with open(scaler_path, 'wb') as f:
         pickle.dump(fold_data[0]['scaler'], f)  # Use first fold's scaler as default
     
     print(f"\n✅ Prepared {len(fold_data)} folds for cross-validation")
@@ -284,11 +299,11 @@ def prepare_data_kfold(show_stratification=False):
     return fold_data, label_encoder
 
 # Backward compatibility
-def prepare_data():
+def prepare_data(variant: str = "full"):
     """
-    Default function - returns single split for backward compatibility
+    Backward-compatibility wrapper: returns single split for requested variant
     """
-    return prepare_data_single_split()
+    return prepare_data_single_split(variant)
 
 if __name__ == "__main__":
     X_train, X_val, y_train, y_val, label_encoder = prepare_data()
