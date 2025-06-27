@@ -25,6 +25,7 @@ import shutil
 import argparse
 import sys
 import os
+import pickle
 
 # Add current directory to Python path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -444,6 +445,19 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         model_filename = f'development/outputs/model_fold_{fold_idx + 1}_{variant}.pth'
         torch.save(model.state_dict(), model_filename)
         print(f"Model saved as '{model_filename}'")
+        
+        # Save the scaler corresponding to this fold for inference pairing
+        scaler_fold = fold['scaler']
+        
+        # Create outputs directory if it doesn't exist
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        outputs_dir = os.path.join(current_dir, 'outputs')
+        os.makedirs(outputs_dir, exist_ok=True)
+        
+        scaler_filename = os.path.join(outputs_dir, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(scaler_filename, 'wb') as f:
+            pickle.dump(scaler_fold, f)
+        print(f"Scaler saved as '{scaler_filename}'")
         
         # Store results
         fold_results.append({

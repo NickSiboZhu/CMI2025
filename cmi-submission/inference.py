@@ -22,7 +22,7 @@ CMI – Detect Behavior with Sensor Data
 import os
 import pickle
 import warnings
-from typing import List
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -40,6 +40,7 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 # ------------------ 自定义模块 ------------------
 from models.cnn import Simple1DCNN, GestureDataset
 from data.data_preprocessing import pad_sequences
+from data.tof_utils import interpolate_tof_row, get_tof_columns
 
 # ------------------ 全局资源加载 ------------------
 # We support two variants: "full" (uses THM/TOF sensors) and "imu" (IMU-only).
@@ -49,24 +50,42 @@ MAP_NON_TARGET = "Drink from bottle/cup"
 SEQ_LEN        = 100          # 与训练保持一致
 
 def _load_preprocessing_objects(variant: str):
-    """Load label encoder & scaler for the given variant."""
-    le_path     = os.path.join(WEIGHT_DIR, f"label_encoder_{variant}.pkl")
-    scaler_path = os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl")
+    """Load label encoder and (optionally) a scaler for the given variant.
 
-    # Back-compat: fall back to un-suffixed filenames if variant files not found
+    A scaler file is no longer required because we load per-fold scalers later.
+    We attempt to load one for backward compatibility but simply return None if it
+    does not exist.
+    """
+    le_path = os.path.join(WEIGHT_DIR, f"label_encoder_{variant}.pkl")
     if not os.path.exists(le_path):
+        # Fallback to generic file name (old submissions)
         le_path = os.path.join(WEIGHT_DIR, "label_encoder.pkl")
-    if not os.path.exists(scaler_path):
-        scaler_path = os.path.join(WEIGHT_DIR, "scaler.pkl")
 
     with open(le_path, "rb") as f:
         le = pickle.load(f)
-    with open(scaler_path, "rb") as f:
-        scaler = pickle.load(f)
+
+    # Try to load an accompanying scaler but don't fail if it's missing
+    possible_scalers = [
+        os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl"),
+        os.path.join(WEIGHT_DIR, "scaler.pkl"),
+    ]
+    scaler = None
+    for path in possible_scalers:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                scaler = pickle.load(f)
+            break
+
     return le, scaler
 
-def _load_models(device, in_channels, num_classes, variant: str) -> List[torch.nn.Module]:
-    models = []
+def _load_models(device, num_classes, variant: str) -> List[Tuple[torch.nn.Module, "StandardScaler"]]:
+    """Load models together with their matching scaler.
+
+    Returns a list of (model, scaler) tuples so that each model gets the
+    exact feature scaling it was trained with (Option B). For single-model
+    variants we still return a one-element list.
+    """
+    pairs = []
 
     # 搜索 5-fold 文件
     fold_paths = [
@@ -77,10 +96,28 @@ def _load_models(device, in_channels, num_classes, variant: str) -> List[torch.n
     if fold_paths:
         print(f"🧩  [{variant}] Detected {len(fold_paths)} fold models → ensemble")
         for p in fold_paths:
+            basename = os.path.basename(p)
+            # Derive fold number to locate matching scaler
+            # Pattern: model_fold_{i}_{variant}.pth
+            parts = basename.split("_")
+            try:
+                fold_num = int(parts[2])  # parts: ['model','fold','{i}','{variant}.pth']
+            except (IndexError, ValueError):
+                raise ValueError(f"Unexpected model filename format: {basename}")
+
+            scaler_path = os.path.join(WEIGHT_DIR, f"scaler_fold_{fold_num}_{variant}.pkl")
+            if not os.path.exists(scaler_path):
+                raise FileNotFoundError(f"Expected scaler file '{scaler_path}' for model '{basename}' not found.")
+
+            with open(scaler_path, "rb") as f:
+                scaler = pickle.load(f)
+
+            in_channels = scaler.mean_.shape[0]
             m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
             m.load_state_dict(torch.load(p, map_location=device))
             m.to(device).eval()
-            models.append(m)
+
+            pairs.append((m, scaler))
     else:
         single = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
         if not os.path.exists(single):
@@ -88,12 +125,22 @@ def _load_models(device, in_channels, num_classes, variant: str) -> List[torch.n
                 f"No model weights found for variant '{variant}' in weights/"
             )
         print(f"🧩  [{variant}] Using single model {os.path.basename(single)}")
+
+        # Load single scaler
+        scaler_path = os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl")
+        if not os.path.exists(scaler_path):
+            scaler_path = os.path.join(WEIGHT_DIR, "scaler.pkl")
+        with open(scaler_path, "rb") as f:
+            scaler = pickle.load(f)
+
+        in_channels = scaler.mean_.shape[0]
         m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
         m.load_state_dict(torch.load(single, map_location=device))
         m.to(device).eval()
-        models.append(m)
 
-    return models
+        pairs.append((m, scaler))
+
+    return pairs
 
 print("🔧  Initialising inference resources …")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -102,17 +149,18 @@ VARIANTS = ["full", "imu"]
 RESOURCES = {}
 
 for v in VARIANTS:
-    le, scaler = _load_preprocessing_objects(v)
-    in_channels = scaler.mean_.shape[0]
+    le, _ = _load_preprocessing_objects(v)  # scaler is optional / unused here
     num_classes = len(le.classes_)
-    models = _load_models(DEVICE, in_channels, num_classes, v)
+    model_scaler_pairs = _load_models(DEVICE, num_classes, v)
+
+    # Use the first scaler just to extract in_channels for bookkeeping
+    in_channels = model_scaler_pairs[0][1].mean_.shape[0]
 
     RESOURCES[v] = {
         "label_encoder": le,
-        "scaler": scaler,
         "in_channels": in_channels,
         "num_classes": num_classes,
-        "models": models,
+        "model_scaler_pairs": model_scaler_pairs,
     }
 
 print("✅  Models / Scalers / LabelEncoders for all variants loaded. Ready.")
@@ -177,16 +225,26 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
         feat_cols = [c for c in feat_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
 
     seq_df[feat_cols] = seq_df[feat_cols].replace(-1.0, np.nan)
-    for c in feat_cols:
-        seq_df[c] = seq_df[c].fillna(seq_df[c].median())
 
-    # ---- build padded tensor
+    # 2-D interpolation for TOF sensor grids (per row) – skip if IMU variant
+    if variant != "imu":
+        tof_mapping = get_tof_columns()
+        if any(col in seq_df.columns for cols in tof_mapping.values() for col in cols):
+            seq_df = seq_df.apply(lambda r: interpolate_tof_row(r, tof_mapping), axis=1)
+
+    # Ensure chronological order before temporal interpolation
+    seq_df = seq_df.sort_values("sequence_counter")
+
+    # Linear interpolation forward/backward along the time axis
+    seq_df[feat_cols] = seq_df[feat_cols].interpolate(method="linear", limit_direction="both")
+
+    # Fallback to median for any column still containing NaN, then 0 as a last resort
+    seq_df[feat_cols] = seq_df[feat_cols].fillna(seq_df[feat_cols].median())
+    seq_df[feat_cols] = seq_df[feat_cols].fillna(0)
+
+    # ---- build padded tensor (unscaled)
     arr = seq_df.sort_values("sequence_counter")[feat_cols].to_numpy()
     arr = pad_sequences([arr], max_length=SEQ_LEN)[0]  # (L, F)
-
-    scaler = RESOURCES[variant]["scaler"]
-    in_channels = RESOURCES[variant]["in_channels"]
-    arr = scaler.transform(arr.reshape(-1, in_channels)).reshape(1, SEQ_LEN, in_channels)
 
     return variant, arr.astype(np.float32)
 
@@ -194,30 +252,29 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
 # ------------------ 预测逻辑 ------------------
 def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     """
-    Kaggle 评测机会多次调用此函数，每次一条 sequence。
+    Entry point that Kaggle calls for each sequence.
     """
     if sequence.is_empty():
         return MAP_NON_TARGET
 
-    variant, X = preprocess_single_sequence(sequence, demographics)
+    variant, arr = preprocess_single_sequence(sequence, demographics)
 
     res      = RESOURCES[variant]
     le       = res["label_encoder"]
-    models   = res["models"]
+    pairs    = res["model_scaler_pairs"]  # List[(model, scaler)]
     num_cls  = res["num_classes"]
 
-    ds = GestureDataset(X, np.zeros(1))
-    dl = DataLoader(ds, batch_size=1, shuffle=False)
-
-    # 多模型平均
     with torch.no_grad():
         probs_sum = np.zeros((1, num_cls))
-        for model in models:
-            for xb, _ in dl:
-                xb = xb.to(DEVICE)
-                probs = torch.softmax(model(xb), dim=1).cpu().numpy()
-                probs_sum += probs
-        probs = probs_sum / len(models)
+        for model, scaler in pairs:
+            in_channels = scaler.mean_.shape[0]
+            X_scaled = scaler.transform(arr.reshape(-1, in_channels)).reshape(1, SEQ_LEN, in_channels)
+
+            xb = torch.from_numpy(X_scaled).to(DEVICE)
+            probs = torch.softmax(model(xb), dim=1).cpu().numpy()
+            probs_sum += probs
+
+        probs = probs_sum / len(pairs)
 
     pred_idx = int(np.argmax(probs, axis=1)[0])
     label    = le.inverse_transform([pred_idx])[0]

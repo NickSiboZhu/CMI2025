@@ -3,6 +3,8 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 import pickle
+import os
+from .tof_utils import interpolate_tof_row, get_tof_columns
 
 def load_and_preprocess_data(variant: str = "full"):
     """
@@ -16,9 +18,15 @@ def load_and_preprocess_data(variant: str = "full"):
     """
     print("Loading data...")
     
-    # Load datasets - fix paths to point to development/data directory
-    train_df = pd.read_csv('development/data/train.csv')
-    demographics_df = pd.read_csv('development/data/train_demographics.csv')
+    # Get the directory of this file and construct absolute paths
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = current_dir  # This file is already in development/data/
+    
+    train_path = os.path.join(data_dir, 'train.csv')
+    demographics_path = os.path.join(data_dir, 'train_demographics.csv')
+    
+    train_df = pd.read_csv(train_path)
+    demographics_df = pd.read_csv(demographics_path)
     
     print(f"Train data shape: {train_df.shape}")
     print(f"Demographics shape: {demographics_df.shape}")
@@ -49,13 +57,37 @@ def load_and_preprocess_data(variant: str = "full"):
     print(f"\nFeature columns: {len(feature_cols)}")
     print(f"Sample features: {feature_cols[:10]}")
     
-    # Handle missing values
-    print("\nHandling missing values...")
+    # Handle missing values – interpolate inside each sequence along the time axis
+    print("\nHandling missing values (interpolating per sequence)...")
+
+    # Convert sentinel -1.0 to NaN first
     train_df[feature_cols] = train_df[feature_cols].replace(-1.0, np.nan)
-    
-    # For now, fill NaN with column median
-    for col in feature_cols:
-        train_df[col] = train_df[col].fillna(train_df[col].median())
+
+    # ------------------------------------------------------------
+    # Spatial interpolation for each TOF sensor (8×8 grid)
+    # ------------------------------------------------------------
+    # Skip TOF interpolation entirely for IMU-only variant to save time
+    if variant != "imu":
+        tof_mapping = get_tof_columns()
+        # Only run if any TOF columns present in the dataframe
+        if any(col in train_df.columns for cols in tof_mapping.values() for col in cols):
+            print("Applying 2-D interpolation to TOF grids …")
+            train_df = train_df.apply(lambda r: interpolate_tof_row(r, tof_mapping), axis=1)
+
+    # Ensure chronological order so interpolation is meaningful
+    train_df = train_df.sort_values(['sequence_id', 'sequence_counter'])
+
+    # Linear interpolation forward & backward **within each sequence**
+    train_df[feature_cols] = (
+        train_df.groupby('sequence_id')[feature_cols]
+                .transform(lambda x: x.interpolate(method='linear', limit_direction='both'))
+    )
+
+    # Fallback: column-wise median for any value still NaN (e.g., entire column NaN)
+    train_df[feature_cols] = train_df[feature_cols].fillna(train_df[feature_cols].median())
+
+    # Final safety net: replace any remaining NaN with 0
+    train_df[feature_cols] = train_df[feature_cols].fillna(0)
     
     # Group by sequence to create samples
     print("Grouping by sequence...")
@@ -170,13 +202,13 @@ def prepare_data_single_split(variant: str = "full"):
     
     X_train, X_val, scaler = normalize_features(X_train, X_val)
     
-    # Save preprocessing objects with variant suffix so that both models can coexist
-    le_path = f'development/outputs/label_encoder_{variant}.pkl'
-    scaler_path = f'development/outputs/scaler_{variant}.pkl'
+    # Create outputs directory if it doesn't exist
+    outputs_dir = os.path.join(os.path.dirname(current_dir), 'outputs')  # development/outputs/
+    os.makedirs(outputs_dir, exist_ok=True)
+    
+    le_path = os.path.join(outputs_dir, f'label_encoder_{variant}.pkl')
     with open(le_path, 'wb') as f:
         pickle.dump(label_encoder, f)
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(scaler, f)
     
     return X_train, X_val, y_train, y_val, label_encoder
 
@@ -285,13 +317,13 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
         })
     
     # Save preprocessing objects (using fold 0's scaler as default)
-    le_path = f'development/outputs/label_encoder_{variant}.pkl'
-    scaler_path = f'development/outputs/scaler_{variant}.pkl'
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    outputs_dir = os.path.join(os.path.dirname(current_dir), 'outputs')  # development/outputs/
+    os.makedirs(outputs_dir, exist_ok=True)
+    
+    le_path = os.path.join(outputs_dir, f'label_encoder_{variant}.pkl')
     with open(le_path, 'wb') as f:
         pickle.dump(label_encoder, f)
-
-    with open(scaler_path, 'wb') as f:
-        pickle.dump(fold_data[0]['scaler'], f)  # Use first fold's scaler as default
     
     print(f"\n✅ Prepared {len(fold_data)} folds for cross-validation")
     print("Each fold will train a separate model")
