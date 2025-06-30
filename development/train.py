@@ -26,6 +26,8 @@ import argparse
 import sys
 import os
 import pickle
+# from transformers import get_cosine_schedule_with_warmup
+from utils.scheduler import get_cosine_schedule_with_warmup
 
 # Add current directory to Python path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -105,7 +107,7 @@ def setup_device(gpu_id=None):
     return device
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None):
     """Train for one epoch"""
     model.train()
     total_loss = 0
@@ -120,6 +122,9 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         loss = criterion(output, target)
         loss.backward()
         optimizer.step()
+        
+        if scheduler is not None:
+            scheduler.step()
         
         total_loss += loss.item()
         pred = output.argmax(dim=1, keepdim=True)
@@ -159,13 +164,23 @@ def validate_epoch(model, dataloader, criterion, device):
 def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
     """Train the model with validation"""
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
+    
+    # Setup cosine schedule with warmup (10% warmup steps)
+    total_training_steps = epochs * len(train_loader)
+    warmup_steps = int(0.1 * total_training_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_training_steps,
+    )
     
     train_losses = []
     train_accuracies = []
     val_losses = []
     val_accuracies = []
+    # Track learning rate for each epoch so we can inspect the schedule later
+    lr_values = []
     
     best_val_acc = 0
     patience = 10
@@ -176,14 +191,15 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
     for epoch in range(epochs):
         start_time = time.time()
         
-        # Train
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        # Train (scheduler is stepped inside train_epoch)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scheduler)
         
         # Validate
         val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
         
-        # Step scheduler
-        scheduler.step(val_loss)
+        # Current learning rate (after scheduler step). Assumes single param group.
+        current_lr = optimizer.param_groups[0]['lr']
+        lr_values.append(current_lr)
         
         # Save best model
         if val_acc > best_val_acc:
@@ -204,7 +220,8 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
         
         print(f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): '
               f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
-              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, '
+              f'LR: {current_lr:.6f}')
         
         # Early stopping
         if patience_counter >= patience:
@@ -219,7 +236,8 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
         'train_loss': train_losses,
         'train_accuracy': train_accuracies,
         'val_loss': val_losses,
-        'val_accuracy': val_accuracies
+        'val_accuracy': val_accuracies,
+        'learning_rate': lr_values,
     }
     
     return history
