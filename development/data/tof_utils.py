@@ -1,69 +1,119 @@
+# This file is copied from development/data/tof_utils.py so that the submission
+# package is self-contained when uploaded to Kaggle.
+
 #!/usr/bin/env python3
-"""Utility functions for 2-D interpolation of 8×8 TOF sensor grids."""
+"""Utility functions for 2-D interpolation of the 8×8 TOF sensor grids."""
 import numpy as np
+import pandas as pd
+from scipy.interpolate import griddata
+from scipy.spatial import QhullError
 
 _TOF_SENSORS = [1, 2, 3, 4, 5]
 
 
 def get_tof_columns() -> dict:
-    """Return a dict mapping sensor_id -> column list names for the 64 pixels."""
+    """Return a mapping: sensor_id -> list of 64 column names (tof_X_v0 … v63)."""
     mapping = {}
     for sid in _TOF_SENSORS:
-        cols = [f"tof_{sid}_v{i}" for i in range(64)]
-        mapping[sid] = cols
+        mapping[sid] = [f"tof_{sid}_v{i}" for i in range(64)]
     return mapping
 
-
-def _interpolate_block(values: np.ndarray) -> np.ndarray:
-    """Interpolate a single 8×8 grid (values.shape == (64,)).
-
-    NaNs are filled by averaging valid 8-neighbour cells; repeat up to 3 passes.
-    Remaining NaNs are replaced by the median of the grid.
+def _interpolate_block(values: np.ndarray, replacement_value: int = 500) -> np.ndarray:
     """
-    grid = values.reshape(8, 8).astype(float)
-    mask = np.isnan(grid)
-    if not mask.any():
-        return values  # nothing to do
+    Handles complex data cleaning with added debugging for QhullError.
+    """
+    values = values.copy()
+    grid = values.astype(float).reshape(8, 8)
 
-    for _ in range(3):
-        new_grid = grid.copy()
-        for i in range(8):
-            for j in range(8):
-                if mask[i, j]:
-                    neigh = grid[max(0, i - 1): i + 2, max(0, j - 1): j + 2]
-                    neigh_valid = neigh[~np.isnan(neigh)]
-                    if neigh_valid.size:
-                        new_grid[i, j] = neigh_valid.mean()
-        grid = new_grid
-        mask = np.isnan(grid)
-        if not mask.any():
-            break
+    if np.all(np.isnan(grid)):
+        return values
 
-    # final fallback – median of valid pixels, else zero
+    grid[grid == -1] = replacement_value
+
+    nan_mask = np.isnan(grid)
+    if not nan_mask.any():
+        return grid.flatten()
+
+    x, y = np.mgrid[0:8, 0:8]
+    valid_points_coords = np.column_stack((x[~nan_mask], y[~nan_mask]))
+    valid_points_values = grid[~nan_mask]
+    
+    if valid_points_coords.shape[0] < 3:
+        points_to_interpolate = np.column_stack((x[nan_mask], y[nan_mask]))
+        interpolated_values = griddata(
+            valid_points_coords, valid_points_values, points_to_interpolate, method='nearest'
+        )
+    else:
+        points_to_interpolate = np.column_stack((x[nan_mask], y[nan_mask]))
+        try:
+            interpolated_values = griddata(
+                valid_points_coords, valid_points_values, points_to_interpolate, method='linear'
+            )
+            
+            nan_in_result_mask = np.isnan(interpolated_values)
+            if nan_in_result_mask.any():
+                nearest_values = griddata(
+                    valid_points_coords, valid_points_values, points_to_interpolate[nan_in_result_mask], method='nearest'
+                )
+                interpolated_values[nan_in_result_mask] = nearest_values
+
+        except QhullError:
+            # --- DEBUGGING BLOCK STARTS HERE ---
+            print("This error occurs when all valid points are collinear (on the same line).")
+            
+            # We print the grid state *before* interpolation is attempted.
+            # This is the grid after -1 has been replaced by large value.
+            print("Problematic 8x8 Grid (after -1 -> large value replacement):")
+            # Use numpy print options for better formatting
+            with np.printoptions(precision=1, suppress=True, linewidth=120):
+                print(grid)
+            
+            print("\nList of valid points' coordinates passed to the algorithm:")
+            print(valid_points_coords)
+            print("="*60 + "\n")
+            # --- DEBUGGING BLOCK ENDS HERE ---
+
+            # Fallback to nearest neighbor interpolation
+            interpolated_values = griddata(
+                valid_points_coords, valid_points_values, points_to_interpolate, method='nearest'
+            )
+
+    grid[nan_mask] = interpolated_values
+    
     if np.isnan(grid).any():
         median_val = np.nanmedian(grid)
-        if np.isnan(median_val):
-            median_val = 0.0
-        grid[np.isnan(grid)] = median_val
+        grid[np.isnan(grid)] = median_val if not np.isnan(median_val) else float(replacement_value)
 
-    return grid.reshape(-1)
+    return grid.flatten()
 
-
-def interpolate_tof_row(row, mapping=None):
-    """Interpolate all TOF sensor blocks within a pandas Series row.
-
-    Parameters
-    ----------
-    row : pandas.Series
-    mapping : dict sensor_id -> column list. If None will call get_tof_columns().
-    Returns the modified row (in-place modification for speed).
+def interpolate_tof(df: pd.DataFrame) -> pd.DataFrame:
     """
-    if mapping is None:
-        mapping = get_tof_columns()
+    An optimized processing function that operates on whole data blocks (sensors)
+    instead of row-by-row.
+    """
 
-    for sid, cols in mapping.items():
-        sub = row[cols]
-        if sub.isna().any():
-            arr = sub.to_numpy()
-            row[cols] = _interpolate_block(arr)
-    return row 
+    tof_mapping = get_tof_columns()
+    df_processed = df.copy()
+
+    print(f"Processing tof df for all {len(df)} rows...")
+    # Loop through the 5 sensors (this loop is fine, it only runs 5 times)
+    for sensor_id, cols in tof_mapping.items():
+        
+        
+        # 1. Extract the entire data block for the sensor at once.
+        # Shape will be (8000, 64)
+        sensor_data_block = df_processed[cols].to_numpy()
+        
+        # 2. Pre-allocate an array for the results
+        processed_block = np.empty_like(sensor_data_block, dtype=float)
+        
+        # 3. Loop over the NumPy array. This is MUCH faster than looping over a DataFrame.
+        for i in range(sensor_data_block.shape[0]):
+            processed_block[i, :] = _interpolate_block(sensor_data_block[i, :])
+            
+        # 4. Assign the processed data back to the DataFrame.
+        df_processed[cols] = processed_block
+
+    print("Interpolation complete.")
+    
+    return df_processed

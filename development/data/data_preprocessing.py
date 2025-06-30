@@ -4,7 +4,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 import pickle
 import os
-from .tof_utils import interpolate_tof_row, get_tof_columns
+from .tof_utils import interpolate_tof
 
 def load_and_preprocess_data(variant: str = "full"):
     """
@@ -61,18 +61,14 @@ def load_and_preprocess_data(variant: str = "full"):
     print("\nHandling missing values (interpolating per sequence)...")
 
     # Convert sentinel -1.0 to NaN first
-    train_df[feature_cols] = train_df[feature_cols].replace(-1.0, np.nan)
+    # train_df[feature_cols] = train_df[feature_cols].replace(-1.0, np.nan)
 
     # ------------------------------------------------------------
     # Spatial interpolation for each TOF sensor (8×8 grid)
     # ------------------------------------------------------------
     # Skip TOF interpolation entirely for IMU-only variant to save time
     if variant != "imu":
-        tof_mapping = get_tof_columns()
-        # Only run if any TOF columns present in the dataframe
-        if any(col in train_df.columns for cols in tof_mapping.values() for col in cols):
-            print("Applying 2-D interpolation to TOF grids …")
-            train_df = train_df.apply(lambda r: interpolate_tof_row(r, tof_mapping), axis=1)
+        train_df = interpolate_tof(train_df)
 
     # Ensure chronological order so interpolation is meaningful
     train_df = train_df.sort_values(['sequence_id', 'sequence_counter'])

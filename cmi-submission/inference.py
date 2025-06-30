@@ -40,7 +40,7 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 # ------------------ 自定义模块 ------------------
 from models.cnn import Simple1DCNN, GestureDataset
 from data.data_preprocessing import pad_sequences
-from data.tof_utils import interpolate_tof_row, get_tof_columns
+from data.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
 # We support two variants: "full" (uses THM/TOF sensors) and "imu" (IMU-only).
@@ -228,9 +228,7 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
 
     # 2-D interpolation for TOF sensor grids (per row) – skip if IMU variant
     if variant != "imu":
-        tof_mapping = get_tof_columns()
-        if any(col in seq_df.columns for cols in tof_mapping.values() for col in cols):
-            seq_df = seq_df.apply(lambda r: interpolate_tof_row(r, tof_mapping), axis=1)
+        seq_df = interpolate_tof(seq_df)
 
     # Ensure chronological order before temporal interpolation
     seq_df = seq_df.sort_values("sequence_counter")

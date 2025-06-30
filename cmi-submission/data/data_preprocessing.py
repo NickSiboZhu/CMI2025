@@ -3,16 +3,30 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 import pickle
+import os
+from .tof_utils import interpolate_tof
 
-def load_and_preprocess_data():
+def load_and_preprocess_data(variant: str = "full"):
     """
-    Load training data and demographics, preprocess for 1D CNN
+    Load training data and demographics, preprocess for 1D CNN.
+
+    Args:
+        variant (str): Sensor variant to build. "full" keeps all features; 
+                        "imu" drops thermopile (thm_*) and time-of-flight (tof__*) columns so
+                        that a model trained on IMU-only data can generalise to test sequences
+                        where those sensors are absent.
     """
     print("Loading data...")
     
-    # Load datasets
-    train_df = pd.read_csv('data/train.csv')
-    demographics_df = pd.read_csv('data/train_demographics.csv')
+    # Get the directory of this file and construct absolute paths
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = current_dir  # This file is already in development/data/
+    
+    train_path = os.path.join(data_dir, 'train.csv')
+    demographics_path = os.path.join(data_dir, 'train_demographics.csv')
+    
+    train_df = pd.read_csv(train_path)
+    demographics_df = pd.read_csv(demographics_path)
     
     print(f"Train data shape: {train_df.shape}")
     print(f"Demographics shape: {demographics_df.shape}")
@@ -31,20 +45,45 @@ def load_and_preprocess_data():
     train_df['gesture_encoded'] = label_encoder.fit_transform(train_df['gesture'])
     
     # Get feature columns (exclude metadata and target)
-    metadata_cols = ['row_id',  'sequence_id', 'sequence_type', 'sequence_counter', 
+    metadata_cols = ['row_id',  'sequence_id', 'sequence_type', 'sequence_counter',
                      'subject', 'orientation', 'behavior', 'phase', 'gesture', 'gesture_encoded']
     feature_cols = [col for col in train_df.columns if col not in metadata_cols]
-    
+
+    # Optionally drop THM / TOF sensors for IMU-only variant
+    if variant == "imu":
+        feature_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
+
+    print(f"Variant: {variant}. Feature columns after filtering: {len(feature_cols)}")
     print(f"\nFeature columns: {len(feature_cols)}")
     print(f"Sample features: {feature_cols[:10]}")
     
-    # Handle missing values
-    print("\nHandling missing values...")
-    train_df[feature_cols] = train_df[feature_cols].replace(-1.0, np.nan)
-    
-    # For now, fill NaN with column median
-    for col in feature_cols:
-        train_df[col] = train_df[col].fillna(train_df[col].median())
+    # Handle missing values – interpolate inside each sequence along the time axis
+    print("\nHandling missing values (interpolating per sequence)...")
+
+    # Convert sentinel -1.0 to NaN first
+    # train_df[feature_cols] = train_df[feature_cols].replace(-1.0, np.nan)
+
+    # ------------------------------------------------------------
+    # Spatial interpolation for each TOF sensor (8×8 grid)
+    # ------------------------------------------------------------
+    # Skip TOF interpolation entirely for IMU-only variant to save time
+    if variant != "imu":
+        train_df = interpolate_tof(train_df)
+
+    # Ensure chronological order so interpolation is meaningful
+    train_df = train_df.sort_values(['sequence_id', 'sequence_counter'])
+
+    # Linear interpolation forward & backward **within each sequence**
+    train_df[feature_cols] = (
+        train_df.groupby('sequence_id')[feature_cols]
+                .transform(lambda x: x.interpolate(method='linear', limit_direction='both'))
+    )
+
+    # Fallback: column-wise median for any value still NaN (e.g., entire column NaN)
+    train_df[feature_cols] = train_df[feature_cols].fillna(train_df[feature_cols].median())
+
+    # Final safety net: replace any remaining NaN with 0
+    train_df[feature_cols] = train_df[feature_cols].fillna(0)
     
     # Group by sequence to create samples
     print("Grouping by sequence...")
@@ -135,11 +174,11 @@ def normalize_features(X_train, X_val):
     
     return X_train_normalized, X_val_normalized, scaler
 
-def prepare_data_single_split():
+def prepare_data_single_split(variant: str = "full"):
     """
     Prepare data with single train/val split (for quick testing)
     """
-    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data()
+    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data(variant)
     
     seq_lengths = [len(seq) for seq in sequences]
     max_length = 100  # Fixed length - keeps the critical END part of gestures
@@ -159,15 +198,17 @@ def prepare_data_single_split():
     
     X_train, X_val, scaler = normalize_features(X_train, X_val)
     
-    # Save preprocessing objects
-    with open('label_encoder.pkl', 'wb') as f:
+    # Create outputs directory if it doesn't exist
+    outputs_dir = os.path.join(os.path.dirname(current_dir), 'outputs')  # development/outputs/
+    os.makedirs(outputs_dir, exist_ok=True)
+    
+    le_path = os.path.join(outputs_dir, f'label_encoder_{variant}.pkl')
+    with open(le_path, 'wb') as f:
         pickle.dump(label_encoder, f)
-    with open('scaler.pkl', 'wb') as f:
-        pickle.dump(scaler, f)
     
     return X_train, X_val, y_train, y_val, label_encoder
 
-def prepare_data_kfold(show_stratification=False):
+def prepare_data_kfold(show_stratification=False, variant: str = "full"):
     """
     Prepare data for 5-fold cross-validation
     Returns all folds for training 5 different models
@@ -176,7 +217,7 @@ def prepare_data_kfold(show_stratification=False):
         show_stratification (bool): If True, show detailed stratification analysis
     """
     # Load and preprocess
-    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data()
+    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data(variant)
     
     # Pad sequences (use fixed length of 100, keeping the critical END part)
     seq_lengths = [len(seq) for seq in sequences]
@@ -272,11 +313,13 @@ def prepare_data_kfold(show_stratification=False):
         })
     
     # Save preprocessing objects (using fold 0's scaler as default)
-    with open('label_encoder.pkl', 'wb') as f:
-        pickle.dump(label_encoder, f)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    outputs_dir = os.path.join(os.path.dirname(current_dir), 'outputs')  # development/outputs/
+    os.makedirs(outputs_dir, exist_ok=True)
     
-    with open('scaler.pkl', 'wb') as f:
-        pickle.dump(fold_data[0]['scaler'], f)  # Use first fold's scaler as default
+    le_path = os.path.join(outputs_dir, f'label_encoder_{variant}.pkl')
+    with open(le_path, 'wb') as f:
+        pickle.dump(label_encoder, f)
     
     print(f"\n✅ Prepared {len(fold_data)} folds for cross-validation")
     print("Each fold will train a separate model")
@@ -284,11 +327,11 @@ def prepare_data_kfold(show_stratification=False):
     return fold_data, label_encoder
 
 # Backward compatibility
-def prepare_data():
+def prepare_data(variant: str = "full"):
     """
-    Default function - returns single split for backward compatibility
+    Backward-compatibility wrapper: returns single split for requested variant
     """
-    return prepare_data_single_split()
+    return prepare_data_single_split(variant)
 
 if __name__ == "__main__":
     X_train, X_val, y_train, y_val, label_encoder = prepare_data()
