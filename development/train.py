@@ -27,6 +27,7 @@ import argparse
 import sys
 import os
 import pickle
+import pandas as pd
 # from transformers import get_cosine_schedule_with_warmup
 from utils.scheduler import get_cosine_schedule_with_warmup
 
@@ -484,8 +485,11 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
     if device is None:
         device = setup_device()
     
-    # Prepare all folds
-    fold_data, label_encoder = prepare_data_kfold(show_stratification=show_stratification, variant=variant)
+    # Prepare all folds and get full labels & sequence IDs for OOF reconstruction
+    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold(show_stratification=show_stratification, variant=variant)
+    num_samples = len(y_all)
+    oof_preds = np.full(num_samples, -1, dtype=int)
+    oof_targets = y_all.copy()
     
     # Model parameters (same for all folds)
     input_channels = fold_data[0]['X_train'].shape[2]
@@ -575,9 +579,12 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
             else:
                 raise e
         
-        # Evaluate model
+        # Evaluate model and capture predictions for OOF
         print(f"\nEvaluating fold {fold_idx + 1}...")
-        _, _ = evaluate_model(model, val_loader, label_encoder, device)
+        _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, nn.CrossEntropyLoss(), device, label_encoder)
+        
+        # Store into OOF array using original indices
+        oof_preds[fold['val_idx']] = all_preds_val
         
         # Calculate final validation score
         best_val_score = max(history['val_competition_score'])
@@ -647,6 +654,20 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
     with open(f'development/outputs/kfold_summary_{variant}.json', 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"Summary saved to 'development/outputs/kfold_summary_{variant}.json'")
+    
+    # Compute overall OOF competition score
+    oof_comp_score = competition_metric(oof_targets, oof_preds, label_encoder)
+    print(f"\n🏆 Overall OOF Competition Score: {oof_comp_score:.4f}")
+
+    # Save OOF predictions to CSV
+    oof_df = pd.DataFrame({
+        'sequence_id': sequence_ids_all,
+        'gesture_true': label_encoder.inverse_transform(oof_targets),
+        'gesture_pred': label_encoder.inverse_transform(oof_preds),
+    })
+    oof_path = f'development/outputs/oof_predictions_{variant}.csv'
+    oof_df.to_csv(oof_path, index=False)
+    print(f"OOF predictions saved to '{oof_path}'")
     
     return fold_models, fold_histories, fold_results
 

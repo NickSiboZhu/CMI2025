@@ -303,7 +303,7 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
         print(f"Train shape: {X_train_norm.shape}")
         print(f"Val shape: {X_val_norm.shape}")
         
-        # Store fold data
+        # Store fold data along with original indices for OOF reconstruction
         fold_data.append({
             'fold_idx': fold_idx,
             'X_train': X_train_norm,
@@ -312,7 +312,9 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
             'y_val': y_val_fold,
             'scaler': scaler_fold,
             'train_subjects': train_subjects_fold,
-            'val_subjects': val_subjects_fold
+            'val_subjects': val_subjects_fold,
+            'train_idx': train_idx,
+            'val_idx': val_idx,
         })
     
     # Save preprocessing objects (using fold 0's scaler as default)
@@ -327,7 +329,8 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
     print(f"\n✅ Prepared {len(fold_data)} folds for cross-validation")
     print("Each fold will train a separate model")
     
-    return fold_data, label_encoder
+    # Return fold data plus the full label array and sequence_ids for OOF reconstruction
+    return fold_data, label_encoder, y, sequence_ids
 
 # Backward compatibility
 def prepare_data(variant: str = "full"):
