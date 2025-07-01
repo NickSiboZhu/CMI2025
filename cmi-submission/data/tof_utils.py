@@ -18,7 +18,7 @@ def get_tof_columns() -> dict:
         mapping[sid] = [f"tof_{sid}_v{i}" for i in range(64)]
     return mapping
 
-def _interpolate_block(values: np.ndarray, replacement_value: int = 500) -> np.ndarray:
+def _interpolate_block(values: np.ndarray, replacement_value: int = 255) -> np.ndarray:
     """
     Handles complex data cleaning with added debugging for QhullError.
     """
@@ -114,6 +114,6 @@ def interpolate_tof(df: pd.DataFrame) -> pd.DataFrame:
         # 4. Assign the processed data back to the DataFrame.
         df_processed[cols] = processed_block
 
-    print("Interpolation complete.")
+    print("2D Interpolation complete.")
     
     return df_processed

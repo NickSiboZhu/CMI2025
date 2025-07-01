@@ -224,7 +224,7 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     if variant == "imu":
         feat_cols = [c for c in feat_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
 
-    seq_df[feat_cols] = seq_df[feat_cols].replace(-1.0, np.nan)
+    # seq_df[feat_cols] = seq_df[feat_cols].replace(-1.0, np.nan)
 
     # 2-D interpolation for TOF sensor grids (per row) – skip if IMU variant
     if variant != "imu":

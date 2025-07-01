@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Gesture Recognition Training Script
+Gesture Recognition Training Script (with Competition Metric)
 
 This script handles the complete training pipeline for gesture recognition using
-1D CNN with 5-fold cross-validation and group-aware splitting.
+1D CNN with 5-fold cross-validation and group-aware splitting. It uses the
+official Kaggle competition metric for model selection and evaluation.
 
 Usage:
-    python train.py                    # Full 5-fold cross-validation
-    python train.py --single           # Single train/val split
-    python train.py --stratification   # Show stratification details
-    python train.py --gpu 1            # Use specific GPU
+    python train.py                     # Full 5-fold cross-validation
+    python train.py --single            # Single train/val split
+    python train.py --stratification    # Show stratification details
+    python train.py --gpu 1             # Use specific GPU
 """
 
 import torch
@@ -18,7 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, f1_score
 import time
 import json
 import shutil
@@ -39,6 +40,52 @@ from data.data_preprocessing import (
     prepare_data_single_split,
 )
 
+# --- NEW: Competition Metric Configuration ---
+# These indices are derived from the actual label_encoder.classes_ output
+# to match the official Kaggle competition categories.
+BFRB_LABEL_INDICES = [0, 1, 3, 4, 6, 7, 9, 10]
+NON_BFRB_LABEL_INDICES = [2, 5, 8, 11, 12, 13, 14, 15, 16, 17]
+
+# For the multi-class part of the metric, we need to remap the labels.
+# We will map the 8 BFRB classes to 0-7 and the 10 non-BFRB classes to a single ID, 8.
+BFRB_MAP = {label: i for i, label in enumerate(BFRB_LABEL_INDICES)}
+NON_TARGET_CLASS_ID = 8 # The new unified class for all non-BFRB gestures.
+ALL_GESTURE_CLASSES = list(range(9)) # 8 BFRB classes + 1 unified non_target class
+
+
+def competition_metric(y_true, y_pred):
+    """
+    Calculates the official Kaggle competition metric.
+    It's the average of two F1 scores:
+    1. Binary F1 score (BFRB vs. non-BFRB).
+    2. Macro F1 score for gestures (8 BFRB classes + 1 combined non-BFRB class).
+    
+    Args:
+        y_true (list or np.array): Ground truth labels.
+        y_pred (list or np.array): Predicted labels.
+        
+    Returns:
+        float: The final competition score.
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    # --- Part 1: Binary F1 Score ---
+    y_true_binary = np.isin(y_true, BFRB_LABEL_INDICES).astype(int)
+    y_pred_binary = np.isin(y_pred, BFRB_LABEL_INDICES).astype(int)
+    binary_f1 = f1_score(y_true_binary, y_pred_binary, pos_label=1, zero_division=0)
+
+    # --- Part 2: Macro F1 Score on Gestures ---
+    # Remap BFRB labels to 0-7 and all non-BFRB to 8
+    y_true_multi = np.array([BFRB_MAP[l] if l in BFRB_MAP else NON_TARGET_CLASS_ID for l in y_true])
+    y_pred_multi = np.array([BFRB_MAP[l] if l in BFRB_MAP else NON_TARGET_CLASS_ID for l in y_pred])
+    
+    macro_f1 = f1_score(y_true_multi, y_pred_multi, average='macro', labels=ALL_GESTURE_CLASSES, zero_division=0)
+
+    # --- Final Score ---
+    final_score = (binary_f1 + macro_f1) / 2.0
+    return final_score
+
 
 def setup_device(gpu_id=None):
     """
@@ -57,7 +104,7 @@ def setup_device(gpu_id=None):
     print(f"Available GPUs: {torch.cuda.device_count()}")
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
-        print(f"  GPU {i}: {torch.cuda.get_device_name(i)} ({props.total_memory // 1024**3} GB)")
+        print(f"   GPU {i}: {torch.cuda.get_device_name(i)} ({props.total_memory // 1024**3} GB)")
     
     # Select GPU
     if gpu_id is not None:
@@ -100,49 +147,64 @@ def setup_device(gpu_id=None):
     
     print(f"\n🎯 Using GPU {selected_gpu}: {torch.cuda.get_device_name(selected_gpu)}")
     print(f"GPU {selected_gpu} Memory:")
-    print(f"  Total: {props.total_memory // 1024**3} GB")
-    print(f"  Used: {allocated // 1024**2} MB")
-    print(f"  Free: {free // 1024**3} GB")
+    print(f"   Total: {props.total_memory // 1024**3} GB")
+    print(f"   Used: {allocated // 1024**2} MB")
+    print(f"   Free: {free // 1024**3} GB")
     
     return device
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None):
-    """Train for one epoch"""
+    """
+    Train for one epoch.
+    MODIFIED: Now also returns predictions and targets for metric calculation.
+    """
     model.train()
     total_loss = 0
-    correct = 0
-    total = 0
+    all_preds = []
+    all_targets = []
     
     for batch_idx, (data, target) in enumerate(dataloader):
         data, target = data.to(device), target.to(device)
         
-        optimizer.zero_grad()
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad() # reset gradients
+        output = model(data) # forward pass
+        loss = criterion(output, target) # compute loss
+        loss.backward() #  compute new gradients for each parameter
+        optimizer.step() # update weights
         
         if scheduler is not None:
-            scheduler.step()
+            scheduler.step() # update learning rate
         
         total_loss += loss.item()
-        pred = output.argmax(dim=1, keepdim=True)
-        correct += pred.eq(target.view_as(pred)).sum().item()
-        total += target.size(0)
+        pred = output.argmax(dim=1)
+        
+        all_preds.extend(pred.cpu().numpy())
+        all_targets.extend(target.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
-    accuracy = 100. * correct / total
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    accuracy = 100. * (all_preds == all_targets).sum() / len(all_targets)
     
-    return avg_loss, accuracy
+    return avg_loss, accuracy, all_preds, all_targets
 
 
-def validate_epoch(model, dataloader, criterion, device):
-    """Validate for one epoch"""
+def validate_and_evaluate_epoch(model, dataloader, criterion, device):
+    """
+    Validate for one epoch and compute all relevant metrics.
+    
+    Returns:
+        avg_loss (float): Average validation loss.
+        accuracy (float): Validation accuracy.
+        comp_score (float): Competition metric score.
+        all_preds (list): All predictions for the epoch.
+        all_targets (list): All ground truth targets for the epoch.
+    """
     model.eval()
     total_loss = 0
-    correct = 0
-    total = 0
+    all_preds = []
+    all_targets = []
     
     with torch.no_grad():
         for data, target in dataloader:
@@ -151,18 +213,24 @@ def validate_epoch(model, dataloader, criterion, device):
             loss = criterion(output, target)
             
             total_loss += loss.item()
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-            total += target.size(0)
+            pred = output.argmax(dim=1)
+            
+            all_preds.extend(pred.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
-    accuracy = 100. * correct / total
     
-    return avg_loss, accuracy
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    
+    accuracy = 100. * (all_preds == all_targets).sum() / len(all_targets)
+    comp_score = competition_metric(all_targets, all_preds)
+    
+    return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
 def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
-    """Train the model with validation"""
+    """Train the model with validation, using competition metric for model selection."""
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
     
@@ -175,15 +243,14 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
         num_training_steps=total_training_steps,
     )
     
-    train_losses = []
-    train_accuracies = []
-    val_losses = []
-    val_accuracies = []
-    # Track learning rate for each epoch so we can inspect the schedule later
-    lr_values = []
+    history = {
+        'train_loss': [], 'train_accuracy': [], 'train_competition_score': [],
+        'val_loss': [], 'val_accuracy': [], 'val_competition_score': [],
+        'learning_rate': []
+    }
     
-    best_val_acc = 0
-    patience = 10
+    best_val_score = 0
+    patience = 15
     patience_counter = 0
     
     print(f"Training on device: {device}")
@@ -191,79 +258,69 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
     for epoch in range(epochs):
         start_time = time.time()
         
-        # Train (scheduler is stepped inside train_epoch)
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scheduler)
+        # Train and get predictions for score calculation
+        train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scheduler)
+        train_score = competition_metric(train_targets, train_preds)
         
         # Validate
-        val_loss, val_acc = validate_epoch(model, val_loader, criterion, device)
+        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, criterion, device)
         
-        # Current learning rate (after scheduler step). Assumes single param group.
         current_lr = optimizer.param_groups[0]['lr']
-        lr_values.append(current_lr)
         
-        # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Save best model based on competition score
+        if val_score > best_val_score:
+            best_val_score = val_score
             ckpt_name = f'development/outputs/best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth'
             torch.save(model.state_dict(), ckpt_name)
             patience_counter = 0
+            print(f"   🚀 New best val score: {best_val_score:.4f}. Model saved.")
         else:
             patience_counter += 1
         
         # Record metrics
-        train_losses.append(train_loss)
-        train_accuracies.append(train_acc)
-        val_losses.append(val_loss)
-        val_accuracies.append(val_acc)
+        history['train_loss'].append(train_loss)
+        history['train_accuracy'].append(train_acc)
+        history['train_competition_score'].append(train_score)
+        history['val_loss'].append(val_loss)
+        history['val_accuracy'].append(val_acc)
+        history['val_competition_score'].append(val_score)
+        history['learning_rate'].append(current_lr)
         
         epoch_time = time.time() - start_time
         
         print(f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): '
-              f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
-              f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%, '
+              f'Train Loss: {train_loss:.4f}, Train Score: {train_score:.4f} | '
+              f'Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | '
               f'LR: {current_lr:.6f}')
         
         # Early stopping
         if patience_counter >= patience:
-            print(f'Early stopping at epoch {epoch+1}')
+            print(f'Early stopping at epoch {epoch+1} as validation score did not improve for {patience} epochs.')
             break
     
     # Load best model
     ckpt_name = f'development/outputs/best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth'
     model.load_state_dict(torch.load(ckpt_name))
     
-    history = {
-        'train_loss': train_losses,
-        'train_accuracy': train_accuracies,
-        'val_loss': val_losses,
-        'val_accuracy': val_accuracies,
-        'learning_rate': lr_values,
-    }
-    
     return history
 
 
 def evaluate_model(model, dataloader, label_encoder, device='cpu'):
-    """Evaluate model and print detailed metrics"""
+    """Evaluate model and print detailed metrics including competition score."""
     model.eval()
-    all_preds = []
-    all_targets = []
     
-    with torch.no_grad():
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
-            pred = output.argmax(dim=1)
-            
-            all_preds.extend(pred.cpu().numpy())
-            all_targets.extend(target.cpu().numpy())
-    
+    # Use the validation function to get all metrics
+    _, _, comp_score, all_preds, all_targets = validate_and_evaluate_epoch(model, dataloader, nn.CrossEntropyLoss(), device)
+
+    print(f"\n🏆 Final Competition Score on Validation Set: {comp_score:.4f}")
+
     # Classification report
     print("\nClassification Report:")
     print(classification_report(
         all_targets, 
         all_preds, 
-        target_names=label_encoder.classes_
+        target_names=label_encoder.classes_,
+        zero_division=0
     ))
     
     # Accuracy by class
@@ -278,24 +335,35 @@ def evaluate_model(model, dataloader, label_encoder, device='cpu'):
 
 
 def plot_training_history(history, save_path='training_history.png'):
-    """Plot training history"""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    """Plot training history, including the new competition score."""
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 4))
     
-    # Accuracy
-    ax1.plot(history['train_accuracy'], label='Train Accuracy')
-    ax1.plot(history['val_accuracy'], label='Val Accuracy')
-    ax1.set_title('Model Accuracy')
+    # Competition Score
+    ax1.plot(history['train_competition_score'], label='Train Score', color='blue')
+    ax1.plot(history['val_competition_score'], label='Val Score', color='orange')
+    ax1.set_title('Competition Score')
     ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Accuracy (%)')
+    ax1.set_ylabel('Score')
     ax1.legend()
+    ax1.grid(True, linestyle='--', alpha=0.6)
+
+    # Accuracy
+    ax2.plot(history['train_accuracy'], label='Train Accuracy')
+    ax2.plot(history['val_accuracy'], label='Val Accuracy')
+    ax2.set_title('Model Accuracy')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.legend()
+    ax2.grid(True, linestyle='--', alpha=0.6)
     
     # Loss
-    ax2.plot(history['train_loss'], label='Train Loss')
-    ax2.plot(history['val_loss'], label='Val Loss')
-    ax2.set_title('Model Loss')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Loss')
-    ax2.legend()
+    ax3.plot(history['train_loss'], label='Train Loss')
+    ax3.plot(history['val_loss'], label='Val Loss')
+    ax3.set_title('Model Loss')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Loss')
+    ax3.legend()
+    ax3.grid(True, linestyle='--', alpha=0.6)
     
     plt.tight_layout()
     plt.savefig(save_path)
@@ -386,7 +454,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
     print(f"Input channels (features): {input_channels}")
     print(f"Sequence length: {sequence_length}")
     print(f"Number of classes: {num_classes}")
-    print(f"Class names: {label_encoder.classes_}")
+    print(f"Class names: {list(label_encoder.classes_)}")
     
     # Store results for all folds
     fold_results = []
@@ -453,11 +521,10 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         
         # Evaluate model
         print(f"\nEvaluating fold {fold_idx + 1}...")
-        y_pred, y_true = evaluate_model(model, val_loader, label_encoder, device)
+        _, _ = evaluate_model(model, val_loader, label_encoder, device)
         
-        # Calculate final validation accuracy
-        final_val_acc = history['val_accuracy'][-1]
-        best_val_acc = max(history['val_accuracy'])
+        # Calculate final validation score
+        best_val_score = max(history['val_competition_score'])
         
         # Save model for this fold
         model_filename = f'development/outputs/model_fold_{fold_idx + 1}_{variant}.pth'
@@ -480,8 +547,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         # Store results
         fold_results.append({
             'fold': fold_idx + 1,
-            'final_val_acc': final_val_acc,
-            'best_val_acc': best_val_acc,
+            'best_val_score': best_val_score,
             'model_filename': model_filename,
             'train_subjects': len(set(fold['train_subjects'])),
             'val_subjects': len(set(fold['val_subjects']))
@@ -490,25 +556,22 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         fold_models.append(model)
         fold_histories.append(history)
         
-        print(f"Fold {fold_idx + 1} - Final Val Acc: {final_val_acc:.2f}%, Best Val Acc: {best_val_acc:.2f}%")
+        print(f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
     
     # Summary of all folds
     print(f"\n" + "="*60)
     print("5-FOLD CROSS-VALIDATION SUMMARY")
     print("="*60)
     
-    final_accs = [result['final_val_acc'] for result in fold_results]
-    best_accs = [result['best_val_acc'] for result in fold_results]
+    best_scores = [result['best_val_score'] for result in fold_results]
     
-    print(f"Final Validation Accuracies: {[f'{acc:.2f}%' for acc in final_accs]}")
-    print(f"Best Validation Accuracies:  {[f'{acc:.2f}%' for acc in best_accs]}")
+    print(f"Best Validation Scores per Fold: {[f'{score:.4f}' for score in best_scores]}")
     print(f"")
-    print(f"Final Acc - Mean: {np.mean(final_accs):.2f}% ± {np.std(final_accs):.2f}%")
-    print(f"Best Acc  - Mean: {np.mean(best_accs):.2f}% ± {np.std(best_accs):.2f}%")
+    print(f"Mean Best Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
     
     # Find best fold
-    best_fold_idx = np.argmax(best_accs)
-    print(f"\nBest performing fold: Fold {best_fold_idx + 1} ({best_accs[best_fold_idx]:.2f}%)")
+    best_fold_idx = np.argmax(best_scores)
+    print(f"\nBest performing fold: Fold {best_fold_idx + 1} (Score: {best_scores[best_fold_idx]:.4f})")
     
     # Copy best model as the main model
     best_model_filename = fold_results[best_fold_idx]['model_filename']
@@ -519,12 +582,10 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
     # Save summary
     summary = {
         'fold_results': fold_results,
-        'mean_final_acc': float(np.mean(final_accs)),
-        'std_final_acc': float(np.std(final_accs)),
-        'mean_best_acc': float(np.mean(best_accs)),
-        'std_best_acc': float(np.std(best_accs)),
+        'mean_best_score': float(np.mean(best_scores)),
+        'std_best_score': float(np.std(best_scores)),
         'best_fold': int(best_fold_idx + 1),
-        'best_fold_acc': float(best_accs[best_fold_idx])
+        'best_fold_score': float(best_scores[best_fold_idx])
     }
     
     with open(f'development/outputs/kfold_summary_{variant}.json', 'w') as f:
@@ -572,4 +633,4 @@ def main():
 
 
 if __name__ == "__main__":
-    results = main() 
+    results = main()
