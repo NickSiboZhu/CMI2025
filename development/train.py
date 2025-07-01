@@ -41,46 +41,79 @@ from data.data_preprocessing import (
 )
 
 # --- NEW: Competition Metric Configuration ---
-# These indices are derived from the actual label_encoder.classes_ output
-# to match the official Kaggle competition categories.
-BFRB_LABEL_INDICES = [0, 1, 3, 4, 6, 7, 9, 10]
-NON_BFRB_LABEL_INDICES = [2, 5, 8, 11, 12, 13, 14, 15, 16, 17]
+# Define BFRB vs Non-BFRB categories based on gesture names rather than indices
+# This is much more robust and maintainable
+BFRB_GESTURES = {
+    'Above ear - pull hair',
+    'Forehead - pull hairline', 
+    'Forehead - scratch',
+    'Eyebrow - pull hair',
+    'Eyelash - pull hair',
+    'Neck - pinch skin',
+    'Neck - scratch',
+    'Cheek - pinch skin'
+}
 
-# For the multi-class part of the metric, we need to remap the labels.
-# We will map the 8 BFRB classes to 0-7 and the 10 non-BFRB classes to a single ID, 8.
-BFRB_MAP = {label: i for i, label in enumerate(BFRB_LABEL_INDICES)}
-NON_TARGET_CLASS_ID = 8 # The new unified class for all non-BFRB gestures.
-ALL_GESTURE_CLASSES = list(range(9)) # 8 BFRB classes + 1 unified non_target class
+NON_BFRB_GESTURES = {
+    'Drink from bottle/cup',
+    'Glasses on/off',
+    'Pull air toward your face',
+    'Pinch knee/leg skin',
+    'Scratch knee/leg skin',
+    'Write name on leg',
+    'Text on phone',
+    'Feel around in tray and pull out an object',
+    'Write name in air',
+    'Wave hello'
+}
 
-
-def competition_metric(y_true, y_pred):
+def competition_metric(y_true, y_pred, label_encoder):
     """
-    Calculates the official Kaggle competition metric.
+    Calculates the official Kaggle competition metric using gesture names.
     It's the average of two F1 scores:
     1. Binary F1 score (BFRB vs. non-BFRB).
     2. Macro F1 score for gestures (8 BFRB classes + 1 combined non-BFRB class).
     
     Args:
-        y_true (list or np.array): Ground truth labels.
-        y_pred (list or np.array): Predicted labels.
+        y_true (list or np.array): Ground truth label indices.
+        y_pred (list or np.array): Predicted label indices.
+        label_encoder: LabelEncoder to convert indices back to gesture names.
         
     Returns:
         float: The final competition score.
     """
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
+    
+    # Convert indices back to gesture names
+    true_gestures = label_encoder.inverse_transform(y_true)
+    pred_gestures = label_encoder.inverse_transform(y_pred)
 
-    # --- Part 1: Binary F1 Score ---
-    y_true_binary = np.isin(y_true, BFRB_LABEL_INDICES).astype(int)
-    y_pred_binary = np.isin(y_pred, BFRB_LABEL_INDICES).astype(int)
+    # --- Part 1: Binary F1 Score (BFRB vs Non-BFRB) ---
+    y_true_binary = np.array([1 if gesture in BFRB_GESTURES else 0 for gesture in true_gestures])
+    y_pred_binary = np.array([1 if gesture in BFRB_GESTURES else 0 for gesture in pred_gestures])
     binary_f1 = f1_score(y_true_binary, y_pred_binary, pos_label=1, zero_division=0)
 
     # --- Part 2: Macro F1 Score on Gestures ---
-    # Remap BFRB labels to 0-7 and all non-BFRB to 8
-    y_true_multi = np.array([BFRB_MAP[l] if l in BFRB_MAP else NON_TARGET_CLASS_ID for l in y_true])
-    y_pred_multi = np.array([BFRB_MAP[l] if l in BFRB_MAP else NON_TARGET_CLASS_ID for l in y_pred])
+    # Create mapping for macro F1: each BFRB gesture gets its own class (0-7), 
+    # all non-BFRB gestures get mapped to class 8
+    bfrb_list = sorted(list(BFRB_GESTURES))  # Consistent ordering
+    bfrb_to_idx = {gesture: i for i, gesture in enumerate(bfrb_list)}
+    non_target_class_id = len(bfrb_list)  # 8
     
-    macro_f1 = f1_score(y_true_multi, y_pred_multi, average='macro', labels=ALL_GESTURE_CLASSES, zero_division=0)
+    # Map gestures to indices for macro F1 calculation
+    y_true_multi = np.array([
+        bfrb_to_idx[gesture] if gesture in BFRB_GESTURES else non_target_class_id 
+        for gesture in true_gestures
+    ])
+    y_pred_multi = np.array([
+        bfrb_to_idx[gesture] if gesture in BFRB_GESTURES else non_target_class_id 
+        for gesture in pred_gestures
+    ])
+    
+    # Calculate macro F1 over all 9 classes (8 BFRB + 1 non-BFRB)
+    all_classes = list(range(len(bfrb_list) + 1))  # 0-8
+    macro_f1 = f1_score(y_true_multi, y_pred_multi, average='macro', labels=all_classes, zero_division=0)
 
     # --- Final Score ---
     final_score = (binary_f1 + macro_f1) / 2.0
@@ -190,7 +223,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     return avg_loss, accuracy, all_preds, all_targets
 
 
-def validate_and_evaluate_epoch(model, dataloader, criterion, device):
+def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_encoder):
     """
     Validate for one epoch and compute all relevant metrics.
     
@@ -224,12 +257,12 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device):
     all_targets = np.array(all_targets)
     
     accuracy = 100. * (all_preds == all_targets).sum() / len(all_targets)
-    comp_score = competition_metric(all_targets, all_preds)
+    comp_score = competition_metric(all_targets, all_preds, label_encoder)
     
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, learning_rate=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
     """Train the model with validation, using competition metric for model selection."""
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
@@ -260,10 +293,10 @@ def train_model(model, train_loader, val_loader, epochs=50, learning_rate=0.001,
         
         # Train and get predictions for score calculation
         train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scheduler)
-        train_score = competition_metric(train_targets, train_preds)
+        train_score = competition_metric(train_targets, train_preds, label_encoder)
         
         # Validate
-        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, criterion, device)
+        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, criterion, device, label_encoder)
         
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -310,7 +343,7 @@ def evaluate_model(model, dataloader, label_encoder, device='cpu'):
     model.eval()
     
     # Use the validation function to get all metrics
-    _, _, comp_score, all_preds, all_targets = validate_and_evaluate_epoch(model, dataloader, nn.CrossEntropyLoss(), device)
+    _, _, comp_score, all_preds, all_targets = validate_and_evaluate_epoch(model, dataloader, nn.CrossEntropyLoss(), device, label_encoder)
 
     print(f"\n🏆 Final Competition Score on Validation Set: {comp_score:.4f}")
 
@@ -415,7 +448,16 @@ def train_single_model(epochs=50, learning_rate=0.001, device=None, variant: str
     
     # Train model
     print("\nTraining model...")
-    history = train_model(model, train_loader, val_loader, epochs, learning_rate, device, variant)
+    history = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        label_encoder=label_encoder,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        device=device,
+        variant=variant,
+    )
     
     # Evaluate model
     print("\nEvaluating model...")
@@ -492,8 +534,15 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
             # Train model
             print(f"\nTraining fold {fold_idx + 1}...")
             history = train_model(
-                model, train_loader, val_loader, 
-                epochs=epochs, learning_rate=learning_rate, device=device, variant=variant, fold_tag=f'_{fold_idx+1}'
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                label_encoder=label_encoder,
+                epochs=epochs,
+                learning_rate=learning_rate,
+                device=device,
+                variant=variant,
+                fold_tag=f'_{fold_idx+1}',
             )
             
         except RuntimeError as e:
@@ -512,8 +561,15 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
                 
                 print(f"Retrying training on CPU with batch_size=8...")
                 history = train_model(
-                    model, train_loader, val_loader, 
-                    epochs=epochs, learning_rate=learning_rate, device=device_fallback, variant=variant, fold_tag=f'_{fold_idx+1}'
+                    model=model,
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    label_encoder=label_encoder,
+                    epochs=epochs,
+                    learning_rate=learning_rate,
+                    device=device_fallback,
+                    variant=variant,
+                    fold_tag=f'_{fold_idx+1}',
                 )
                 device = device_fallback  # Update device for evaluation
             else:

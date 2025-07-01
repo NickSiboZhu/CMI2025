@@ -168,7 +168,7 @@ def normalize_features(X_train, X_val):
     X_train_normalized = scaler.fit_transform(X_train_reshaped)
     X_val_normalized = scaler.transform(X_val_reshaped)
     
-    # Reshape back
+    # Reshape back to original dimensions
     X_train_normalized = X_train_normalized.reshape(n_samples, n_timesteps, n_features)
     X_val_normalized = X_val_normalized.reshape(X_val.shape[0], n_timesteps, n_features)
     
@@ -199,6 +199,7 @@ def prepare_data_single_split(variant: str = "full"):
     X_train, X_val, scaler = normalize_features(X_train, X_val)
     
     # Create outputs directory if it doesn't exist
+    current_dir = os.path.dirname(os.path.abspath(__file__))  # development/data/
     outputs_dir = os.path.join(os.path.dirname(current_dir), 'outputs')  # development/outputs/
     os.makedirs(outputs_dir, exist_ok=True)
     
@@ -286,9 +287,11 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
             train_pct = train_dist / len(y_train_fold) * 100
             val_pct = val_dist / len(y_val_fold) * 100
             print(f"Stratification check:")
-            for i, class_name in enumerate(label_encoder.classes_):
-                if i < len(train_pct) and i < len(val_pct):
-                    print(f"  {class_name}: Train {train_pct[i]:.1f}%, Val {val_pct[i]:.1f}%")
+            classes = label_encoder.classes_
+            if classes is not None:
+                for i, class_name in enumerate(classes):
+                    if i < len(train_pct) and i < len(val_pct):
+                        print(f"  {class_name}: Train {train_pct[i]:.1f}%, Val {val_pct[i]:.1f}%")
         else:
             # Simple output
             print(f"Train class distribution: {train_dist}")
