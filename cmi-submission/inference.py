@@ -39,8 +39,8 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
 from models.cnn import Simple1DCNN, GestureDataset
-from data.data_preprocessing import pad_sequences
-from data.tof_utils import interpolate_tof
+from data_utils.data_preprocessing import pad_sequences
+from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
 # We support two variants: "full" (uses THM/TOF sensors) and "imu" (IMU-only).

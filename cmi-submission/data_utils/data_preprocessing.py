@@ -6,6 +6,14 @@ import pickle
 import os
 from .tof_utils import interpolate_tof
 
+# Helper to locate shared weights directory inside cmi-submission
+def _get_weights_dir():
+    module_dir = os.path.dirname(os.path.abspath(__file__))  # …/cmi-submission/data_utils
+    subm_root  = os.path.abspath(os.path.join(module_dir, '..'))     # …/cmi-submission
+    weights_dir = os.path.join(subm_root, 'weights')
+    os.makedirs(weights_dir, exist_ok=True)
+    return weights_dir
+
 def load_and_preprocess_data(variant: str = "full"):
     """
     Load training data and demographics, preprocess for 1D CNN.
@@ -20,10 +28,24 @@ def load_and_preprocess_data(variant: str = "full"):
     
     # Get the directory of this file and construct absolute paths
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = current_dir  # This file is already in development/data/
-    
+    data_dir = current_dir  # primary location (cmi-submission/data)
+
+    # Fallback: look in development/data/ if CSVs not found here (training environment)
+    project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))  # repo root
+    dev_data_dir = os.path.join(project_root, 'development', 'data')
+
     train_path = os.path.join(data_dir, 'train.csv')
     demographics_path = os.path.join(data_dir, 'train_demographics.csv')
+
+    if not os.path.exists(train_path):
+        alt_train = os.path.join(dev_data_dir, 'train.csv')
+        if os.path.exists(alt_train):
+            train_path = alt_train
+            demographics_path = os.path.join(dev_data_dir, 'train_demographics.csv')
+            print(f"⚠️  train.csv not found in {data_dir}. Falling back to {dev_data_dir}.")
+    
+    if not os.path.exists(train_path):
+        raise FileNotFoundError("train.csv not found in either cmi-submission/data or development/data")
     
     train_df = pd.read_csv(train_path)
     demographics_df = pd.read_csv(demographics_path)
@@ -168,7 +190,7 @@ def normalize_features(X_train, X_val):
     X_train_normalized = scaler.fit_transform(X_train_reshaped)
     X_val_normalized = scaler.transform(X_val_reshaped)
     
-    # Reshape back to original dimensions
+    # Reshape back
     X_train_normalized = X_train_normalized.reshape(n_samples, n_timesteps, n_features)
     X_val_normalized = X_val_normalized.reshape(X_val.shape[0], n_timesteps, n_features)
     
@@ -198,12 +220,9 @@ def prepare_data_single_split(variant: str = "full"):
     
     X_train, X_val, scaler = normalize_features(X_train, X_val)
     
-    # Create outputs directory if it doesn't exist
-    current_dir = os.path.dirname(os.path.abspath(__file__))  # development/data/
-    outputs_dir = os.path.join(os.path.dirname(current_dir), 'outputs')  # development/outputs/
-    os.makedirs(outputs_dir, exist_ok=True)
-    
-    le_path = os.path.join(outputs_dir, f'label_encoder_{variant}.pkl')
+    # Create outputs directory (repo_root/outputs)
+    weights_dir = _get_weights_dir()
+    le_path = os.path.join(weights_dir, f'label_encoder_{variant}.pkl')
     with open(le_path, 'wb') as f:
         pickle.dump(label_encoder, f)
     
@@ -287,11 +306,9 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
             train_pct = train_dist / len(y_train_fold) * 100
             val_pct = val_dist / len(y_val_fold) * 100
             print(f"Stratification check:")
-            classes = label_encoder.classes_
-            if classes is not None:
-                for i, class_name in enumerate(classes):
-                    if i < len(train_pct) and i < len(val_pct):
-                        print(f"  {class_name}: Train {train_pct[i]:.1f}%, Val {val_pct[i]:.1f}%")
+            for i, class_name in enumerate(label_encoder.classes_):
+                if i < len(train_pct) and i < len(val_pct):
+                    print(f"  {class_name}: Train {train_pct[i]:.1f}%, Val {val_pct[i]:.1f}%")
         else:
             # Simple output
             print(f"Train class distribution: {train_dist}")
@@ -303,7 +320,7 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
         print(f"Train shape: {X_train_norm.shape}")
         print(f"Val shape: {X_val_norm.shape}")
         
-        # Store fold data along with original indices for OOF reconstruction
+        # Store fold data (include original indices for OOF reconstruction)
         fold_data.append({
             'fold_idx': fold_idx,
             'X_train': X_train_norm,
@@ -318,18 +335,15 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
         })
     
     # Save preprocessing objects (using fold 0's scaler as default)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    outputs_dir = os.path.join(os.path.dirname(current_dir), 'outputs')  # development/outputs/
-    os.makedirs(outputs_dir, exist_ok=True)
-    
-    le_path = os.path.join(outputs_dir, f'label_encoder_{variant}.pkl')
+    weights_dir = _get_weights_dir()
+    le_path = os.path.join(weights_dir, f'label_encoder_{variant}.pkl')
     with open(le_path, 'wb') as f:
         pickle.dump(label_encoder, f)
     
     print(f"\n✅ Prepared {len(fold_data)} folds for cross-validation")
     print("Each fold will train a separate model")
     
-    # Return fold data plus the full label array and sequence_ids for OOF reconstruction
+    # Return additional arrays for OOF handling
     return fold_data, label_encoder, y, sequence_ids
 
 # Backward compatibility

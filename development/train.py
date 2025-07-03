@@ -28,6 +28,16 @@ import sys
 import os
 import pickle
 import pandas as pd
+# ----------------------------------------------------------------------
+# Ensure shared code in cmi-submission/ is the one we import everywhere
+# ----------------------------------------------------------------------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))             # …/development
+SUBM_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, '..', 'cmi-submission'))
+
+# Pre-pend so it has priority over the local development/ path.
+if SUBM_DIR not in sys.path:
+    sys.path.insert(0, SUBM_DIR)
+
 # from transformers import get_cosine_schedule_with_warmup
 from utils.scheduler import get_cosine_schedule_with_warmup
 
@@ -36,10 +46,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Import our model and data preprocessing
 from models.cnn import Simple1DCNN, GestureDataset
-from data.data_preprocessing import (
+from data_utils.data_preprocessing import (
     prepare_data_kfold,
     prepare_data_single_split,
 )
+
+# Directory holding all models, scalers, summaries
+WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
+os.makedirs(WEIGHT_DIR, exist_ok=True)
 
 # --- NEW: Competition Metric Configuration ---
 # Define BFRB vs Non-BFRB categories based on gesture names rather than indices
@@ -263,10 +277,10 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_enco
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, learning_rate=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start_lr=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
     """Train the model with validation, using competition metric for model selection."""
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-2)
+    optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=1e-2)
     
     # Setup cosine schedule with warmup (10% warmup steps)
     total_training_steps = epochs * len(train_loader)
@@ -304,7 +318,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, learn
         # Save best model based on competition score
         if val_score > best_val_score:
             best_val_score = val_score
-            ckpt_name = f'development/outputs/best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth'
+            ckpt_name = os.path.join(WEIGHT_DIR, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
             torch.save(model.state_dict(), ckpt_name)
             patience_counter = 0
             print(f"   🚀 New best val score: {best_val_score:.4f}. Model saved.")
@@ -333,7 +347,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, learn
             break
     
     # Load best model
-    ckpt_name = f'development/outputs/best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth'
+    ckpt_name = os.path.join(WEIGHT_DIR, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
     model.load_state_dict(torch.load(ckpt_name))
     
     return history
@@ -405,7 +419,7 @@ def plot_training_history(history, save_path='training_history.png'):
     print(f"Training history plot saved to {save_path}")
 
 
-def train_single_model(epochs=50, learning_rate=0.001, device=None, variant: str = 'full'):
+def train_single_model(epochs=50, start_lr=0.001, device=None, variant: str = 'full'):
     """Train a single model with single train/val split"""
     print("🎯 TRAINING SINGLE MODEL")
     print("="*60)
@@ -455,7 +469,7 @@ def train_single_model(epochs=50, learning_rate=0.001, device=None, variant: str
         val_loader=val_loader,
         label_encoder=label_encoder,
         epochs=epochs,
-        learning_rate=learning_rate,
+        start_lr=start_lr,
         device=device,
         variant=variant,
     )
@@ -465,17 +479,17 @@ def train_single_model(epochs=50, learning_rate=0.001, device=None, variant: str
     y_pred, y_true = evaluate_model(model, val_loader, label_encoder, device)
     
     # Plot training history
-    plot_training_history(history, f'development/outputs/single_model_history_{variant}.png')
+    plot_training_history(history, os.path.join(WEIGHT_DIR, f'single_model_history_{variant}.png'))
     
     # Save final model
-    model_path = f'development/outputs/single_model_{variant}.pth'
+    model_path = os.path.join(WEIGHT_DIR, f'single_model_{variant}.pth')
     torch.save(model.state_dict(), model_path)
     print(f"\nModel saved as '{model_path}'")
     
     return model, history
 
 
-def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False, device=None, variant: str = 'full'):
+def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full'):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -543,7 +557,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
                 val_loader=val_loader,
                 label_encoder=label_encoder,
                 epochs=epochs,
-                learning_rate=learning_rate,
+                start_lr=start_lr,
                 device=device,
                 variant=variant,
                 fold_tag=f'_{fold_idx+1}',
@@ -570,7 +584,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
                     val_loader=val_loader,
                     label_encoder=label_encoder,
                     epochs=epochs,
-                    learning_rate=learning_rate,
+                    start_lr=start_lr,
                     device=device_fallback,
                     variant=variant,
                     fold_tag=f'_{fold_idx+1}',
@@ -590,7 +604,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         best_val_score = max(history['val_competition_score'])
         
         # Save model for this fold
-        model_filename = f'development/outputs/model_fold_{fold_idx + 1}_{variant}.pth'
+        model_filename = os.path.join(WEIGHT_DIR, f'model_fold_{fold_idx + 1}_{variant}.pth')
         torch.save(model.state_dict(), model_filename)
         print(f"Model saved as '{model_filename}'")
         
@@ -598,11 +612,9 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         scaler_fold = fold['scaler']
         
         # Create outputs directory if it doesn't exist
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        outputs_dir = os.path.join(current_dir, 'outputs')
-        os.makedirs(outputs_dir, exist_ok=True)
+        os.makedirs(WEIGHT_DIR, exist_ok=True)
         
-        scaler_filename = os.path.join(outputs_dir, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        scaler_filename = os.path.join(WEIGHT_DIR, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
         with open(scaler_filename, 'wb') as f:
             pickle.dump(scaler_fold, f)
         print(f"Scaler saved as '{scaler_filename}'")
@@ -638,7 +650,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
     
     # Copy best model as the main model
     best_model_filename = fold_results[best_fold_idx]['model_filename']
-    dest_best = f'development/outputs/best_model_{variant}.pth'
+    dest_best = os.path.join(WEIGHT_DIR, f'best_model_{variant}.pth')
     shutil.copy(best_model_filename, dest_best)
     print(f"Best model copied to '{dest_best}'")
     
@@ -651,7 +663,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         'best_fold_score': float(best_scores[best_fold_idx])
     }
     
-    with open(f'development/outputs/kfold_summary_{variant}.json', 'w') as f:
+    with open(os.path.join(WEIGHT_DIR, f'kfold_summary_{variant}.json'), 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"Summary saved to 'development/outputs/kfold_summary_{variant}.json'")
     
@@ -665,7 +677,7 @@ def train_kfold_models(epochs=50, learning_rate=0.001, show_stratification=False
         'gesture_true': label_encoder.inverse_transform(oof_targets),
         'gesture_pred': label_encoder.inverse_transform(oof_preds),
     })
-    oof_path = f'development/outputs/oof_predictions_{variant}.csv'
+    oof_path = os.path.join(WEIGHT_DIR, f'oof_predictions_{variant}.csv')
     oof_df.to_csv(oof_path, index=False)
     print(f"OOF predictions saved to '{oof_path}'")
     
@@ -678,7 +690,7 @@ def main():
     parser.add_argument('--single', action='store_true', help='Train single model instead of 5-fold CV')
     parser.add_argument('--stratification', action='store_true', help='Show stratification details')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--start_lr', type=float, default=0.001, help='Initial learning rate')
     parser.add_argument('--gpu', type=int, help='Specific GPU ID to use')
     parser.add_argument('--variant', choices=['full', 'imu'], default='full', help='Sensor variant to train (full or imu-only)')
     
@@ -691,7 +703,7 @@ def main():
     if args.single:
         model, history = train_single_model(
             epochs=args.epochs, 
-            learning_rate=args.lr, 
+            start_lr=args.start_lr, 
             device=device,
             variant=args.variant,
         )
@@ -700,7 +712,7 @@ def main():
     else:
         fold_models, fold_histories, fold_results = train_kfold_models(
             epochs=args.epochs, 
-            learning_rate=args.lr, 
+            start_lr=args.start_lr, 
             show_stratification=args.stratification,
             device=device,
             variant=args.variant,
