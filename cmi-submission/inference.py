@@ -204,8 +204,9 @@ def _decide_variant(seq_df: "pd.DataFrame") -> str:
 
 def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     """
-    Convert a single sequence to a numpy tensor suitable for the chosen variant.
-    Returns (variant, np.ndarray[1, L, F])
+    Convert a single sequence to a DataFrame suitable for the chosen variant.
+    Padding is now handled AFTER scaling in the predict function.
+    Returns (variant, pd.DataFrame[L, F])
     """
 
     seq_df = seq_pl.to_pandas()
@@ -237,14 +238,18 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     seq_df[feat_cols] = seq_df[feat_cols].interpolate(method="linear", limit_direction="both")
 
     # Fallback to median for any column still containing NaN, then 0 as a last resort
-    seq_df[feat_cols] = seq_df[feat_cols].fillna(seq_df[feat_cols].median())
+    # Note: Using the median of the single sequence might be noisy.
+    # A more robust approach would be to load pre-computed medians from the training set.
+    col_medians = seq_df[feat_cols].median()
+    seq_df[feat_cols] = seq_df[feat_cols].fillna(col_medians)
     seq_df[feat_cols] = seq_df[feat_cols].fillna(0)
+    
+    # ---- Return the feature DataFrame (unscaled, unpadded)
+    # The scaler requires a DataFrame or a NumPy array with the correct feature order.
+    # Slicing with feat_cols ensures the column order is correct.
+    final_features_df = seq_df.sort_values("sequence_counter")[feat_cols]
 
-    # ---- build padded tensor (unscaled)
-    arr = seq_df.sort_values("sequence_counter")[feat_cols].to_numpy()
-    arr = pad_sequences([arr], max_length=SEQ_LEN)[0]  # (L, F)
-
-    return variant, arr.astype(np.float32)
+    return variant, final_features_df
 
 
 # ------------------ 预测逻辑 ------------------
@@ -255,7 +260,8 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     if sequence.is_empty():
         return MAP_NON_TARGET
 
-    variant, arr = preprocess_single_sequence(sequence, demographics)
+    # 1. Preprocess sequence to get an unpadded feature DataFrame
+    variant, features_df = preprocess_single_sequence(sequence, demographics)
 
     res      = RESOURCES[variant]
     le       = res["label_encoder"]
@@ -264,14 +270,28 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 
     with torch.no_grad():
         probs_sum = np.zeros((1, num_cls))
+        
+        # 2. Loop through each model and its corresponding scaler
         for model, scaler in pairs:
-            in_channels = scaler.mean_.shape[0]
-            X_scaled = scaler.transform(arr.reshape(-1, in_channels)).reshape(1, SEQ_LEN, in_channels)
+            # 3. Apply scaling to the unpadded 2D DataFrame
+            X_scaled_unpadded = scaler.transform(features_df)
 
-            xb = torch.from_numpy(X_scaled).to(DEVICE)
+            # 4. ✨ CORRECTED PADDING CALL ✨
+            # Apply padding AFTER scaling, using the correct function signature.
+            # Your function takes a list of sequences and max_length.
+            X_padded = pad_sequences(
+                [X_scaled_unpadded], 
+                max_length=SEQ_LEN
+            )
+
+            # 5. Convert to tensor and predict
+            # The shape from pad_sequences is (1, SEQ_LEN, num_features)
+            xb = torch.from_numpy(X_padded.astype(np.float32)).to(DEVICE)
+            
             probs = torch.softmax(model(xb), dim=1).cpu().numpy()
             probs_sum += probs
 
+        # Average the probabilities for the ensemble
         probs = probs_sum / len(pairs)
 
     pred_idx = int(np.argmax(probs, axis=1)[0])
