@@ -61,6 +61,7 @@ development/outputs/*.png
 development/outputs/*.jpg
 development/outputs/*.json
 development/outputs/*.pkl
+cmi-submission/weights/*
 
 # System files
 .DS_Store
