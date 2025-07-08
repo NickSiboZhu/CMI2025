@@ -38,8 +38,8 @@ BASE_DIR   = os.path.dirname(__file__)
 WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
-from models.cnn import Simple1DCNN, GestureDataset
-from data_utils.data_preprocessing import pad_sequences
+from models.fusion import FusionModel
+from data_utils.data_preprocessing import pad_sequences, STATIC_FEATURE_COLS
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
@@ -78,67 +78,70 @@ def _load_preprocessing_objects(variant: str):
 
     return le, scaler
 
-def _load_models(device, num_classes, variant: str) -> List[Tuple[torch.nn.Module, "StandardScaler"]]:
-    """Load models together with their matching scaler.
+def _load_models(device, num_classes, variant: str):
+    """Load Fusion models together with their matching sequential & static scalers.
 
-    Returns a list of (model, scaler) tuples so that each model gets the
-    exact feature scaling it was trained with (Option B). For single-model
-    variants we still return a one-element list.
+    Returns a list of (model, seq_scaler, static_scaler) tuples. Works for both
+    5-fold ensembles and single-model submissions.
     """
     pairs = []
 
-    # 搜索 5-fold 文件
-    fold_paths = [
-        os.path.join(WEIGHT_DIR, f"model_fold_{i}_{variant}.pth") for i in range(1, 6)
-    ]
+    # Look for 5-fold models first
+    fold_paths = [os.path.join(WEIGHT_DIR, f"model_fold_{i}_{variant}.pth") for i in range(1, 6)]
     fold_paths = [p for p in fold_paths if os.path.exists(p)]
 
     if fold_paths:
         print(f"🧩  [{variant}] Detected {len(fold_paths)} fold models → ensemble")
         for p in fold_paths:
             basename = os.path.basename(p)
-            # Derive fold number to locate matching scaler
-            # Pattern: model_fold_{i}_{variant}.pth
+            # Extract fold index
             parts = basename.split("_")
-            try:
-                fold_num = int(parts[2])  # parts: ['model','fold','{i}','{variant}.pth']
-            except (IndexError, ValueError):
-                raise ValueError(f"Unexpected model filename format: {basename}")
+            fold_num = int(parts[2])  # e.g. model_fold_3_full.pth → 3
 
-            scaler_path = os.path.join(WEIGHT_DIR, f"scaler_fold_{fold_num}_{variant}.pkl")
-            if not os.path.exists(scaler_path):
-                raise FileNotFoundError(f"Expected scaler file '{scaler_path}' for model '{basename}' not found.")
+            seq_scaler_path    = os.path.join(WEIGHT_DIR, f"seq_scaler_fold_{fold_num}_{variant}.pkl")
+            static_scaler_path = os.path.join(WEIGHT_DIR, f"static_scaler_fold_{fold_num}_{variant}.pkl")
 
-            with open(scaler_path, "rb") as f:
-                scaler = pickle.load(f)
+            if not (os.path.exists(seq_scaler_path) and os.path.exists(static_scaler_path)):
+                raise FileNotFoundError(f"Missing scaler(s) for fold {fold_num} ({variant}).")
 
-            in_channels = scaler.mean_.shape[0]
-            m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
-            m.load_state_dict(torch.load(p, map_location=device))
-            m.to(device).eval()
+            with open(seq_scaler_path, "rb") as f:
+                seq_scaler = pickle.load(f)
+            with open(static_scaler_path, "rb") as f:
+                static_scaler = pickle.load(f)
 
-            pairs.append((m, scaler))
+            seq_in_channels      = seq_scaler.mean_.shape[0]
+            static_in_features   = static_scaler.mean_.shape[0]
+
+            model = FusionModel(seq_in_channels, static_in_features, num_classes, SEQ_LEN)
+            model.load_state_dict(torch.load(p, map_location=device))
+            model.to(device).eval()
+
+            pairs.append((model, seq_scaler, static_scaler))
     else:
-        single = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
-        if not os.path.exists(single):
-            raise FileNotFoundError(
-                f"No model weights found for variant '{variant}' in weights/"
-            )
-        print(f"🧩  [{variant}] Using single model {os.path.basename(single)}")
+        # Single-model fallback
+        weight_path = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
+        if not os.path.exists(weight_path):
+            raise FileNotFoundError(f"No weight file found for variant '{variant}'.")
 
-        # Load single scaler
-        scaler_path = os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl")
-        if not os.path.exists(scaler_path):
-            scaler_path = os.path.join(WEIGHT_DIR, "scaler.pkl")
-        with open(scaler_path, "rb") as f:
-            scaler = pickle.load(f)
+        seq_scaler_path    = os.path.join(WEIGHT_DIR, f"seq_scaler_{variant}.pkl")
+        static_scaler_path = os.path.join(WEIGHT_DIR, f"static_scaler_{variant}.pkl")
 
-        in_channels = scaler.mean_.shape[0]
-        m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
-        m.load_state_dict(torch.load(single, map_location=device))
-        m.to(device).eval()
+        if not (os.path.exists(seq_scaler_path) and os.path.exists(static_scaler_path)):
+            raise FileNotFoundError(f"Missing sequential/static scaler for single-model variant '{variant}'.")
 
-        pairs.append((m, scaler))
+        with open(seq_scaler_path, "rb") as f:
+            seq_scaler = pickle.load(f)
+        with open(static_scaler_path, "rb") as f:
+            static_scaler = pickle.load(f)
+
+        seq_in_channels    = seq_scaler.mean_.shape[0]
+        static_in_features = static_scaler.mean_.shape[0]
+
+        model = FusionModel(seq_in_channels, static_in_features, num_classes, SEQ_LEN)
+        model.load_state_dict(torch.load(weight_path, map_location=device))
+        model.to(device).eval()
+
+        pairs.append((model, seq_scaler, static_scaler))
 
     return pairs
 
@@ -203,10 +206,9 @@ def _decide_variant(seq_df: "pd.DataFrame") -> str:
     return "full"  # Both sensor types have at least some valid data
 
 def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
-    """
-    Convert a single sequence to a numpy tensor suitable for the chosen variant.
-    Returns (variant, np.ndarray[1, L, F])
-    """
+    """Convert one sequence to sequential & static numpy arrays ready for inference.
+
+    Returns (variant, seq_arr[L,F], static_arr[features])"""
 
     seq_df = seq_pl.to_pandas()
     if not demog_pl.is_empty():
@@ -214,17 +216,19 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
 
     variant = _decide_variant(seq_df)
 
-    meta_cols = [
+    # --- MODIFIED: Define and separate static vs. sequential features (same as training) ---
+    metadata_cols = [
         "row_id", "sequence_id", "sequence_type", "sequence_counter",
         "subject", "orientation", "behavior", "phase",
     ]
-
-    feat_cols = [c for c in seq_df.columns if c not in meta_cols]
+    
+    # Sequential features: exclude metadata AND static features
+    seq_feat_cols = [c for c in seq_df.columns if c not in metadata_cols and c not in STATIC_FEATURE_COLS]
 
     if variant == "imu":
-        feat_cols = [c for c in feat_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
+        seq_feat_cols = [c for c in seq_feat_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
 
-    # seq_df[feat_cols] = seq_df[feat_cols].replace(-1.0, np.nan)
+    # seq_df[seq_feat_cols] = seq_df[seq_feat_cols].replace(-1.0, np.nan)
 
     # 2-D interpolation for TOF sensor grids (per row) – skip if IMU variant
     if variant != "imu":
@@ -234,17 +238,26 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     seq_df = seq_df.sort_values("sequence_counter")
 
     # Linear interpolation forward/backward along the time axis
-    seq_df[feat_cols] = seq_df[feat_cols].interpolate(method="linear", limit_direction="both")
+    seq_df[seq_feat_cols] = seq_df[seq_feat_cols].interpolate(method="linear", limit_direction="both")
 
     # Fallback to median for any column still containing NaN, then 0 as a last resort
-    seq_df[feat_cols] = seq_df[feat_cols].fillna(seq_df[feat_cols].median())
-    seq_df[feat_cols] = seq_df[feat_cols].fillna(0)
+    seq_df[seq_feat_cols] = seq_df[seq_feat_cols].fillna(seq_df[seq_feat_cols].median())
+    seq_df[seq_feat_cols] = seq_df[seq_feat_cols].fillna(0)
 
-    # ---- build padded tensor (unscaled)
-    arr = seq_df.sort_values("sequence_counter")[feat_cols].to_numpy()
-    arr = pad_sequences([arr], max_length=SEQ_LEN)[0]  # (L, F)
+    # ---- build padded sequential tensor (unscaled)
+    seq_arr = seq_df.sort_values("sequence_counter")[seq_feat_cols].to_numpy()
+    seq_arr = pad_sequences([seq_arr], max_length=SEQ_LEN)[0]  # (L, F)
 
-    return variant, arr.astype(np.float32)
+    # ---- static demographic features (order must match training)
+    if STATIC_FEATURE_COLS[0] in seq_df.columns:
+        static_vec = seq_df.iloc[0][STATIC_FEATURE_COLS].to_numpy()
+    else:
+        # If not merged correctly, fall back to zeros
+        static_vec = np.zeros(len(STATIC_FEATURE_COLS), dtype=np.float32)
+
+    static_vec = static_vec.astype(np.float32)
+
+    return variant, seq_arr, static_vec
 
 
 # ------------------ 预测逻辑 ------------------
@@ -255,21 +268,25 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     if sequence.is_empty():
         return MAP_NON_TARGET
 
-    variant, arr = preprocess_single_sequence(sequence, demographics)
+    variant, seq_arr, static_vec = preprocess_single_sequence(sequence, demographics)
 
     res      = RESOURCES[variant]
     le       = res["label_encoder"]
-    pairs    = res["model_scaler_pairs"]  # List[(model, scaler)]
+    pairs    = res["model_scaler_pairs"]  # List[(model, seq_scaler, static_scaler)]
     num_cls  = res["num_classes"]
 
     with torch.no_grad():
         probs_sum = np.zeros((1, num_cls))
-        for model, scaler in pairs:
-            in_channels = scaler.mean_.shape[0]
-            X_scaled = scaler.transform(arr.reshape(-1, in_channels)).reshape(1, SEQ_LEN, in_channels)
+        for model, seq_scaler, static_scaler in pairs:
+            # ----- scale inputs -----
+            seq_channels = seq_scaler.mean_.shape[0]
+            seq_scaled = seq_scaler.transform(seq_arr.reshape(-1, seq_channels)).reshape(1, SEQ_LEN, seq_channels)
+            static_scaled = static_scaler.transform(static_vec.reshape(1, -1))  # (1, static_features)
 
-            xb = torch.from_numpy(X_scaled).to(DEVICE)
-            probs = torch.softmax(model(xb), dim=1).cpu().numpy()
+            xb_seq   = torch.from_numpy(seq_scaled).to(DEVICE)
+            xb_stat  = torch.from_numpy(static_scaled).to(DEVICE)
+
+            probs = torch.softmax(model(xb_seq, xb_stat), dim=1).cpu().numpy()
             probs_sum += probs
 
         probs = probs_sum / len(pairs)

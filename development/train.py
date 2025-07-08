@@ -41,15 +41,10 @@ if SUBM_DIR not in sys.path:
 # from transformers import get_cosine_schedule_with_warmup
 from utils.scheduler import get_cosine_schedule_with_warmup
 
-# Add current directory to Python path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 # Import our model and data preprocessing
-from models.cnn import Simple1DCNN, GestureDataset
-from data_utils.data_preprocessing import (
-    prepare_data_kfold,
-    prepare_data_single_split,
-)
+from models.fusion import FusionModel
+from models.datasets import MultimodalDataset
+from data_utils.data_preprocessing import prepare_data_kfold
 
 # Directory holding all models, scalers, summaries
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
@@ -212,11 +207,11 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     all_preds = []
     all_targets = []
     
-    for batch_idx, (data, target) in enumerate(dataloader):
-        data, target = data.to(device), target.to(device)
+    for (seq_data, static_data), target in dataloader:
+        seq_data, static_data, target = seq_data.to(device), static_data.to(device), target.to(device)
         
         optimizer.zero_grad() # reset gradients
-        output = model(data) # forward pass
+        output = model(seq_data, static_data) # forward pass
         loss = criterion(output, target) # compute loss
         loss.backward() #  compute new gradients for each parameter
         optimizer.step() # update weights
@@ -255,9 +250,9 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_enco
     all_targets = []
     
     with torch.no_grad():
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
+        for (seq_data, static_data), target in dataloader:
+            seq_data, static_data, target = seq_data.to(device), static_data.to(device), target.to(device)
+            output = model(seq_data, static_data)
             loss = criterion(output, target)
             
             total_loss += loss.item()
@@ -419,76 +414,6 @@ def plot_training_history(history, save_path='training_history.png'):
     print(f"Training history plot saved to {save_path}")
 
 
-def train_single_model(epochs=50, start_lr=0.001, device=None, variant: str = 'full'):
-    """Train a single model with single train/val split"""
-    print("🎯 TRAINING SINGLE MODEL")
-    print("="*60)
-    
-    # Setup device
-    if device is None:
-        device = setup_device()
-    
-    # Prepare data
-    print("Preparing data for single model training...")
-    X_train, X_val, y_train, y_val, label_encoder = prepare_data_single_split(variant)
-    
-    # Model parameters
-    input_channels = X_train.shape[2]
-    sequence_length = X_train.shape[1]
-    num_classes = len(label_encoder.classes_)
-    
-    print(f"\nModel configuration:")
-    print(f"Input shape: {X_train.shape}")
-    print(f"Input channels (features): {input_channels}")
-    print(f"Sequence length: {sequence_length}")
-    print(f"Number of classes: {num_classes}")
-    
-    # Create datasets and dataloaders
-    train_dataset = GestureDataset(X_train, y_train)
-    val_dataset = GestureDataset(X_val, y_val)
-    
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    
-    # Build model
-    print("\nBuilding model...")
-    model = Simple1DCNN(input_channels, num_classes, sequence_length)
-    model = model.to(device)
-    
-    # Print model info
-    model_info = model.get_model_info()
-    print(f"\nModel Summary:")
-    print(f"Total parameters: {model_info['total_params']:,}")
-    print(f"Model size: {model_info['model_size_mb']:.1f} MB")
-    
-    # Train model
-    print("\nTraining model...")
-    history = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        label_encoder=label_encoder,
-        epochs=epochs,
-        start_lr=start_lr,
-        device=device,
-        variant=variant,
-    )
-    
-    # Evaluate model
-    print("\nEvaluating model...")
-    y_pred, y_true = evaluate_model(model, val_loader, label_encoder, device)
-    
-    # Plot training history
-    plot_training_history(history, os.path.join(WEIGHT_DIR, f'single_model_history_{variant}.png'))
-    
-    # Save final model
-    model_path = os.path.join(WEIGHT_DIR, f'single_model_{variant}.pth')
-    torch.save(model.state_dict(), model_path)
-    print(f"\nModel saved as '{model_path}'")
-    
-    return model, history
-
-
 def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full'):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
@@ -506,15 +431,19 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
     oof_targets = y_all.copy()
     
     # Model parameters (same for all folds)
-    input_channels = fold_data[0]['X_train'].shape[2]
-    sequence_length = fold_data[0]['X_train'].shape[1]
+    sample_seq_data = fold_data[0]['X_train_seq']
+    sample_static_data = fold_data[0]['X_train_static']
+    
+    seq_input_channels = sample_seq_data.shape[2]
+    static_input_features = sample_static_data.shape[1]
+    sequence_length = sample_seq_data.shape[1]
     num_classes = len(label_encoder.classes_)
     
     print(f"\nModel configuration:")
-    print(f"Input channels (features): {input_channels}")
-    print(f"Sequence length: {sequence_length}")
-    print(f"Number of classes: {num_classes}")
-    print(f"Class names: {list(label_encoder.classes_)}")
+    print(f"  Sequential Channels: {seq_input_channels}")
+    print(f"  Static Features: {static_input_features}")
+    print(f"  Sequence Length: {sequence_length}")
+    print(f"  Number of classes: {num_classes}")
     
     # Store results for all folds
     fold_results = []
@@ -529,21 +458,23 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # Get fold data
         fold = fold_data[fold_idx]
-        X_train, X_val = fold['X_train'], fold['X_val']
-        y_train, y_val = fold['y_train'], fold['y_val']
+        # X_train, X_val = fold['X_train'], fold['X_val']
+        # y_train, y_val = fold['y_train'], fold['y_val']
         
-        print(f"Fold {fold_idx + 1} - Train: {X_train.shape}, Val: {X_val.shape}")
+        # print(f"Fold {fold_idx + 1} - Train: {X_train.shape}, Val: {X_val.shape}")
         
-        # Create datasets and dataloaders
-        train_dataset = GestureDataset(X_train, y_train)
-        val_dataset = GestureDataset(X_val, y_val)
+        # # Create datasets and dataloaders
+        # train_dataset = GestureDataset(X_train, y_train)
+        # val_dataset = GestureDataset(X_val, y_val)
+        train_dataset = MultimodalDataset(fold['X_train_seq'], fold['X_train_static'], fold['y_train'])
+        val_dataset = MultimodalDataset(fold['X_val_seq'], fold['X_val_static'], fold['y_val'])
         
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
-        model = Simple1DCNN(input_channels, num_classes, sequence_length)
+        model = FusionModel(seq_input_channels, static_input_features, num_classes, sequence_length)
         
         try:
             model = model.to(device)
@@ -608,16 +539,24 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         torch.save(model.state_dict(), model_filename)
         print(f"Model saved as '{model_filename}'")
         
-        # Save the scaler corresponding to this fold for inference pairing
-        scaler_fold = fold['scaler']
+        # Save the scalers corresponding to this fold for inference pairing
+        seq_scaler_fold = fold['seq_scaler']
+        static_scaler_fold = fold['static_scaler']
         
         # Create outputs directory if it doesn't exist
         os.makedirs(WEIGHT_DIR, exist_ok=True)
         
-        scaler_filename = os.path.join(WEIGHT_DIR, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
-        with open(scaler_filename, 'wb') as f:
-            pickle.dump(scaler_fold, f)
-        print(f"Scaler saved as '{scaler_filename}'")
+        # Save both scalers
+        seq_scaler_filename = os.path.join(WEIGHT_DIR, f'seq_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        static_scaler_filename = os.path.join(WEIGHT_DIR, f'static_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        
+        with open(seq_scaler_filename, 'wb') as f:
+            pickle.dump(seq_scaler_fold, f)
+        with open(static_scaler_filename, 'wb') as f:
+            pickle.dump(static_scaler_fold, f)
+            
+        print(f"Sequential scaler saved as '{seq_scaler_filename}'")
+        print(f"Static scaler saved as '{static_scaler_filename}'")
         
         # Store results
         fold_results.append({
@@ -687,7 +626,6 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
 def main():
     """Main training function with command line interface"""
     parser = argparse.ArgumentParser(description="Gesture Recognition Training")
-    parser.add_argument('--single', action='store_true', help='Train single model instead of 5-fold CV')
     parser.add_argument('--stratification', action='store_true', help='Show stratification details')
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--start_lr', type=float, default=0.001, help='Initial learning rate')
@@ -700,25 +638,16 @@ def main():
     device = setup_device(args.gpu)
     
     # Train model(s)
-    if args.single:
-        model, history = train_single_model(
-            epochs=args.epochs, 
-            start_lr=args.start_lr, 
-            device=device,
-            variant=args.variant,
-        )
-        print("✅ Single model training completed!")
-        return model, history
-    else:
-        fold_models, fold_histories, fold_results = train_kfold_models(
-            epochs=args.epochs, 
-            start_lr=args.start_lr, 
-            show_stratification=args.stratification,
-            device=device,
-            variant=args.variant,
-        )
-        print("✅ 5-fold cross-validation training completed!")
-        return fold_models, fold_histories, fold_results
+    fold_models, fold_histories, fold_results = train_kfold_models(
+        epochs=args.epochs, 
+        start_lr=args.start_lr, 
+        show_stratification=args.stratification,
+        device=device,
+        variant=args.variant,
+    )
+    
+    print("✅ 5-fold cross-validation training completed!")
+    return fold_models, fold_histories, fold_results
 
 
 if __name__ == "__main__":

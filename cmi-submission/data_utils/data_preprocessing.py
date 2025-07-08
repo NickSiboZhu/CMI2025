@@ -6,6 +6,12 @@ import pickle
 import os
 from .tof_utils import interpolate_tof
 
+# Static feature columns (shared between training and inference)
+STATIC_FEATURE_COLS = [
+    'adult_child', 'age', 'sex', 'handedness', 'height_cm', 
+    'shoulder_to_wrist_cm', 'elbow_to_wrist_cm'
+]
+
 # Helper to locate shared weights directory inside cmi-submission
 def _get_weights_dir():
     module_dir = os.path.dirname(os.path.abspath(__file__))  # …/cmi-submission/data_utils
@@ -65,19 +71,23 @@ def load_and_preprocess_data(variant: str = "full"):
     # Encode gesture labels
     label_encoder = LabelEncoder()
     train_df['gesture_encoded'] = label_encoder.fit_transform(train_df['gesture'])
+
+    # --- MODIFIED: Define and separate static vs. sequential features ---
+    static_feature_cols = STATIC_FEATURE_COLS
     
     # Get feature columns (exclude metadata and target)
     metadata_cols = ['row_id',  'sequence_id', 'sequence_type', 'sequence_counter',
                      'subject', 'orientation', 'behavior', 'phase', 'gesture', 'gesture_encoded']
-    feature_cols = [col for col in train_df.columns if col not in metadata_cols]
+                     
+    seq_feature_cols = [col for col in train_df.columns if col not in metadata_cols and col not in static_feature_cols]
 
     # Optionally drop THM / TOF sensors for IMU-only variant
     if variant == "imu":
-        feature_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
+        seq_feature_cols = [c for c in seq_feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
 
-    print(f"Variant: {variant}. Feature columns after filtering: {len(feature_cols)}")
-    print(f"\nFeature columns: {len(feature_cols)}")
-    print(f"Sample features: {feature_cols[:10]}")
+    print(f"Variant: {variant}. Feature columns after filtering: {len(seq_feature_cols)}")
+    print(f"\nFeature columns: {len(seq_feature_cols)}")
+    print(f"Sample features: {seq_feature_cols[:10]}")
     
     # Handle missing values – interpolate inside each sequence along the time axis
     print("\nHandling missing values (interpolating per sequence)...")
@@ -96,16 +106,16 @@ def load_and_preprocess_data(variant: str = "full"):
     train_df = train_df.sort_values(['sequence_id', 'sequence_counter'])
 
     # Linear interpolation forward & backward **within each sequence**
-    train_df[feature_cols] = (
-        train_df.groupby('sequence_id')[feature_cols]
+    train_df[seq_feature_cols] = (
+        train_df.groupby('sequence_id')[seq_feature_cols]
                 .transform(lambda x: x.interpolate(method='linear', limit_direction='both'))
     )
 
     # Fallback: column-wise median for any value still NaN (e.g., entire column NaN)
-    train_df[feature_cols] = train_df[feature_cols].fillna(train_df[feature_cols].median())
+    train_df[seq_feature_cols] = train_df[seq_feature_cols].fillna(train_df[seq_feature_cols].median())
 
     # Final safety net: replace any remaining NaN with 0
-    train_df[feature_cols] = train_df[feature_cols].fillna(0)
+    train_df[seq_feature_cols] = train_df[seq_feature_cols].fillna(0)
     
     # Group by sequence to create samples
     print("Grouping by sequence...")
@@ -113,13 +123,15 @@ def load_and_preprocess_data(variant: str = "full"):
     labels = []
     sequence_ids = []
     subjects = []  # Track subject for each sequence
+    static_features_list = [] # <-- 新增
     
     for seq_id, group in train_df.groupby('sequence_id'):
         # Sort by sequence_counter to maintain temporal order
         group = group.sort_values('sequence_counter')
         
         # Extract features and label
-        sequence_features = group[feature_cols].values
+        sequence_features = group[seq_feature_cols].values
+        static_features_list.append(group[static_feature_cols].iloc[0].values) # <-- 新增
         gesture_label = group['gesture_encoded'].iloc[0]  # Same for all steps in sequence
         subject_id = group['subject'].iloc[0]  # Same for all steps in sequence
         
@@ -138,8 +150,11 @@ def load_and_preprocess_data(variant: str = "full"):
     print(f"  Max: {max(seq_lengths)}")
     print(f"  Mean: {np.mean(seq_lengths):.1f}")
     print(f"  Median: {np.median(seq_lengths)}")
+
+    # 将静态特征转换为numpy数组
+    static_features_arr = np.array(static_features_list)
     
-    return sequences, labels, sequence_ids, subjects, label_encoder, feature_cols
+    return sequences, static_features_arr, labels, sequence_ids, subjects, label_encoder, seq_feature_cols
 
 def pad_sequences(sequences, max_length=None):
     """
@@ -174,59 +189,31 @@ def pad_sequences(sequences, max_length=None):
     
     return padded_sequences
 
-def normalize_features(X_train, X_val):
-    """
-    Normalize features across the feature dimension
-    """
-    print("Normalizing features...")
-    
-    # Reshape for normalization: (samples * timesteps, features)
+def normalize_sequential_features(X_train, X_val):
+    """Normalizes the 3D sequential data."""
     n_samples, n_timesteps, n_features = X_train.shape
     X_train_reshaped = X_train.reshape(-1, n_features)
-    X_val_reshaped = X_val.reshape(-1, n_features)
     
-    # Fit scaler on training data
     scaler = StandardScaler()
     X_train_normalized = scaler.fit_transform(X_train_reshaped)
+    
+    X_val_reshaped = X_val.reshape(-1, n_features)
     X_val_normalized = scaler.transform(X_val_reshaped)
     
-    # Reshape back
     X_train_normalized = X_train_normalized.reshape(n_samples, n_timesteps, n_features)
     X_val_normalized = X_val_normalized.reshape(X_val.shape[0], n_timesteps, n_features)
     
     return X_train_normalized, X_val_normalized, scaler
 
-def prepare_data_single_split(variant: str = "full"):
-    """
-    Prepare data with single train/val split (for quick testing)
-    """
-    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data(variant)
-    
-    seq_lengths = [len(seq) for seq in sequences]
-    max_length = 100  # Fixed length - keeps the critical END part of gestures
-    print(f"Using max_length: {max_length} (fixed length, keeps end of gestures)")
-    print(f"Sequence length stats: min={min(seq_lengths)}, max={max(seq_lengths)}, mean={np.mean(seq_lengths):.1f}")
-    
-    X = pad_sequences(sequences, max_length)
-    y = np.array(labels)
-    subjects = np.array(subjects)
-    
-    # Single split using first fold
-    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
-    train_idx, val_idx = next(sgkf.split(X, y, groups=subjects))
-    
-    X_train, X_val = X[train_idx], X[val_idx]
-    y_train, y_val = y[train_idx], y[val_idx]
-    
-    X_train, X_val, scaler = normalize_features(X_train, X_val)
-    
-    # Create outputs directory (repo_root/outputs)
-    weights_dir = _get_weights_dir()
-    le_path = os.path.join(weights_dir, f'label_encoder_{variant}.pkl')
-    with open(le_path, 'wb') as f:
-        pickle.dump(label_encoder, f)
-    
-    return X_train, X_val, y_train, y_val, label_encoder
+# --- NEW: Separate normalization function for static features ---
+def normalize_static_features(X_train_static, X_val_static):
+    """Normalizes the 2D static data."""
+    scaler = StandardScaler()
+    X_train_static_norm = scaler.fit_transform(X_train_static)
+    X_val_static_norm = scaler.transform(X_val_static)
+    return X_train_static_norm, X_val_static_norm, scaler
+
+
 
 def prepare_data_kfold(show_stratification=False, variant: str = "full"):
     """
@@ -237,7 +224,8 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
         show_stratification (bool): If True, show detailed stratification analysis
     """
     # Load and preprocess
-    sequences, labels, sequence_ids, subjects, label_encoder, feature_cols = load_and_preprocess_data(variant)
+    # --- MODIFIED: Unpack new static features array ---
+    sequences, X_static, labels, sequence_ids, subjects, label_encoder, _ = load_and_preprocess_data(variant)
     
     # Pad sequences (use fixed length of 100, keeping the critical END part)
     seq_lengths = [len(seq) for seq in sequences]
@@ -276,14 +264,21 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
         print(f"\n--- Fold {fold_idx + 1} ---")
         
         # Split data
-        X_train_fold = X[train_idx]
-        X_val_fold = X[val_idx]
-        y_train_fold = y[train_idx]
-        y_val_fold = y[val_idx]
-        train_subjects_fold = subjects[train_idx]
-        val_subjects_fold = subjects[val_idx]
+        # --- MODIFIED: Split both sequential and static data ---
+        X_train_seq_fold, X_val_seq_fold = X[train_idx], X[val_idx]
+        X_train_static_fold, X_val_static_fold = X_static[train_idx], X_static[val_idx]
+        y_train_fold, y_val_fold = y[train_idx], y[val_idx]
+        
+        # --- MODIFIED: Normalize both data types separately ---
+        X_train_seq_norm, X_val_seq_norm, seq_scaler = normalize_sequential_features(X_train_seq_fold, X_val_seq_fold)
+        X_train_static_norm, X_val_static_norm, static_scaler = normalize_static_features(X_train_static_fold, X_val_static_fold)
+        
+        print(f"Train shapes: Seq={X_train_seq_norm.shape}, Static={X_train_static_norm.shape}")
+        print(f"Val shapes:   Seq={X_val_seq_norm.shape}, Static={X_val_static_norm.shape}")
         
         # Verify no subject overlap
+        train_subjects_fold = subjects[train_idx]
+        val_subjects_fold = subjects[val_idx]
         train_subjects_set = set(train_subjects_fold)
         val_subjects_set = set(val_subjects_fold)
         overlap = train_subjects_set.intersection(val_subjects_set)
@@ -314,24 +309,20 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
             print(f"Train class distribution: {train_dist}")
             print(f"Val class distribution: {val_dist}")
         
-        # Normalize features for this fold
-        X_train_norm, X_val_norm, scaler_fold = normalize_features(X_train_fold, X_val_fold)
-    
-        print(f"Train shape: {X_train_norm.shape}")
-        print(f"Val shape: {X_val_norm.shape}")
-        
         # Store fold data (include original indices for OOF reconstruction)
+        # --- MODIFIED: Store all data components for the fold ---
         fold_data.append({
-            'fold_idx': fold_idx,
-            'X_train': X_train_norm,
-            'X_val': X_val_norm,
+            'X_train_seq': X_train_seq_norm,
+            'X_train_static': X_train_static_norm,
             'y_train': y_train_fold,
+            'X_val_seq': X_val_seq_norm,
+            'X_val_static': X_val_static_norm,
             'y_val': y_val_fold,
-            'scaler': scaler_fold,
-            'train_subjects': train_subjects_fold,
-            'val_subjects': val_subjects_fold,
-            'train_idx': train_idx,
+            'seq_scaler': seq_scaler,
+            'static_scaler': static_scaler,
             'val_idx': val_idx,
+            'train_subjects': subjects[train_idx],
+            'val_subjects': subjects[val_idx],
         })
     
     # Save preprocessing objects (using fold 0's scaler as default)
@@ -345,14 +336,3 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
     
     # Return additional arrays for OOF handling
     return fold_data, label_encoder, y, sequence_ids
-
-# Backward compatibility
-def prepare_data(variant: str = "full"):
-    """
-    Backward-compatibility wrapper: returns single split for requested variant
-    """
-    return prepare_data_single_split(variant)
-
-if __name__ == "__main__":
-    X_train, X_val, y_train, y_val, label_encoder = prepare_data()
-    print("Data preprocessing completed!") 
