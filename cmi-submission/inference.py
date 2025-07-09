@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""
-CMI – Detect Behavior with Sensor Data
---------------------------------------
-推理脚本（Code Competition 版本）
-
-目录结构::
-    cmi-submission/
-        data/
-            __init__.py
-            data_preprocessing.py   ← pad_sequences 在此
-        models/
-            __init__.py
-            cnn.py                  ← Simple1DCNN & GestureDataset
-        weights/
-            best_model.pth  或  model_fold_1.pth …
-            label_encoder.pkl
-            scaler.pkl
-        inference.py                ← 当前文件
-"""
 
 import os
 import pickle
@@ -302,5 +283,14 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 # ------------------ 启动评测服务器 ------------------
 if __name__ == "__main__":
     import kaggle_evaluation.cmi_inference_server as kis
-    print("🚀  Starting CMIInferenceServer …")
-    kis.CMIInferenceServer(predict).serve()
+    print("🚀 Starting CMIInferenceServer …")
+    inference_server = kis.CMIInferenceServer(predict)
+    if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+        inference_server.serve()
+    else:
+        inference_server.run_local_gateway(
+            data_paths=(
+                "/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv",
+                "/kaggle/input/cmi-detect-behavior-with-sensor-data/test_demographics.csv"
+            )
+        )
