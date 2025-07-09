@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import polars as pl
+from scipy.spatial.transform import Rotation as R
 
 warnings.filterwarnings("ignore")
 
@@ -20,7 +21,7 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
 from models.cnn import Simple1DCNN, GestureDataset
-from data_utils.data_preprocessing import pad_sequences
+from data_utils.data_preprocessing import pad_sequences, feature_engineering
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
@@ -186,50 +187,36 @@ def _decide_variant(seq_df: "pd.DataFrame") -> str:
 
 def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     """
-    Convert a single sequence to a DataFrame suitable for the chosen variant.
-    Padding is now handled AFTER scaling in the predict function.
-    Returns (variant, pd.DataFrame[L, F])
+    Preprocesses a single sequence by applying the full ToF and IMU feature engineering pipeline,
+    ensuring it perfectly matches the training process.
     """
-
     seq_df = seq_pl.to_pandas()
     if not demog_pl.is_empty():
         seq_df = seq_df.merge(demog_pl.to_pandas(), on="subject", how="left")
 
     variant = _decide_variant(seq_df)
+    
+    print(f"🧬 Preprocessing with variant: {variant}")
 
-    meta_cols = [
-        "row_id", "sequence_id", "sequence_type", "sequence_counter",
-        "subject", "orientation", "behavior", "phase",
-    ]
-
-    feat_cols = [c for c in seq_df.columns if c not in meta_cols]
-
-    if variant == "imu":
-        feat_cols = [c for c in feat_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
-
-    # seq_df[feat_cols] = seq_df[feat_cols].replace(-1.0, np.nan)
-
-    # 2-D interpolation for TOF sensor grids (per row) – skip if IMU variant
+    # 1. First, handle all ToF interpolation if needed.
+    # This must be done BEFORE feature engineering.
     if variant != "imu":
         seq_df = interpolate_tof(seq_df)
 
-    # Ensure chronological order before temporal interpolation
-    seq_df = seq_df.sort_values("sequence_counter")
+    # 2. Next, apply the advanced feature engineering.
+    # This function creates new IMU features and handles all NaN values robustly.
+    processed_df, feature_cols = feature_engineering(seq_df)
 
-    # Linear interpolation forward/backward along the time axis
-    seq_df[feat_cols] = seq_df[feat_cols].interpolate(method="linear", limit_direction="both")
+    # 3. If the determined variant is IMU-only, filter out non-IMU columns.
+    # The scaler for the IMU model was trained only on these columns.
+    if variant == "imu":
+        demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm', 'sex_M']
+        imu_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
+        # Keep IMU columns plus any available demographic columns
+        feature_cols = imu_cols + [c for c in demographic_cols if c in processed_df.columns]
 
-    # Fallback to median for any column still containing NaN, then 0 as a last resort
-    # Note: Using the median of the single sequence might be noisy.
-    # A more robust approach would be to load pre-computed medians from the training set.
-    col_medians = seq_df[feat_cols].median()
-    seq_df[feat_cols] = seq_df[feat_cols].fillna(col_medians)
-    seq_df[feat_cols] = seq_df[feat_cols].fillna(0)
-    
-    # ---- Return the feature DataFrame (unscaled, unpadded)
-    # The scaler requires a DataFrame or a NumPy array with the correct feature order.
-    # Slicing with feat_cols ensures the column order is correct.
-    final_features_df = seq_df.sort_values("sequence_counter")[feat_cols]
+    # 4. Return the final feature DataFrame, correctly ordered and ready for scaling.
+    final_features_df = processed_df.sort_values("sequence_counter")[feature_cols]
 
     return variant, final_features_df
 

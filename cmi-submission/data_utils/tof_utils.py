@@ -20,100 +20,84 @@ def get_tof_columns() -> dict:
 
 def _interpolate_block(values: np.ndarray, replacement_value: int = 255) -> np.ndarray:
     """
-    Handles complex data cleaning with added debugging for QhullError.
+    Robustly interpolates a single 8x8 spatial grid. Handles various edge cases.
     """
     values = values.copy()
     grid = values.astype(float).reshape(8, 8)
 
-    if np.all(np.isnan(grid)):
-        return values
-
+    # 替换 -1
     grid[grid == -1] = replacement_value
-
+    
+    # 如果没有NaN，直接返回
     nan_mask = np.isnan(grid)
-    if not nan_mask.any():
+    if not np.any(nan_mask):
         return grid.flatten()
+
+    # 如果全部是NaN，也直接返回（让主函数处理）
+    if np.all(nan_mask):
+        return values # 返回原始的全NaN数组
 
     x, y = np.mgrid[0:8, 0:8]
     valid_points_coords = np.column_stack((x[~nan_mask], y[~nan_mask]))
     valid_points_values = grid[~nan_mask]
-    
+    points_to_interpolate = np.column_stack((x[nan_mask], y[nan_mask]))
+
+    # 3D线性插值至少需要3个非共线的点
     if valid_points_coords.shape[0] < 3:
-        points_to_interpolate = np.column_stack((x[nan_mask], y[nan_mask]))
-        interpolated_values = griddata(
-            valid_points_coords, valid_points_values, points_to_interpolate, method='nearest'
-        )
+        method = 'nearest'
     else:
-        points_to_interpolate = np.column_stack((x[nan_mask], y[nan_mask]))
-        try:
-            interpolated_values = griddata(
-                valid_points_coords, valid_points_values, points_to_interpolate, method='linear'
-            )
-            
-            nan_in_result_mask = np.isnan(interpolated_values)
-            if nan_in_result_mask.any():
-                nearest_values = griddata(
-                    valid_points_coords, valid_points_values, points_to_interpolate[nan_in_result_mask], method='nearest'
-                )
-                interpolated_values[nan_in_result_mask] = nearest_values
+        method = 'linear'
 
-        except QhullError:
-            # --- DEBUGGING BLOCK STARTS HERE ---
-            print("This error occurs when all valid points are collinear (on the same line).")
-            
-            # We print the grid state *before* interpolation is attempted.
-            # This is the grid after -1 has been replaced by large value.
-            print("Problematic 8x8 Grid (after -1 -> large value replacement):")
-            # Use numpy print options for better formatting
-            with np.printoptions(precision=1, suppress=True, linewidth=120):
-                print(grid)
-            
-            print("\nList of valid points' coordinates passed to the algorithm:")
-            print(valid_points_coords)
-            print("="*60 + "\n")
-            # --- DEBUGGING BLOCK ENDS HERE ---
-
-            # Fallback to nearest neighbor interpolation
-            interpolated_values = griddata(
-                valid_points_coords, valid_points_values, points_to_interpolate, method='nearest'
-            )
+    try:
+        interpolated_values = griddata(valid_points_coords, valid_points_values, points_to_interpolate, method=method)
+        nan_in_result = np.isnan(interpolated_values)
+        if np.any(nan_in_result):
+            nearest_values = griddata(valid_points_coords, valid_points_values, points_to_interpolate[nan_in_result], method='nearest')
+            interpolated_values[nan_in_result] = nearest_values
+    except (QhullError, ValueError):
+        interpolated_values = griddata(valid_points_coords, valid_points_values, points_to_interpolate, method='nearest')
 
     grid[nan_mask] = interpolated_values
     
+    # 最终保险：如果还有NaN，用中位数或替换值填充
     if np.isnan(grid).any():
-        median_val = np.nanmedian(grid)
-        grid[np.isnan(grid)] = median_val if not np.isnan(median_val) else float(replacement_value)
+        grid[np.isnan(grid)] = 128
 
     return grid.flatten()
 
-def interpolate_tof(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    An optimized processing function that operates on whole data blocks (sensors)
-    instead of row-by-row.
-    """
 
-    tof_mapping = get_tof_columns()
+def interpolate_tof(df: pd.DataFrame, replacement_value: int = 255) -> pd.DataFrame:
+    """
+    A self-contained, robust function to handle all ToF data interpolation using
+    a two-stage hierarchical strategy: Temporal fill -> Spatial interpolation.
+    """
+    print("\nStarting robust ToF interpolation...")
     df_processed = df.copy()
+    
+    # 假设 get_tof_columns() 存在且能正常工作
+    tof_mapping = get_tof_columns() 
+    all_tof_cols = [col for sensor_cols in tof_mapping.values() for col in sensor_cols]
 
-    print(f"Processing tof df for all {len(df)} rows...")
-    # Loop through the 5 sensors (this loop is fine, it only runs 5 times)
+    # STAGE 1: Temporal Filling for large gaps (all-NaN blocks)
+    if all_tof_cols:
+        print("  Stage 1 (Temporal): Applying forward/backward fill to handle large gaps...")
+        df_processed = df_processed.sort_values(['sequence_id', 'sequence_counter'])
+        df_processed[all_tof_cols] = df_processed.groupby('sequence_id')[all_tof_cols].ffill()
+        df_processed[all_tof_cols] = df_processed.groupby('sequence_id')[all_tof_cols].bfill()
+        # 对于整个序列都是NaN的极端情况，填充一个中性值
+        df_processed[all_tof_cols] = df_processed[all_tof_cols].fillna(128)
+
+
+    # STAGE 2: Spatial Interpolation for scattered NaNs
+    print("  Stage 2 (Spatial): Applying 2D interpolation for scattered NaNs...")
     for sensor_id, cols in tof_mapping.items():
-        
-        
-        # 1. Extract the entire data block for the sensor at once.
-        # Shape will be (8000, 64)
         sensor_data_block = df_processed[cols].to_numpy()
-        
-        # 2. Pre-allocate an array for the results
         processed_block = np.empty_like(sensor_data_block, dtype=float)
         
-        # 3. Loop over the NumPy array. This is MUCH faster than looping over a DataFrame.
         for i in range(sensor_data_block.shape[0]):
-            processed_block[i, :] = _interpolate_block(sensor_data_block[i, :])
+            processed_block[i, :] = _interpolate_block(sensor_data_block[i, :], replacement_value)
             
-        # 4. Assign the processed data back to the DataFrame.
         df_processed[cols] = processed_block
 
-    print("2D Interpolation complete.")
-    
+    print("✅ Robust ToF Interpolation complete.")
     return df_processed
