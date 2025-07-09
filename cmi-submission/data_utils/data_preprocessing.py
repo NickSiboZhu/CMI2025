@@ -164,6 +164,16 @@ class TofScaler(BaseEstimator, TransformerMixin):
             X_transformed[mask] = self.scaler_.transform(valid_data).flatten()
             
         return X_transformed
+    
+    def get_feature_names_out(self, input_features=None):
+        """
+        返回转换后的特征名称。
+        因为此缩放器不改变特征的数量或名称，所以直接返回输入的特征名。
+        """
+        if input_features is None:
+            # 如果scikit-learn版本较旧，可能需要处理这种情况
+            raise ValueError("input_features is required for get_feature_names_out.")
+        return np.asarray(input_features, dtype=object)
 
 def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     """
@@ -224,6 +234,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     try:
         feature_names = scaler.get_feature_names_out()
     except Exception:
+        print("⚠️ Warning: get_feature_names_out() failed. Using original column names.")
         # 兼容旧版本scikit-learn
         feature_names = X_train.columns # 这是一个简化的回退，顺序可能不完全匹配
     
@@ -273,6 +284,11 @@ def prepare_data_kfold(show_stratification=False, variant: str = "full"):
     """
     # 1. Load data to get a single, clean DataFrame
     all_data_df, label_encoder, feature_cols = load_and_preprocess_data(variant)
+
+    weights_dir = _get_weights_dir()
+    le_path = os.path.join(weights_dir, f'label_encoder_{variant}.pkl')
+    with open(le_path, 'wb') as f:
+        pickle.dump(label_encoder, f)
     
     # 2. Create a map for stratification (one row per sequence)
     labels_map_df = all_data_df[['sequence_id', 'gesture_encoded', 'subject']].drop_duplicates().reset_index(drop=True)

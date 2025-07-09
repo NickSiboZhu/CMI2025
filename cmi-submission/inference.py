@@ -93,7 +93,7 @@ def _load_models(device, num_classes, variant: str) -> List[Tuple[torch.nn.Modul
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
 
-            in_channels = scaler.mean_.shape[0]
+            in_channels = len(scaler.get_feature_names_out())
             m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
             m.load_state_dict(torch.load(p, map_location=device))
             m.to(device).eval()
@@ -114,7 +114,7 @@ def _load_models(device, num_classes, variant: str) -> List[Tuple[torch.nn.Modul
         with open(scaler_path, "rb") as f:
             scaler = pickle.load(f)
 
-        in_channels = scaler.mean_.shape[0]
+        in_channels = len(scaler.get_feature_names_out())
         m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
         m.load_state_dict(torch.load(single, map_location=device))
         m.to(device).eval()
@@ -135,7 +135,8 @@ for v in VARIANTS:
     model_scaler_pairs = _load_models(DEVICE, num_classes, v)
 
     # Use the first scaler just to extract in_channels for bookkeeping
-    in_channels = model_scaler_pairs[0][1].mean_.shape[0]
+    first_scaler = model_scaler_pairs[0][1]
+    in_channels = len(first_scaler.get_feature_names_out())
 
     RESOURCES[v] = {
         "label_encoder": le,
@@ -288,6 +289,11 @@ if __name__ == "__main__":
     if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         inference_server.serve()
     else:
+        try:
+            os.chdir('/kaggle/working/')
+        except Exception as e:
+            print(f"Could not change directory to /kaggle/working/: {e}")
+        
         inference_server.run_local_gateway(
             data_paths=(
                 "/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv",

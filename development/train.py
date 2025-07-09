@@ -349,6 +349,11 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start
     # Load best model
     ckpt_name = os.path.join(WEIGHT_DIR, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
     model.load_state_dict(torch.load(ckpt_name))
+
+    # delete temporary best model file
+    if os.path.exists(ckpt_name):
+        os.remove(ckpt_name)
+        print(f"Temporary best model file '{ckpt_name}' deleted.")
     
     return history
 
@@ -652,6 +657,10 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
     best_model_filename = fold_results[best_fold_idx]['model_filename']
     dest_best = os.path.join(WEIGHT_DIR, f'best_model_{variant}.pth')
     shutil.copy(best_model_filename, dest_best)
+    # delete the temporary best model file
+    if os.path.exists(best_model_filename):
+        os.remove(best_model_filename)
+        print(f"Temporary best model file '{best_model_filename}' deleted.")
     print(f"Best model copied to '{dest_best}'")
     
     # Save summary
