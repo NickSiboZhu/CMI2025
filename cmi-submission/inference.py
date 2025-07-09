@@ -42,6 +42,48 @@ from models.fusion import FusionModel
 from data_utils.data_preprocessing import pad_sequences, STATIC_FEATURE_COLS, preprocess_single_sequence_multimodal
 from data_utils.tof_utils import interpolate_tof
 
+# --- NEW: helper utilities for scaler handling ---
+from typing import Union
+from sklearn.preprocessing import StandardScaler
+
+def _get_tof_in_channels(tof_scaler: Union[StandardScaler, list, None]) -> int:
+    """Return the feature dimension (channels) handled by a TOF scaler.
+
+    The training pipeline stores TOF scalers as a *list* of 5 per-sensor
+    StandardScaler objects (one for each 8×8 grid).  Old checkpoints store a
+    single StandardScaler covering all 320 pixels.  This helper unifies both
+    cases.
+    """
+    if tof_scaler is None:
+        return 0
+    # New format → list[StandardScaler] (one per sensor, 64 pixels each)
+    if isinstance(tof_scaler, list):
+        return len(tof_scaler) * 64
+    # Legacy format → single StandardScaler for all pixels
+    return tof_scaler.mean_.shape[0]
+
+
+def _transform_tof(flat_tof: np.ndarray, tof_scaler: Union[StandardScaler, list, None]) -> np.ndarray:
+    """Scale a 2-D (N, 320) TOF array with either a single or a list of scalers."""
+    if tof_scaler is None or flat_tof.shape[1] == 0:
+        return flat_tof  # nothing to do
+
+    if isinstance(tof_scaler, list):
+        # Expect len == 5, each scaler handles 64 columns
+        n_sensors = len(tof_scaler)
+        assert flat_tof.shape[1] == n_sensors * 64, (
+            f"Expected {n_sensors*64} TOF channels, got {flat_tof.shape[1]}")
+        scaled_parts = []
+        for i, scaler in enumerate(tof_scaler):
+            start = i * 64
+            end = start + 64
+            scaled_parts.append(scaler.transform(flat_tof[:, start:end]))
+        return np.concatenate(scaled_parts, axis=1)
+    else:
+        # Single scaler covering all channels
+        return tof_scaler.transform(flat_tof)
+
+
 # ------------------ 全局资源加载 ------------------
 # We support two variants: "full" (uses THM/TOF sensors) and "imu" (IMU-only).
 # Each variant has its own scaler and model weight files.
@@ -120,7 +162,7 @@ def _load_models(device, num_classes, variant: str):
             if variant == "full":
                 with open(tof_scaler_path, "rb") as f:
                     tof_scaler = pickle.load(f)
-                tof_in_channels = tof_scaler.mean_.shape[0]
+                tof_in_channels = _get_tof_in_channels(tof_scaler)
             else:
                 tof_scaler = None
                 tof_in_channels = 0
@@ -167,7 +209,7 @@ def _load_models(device, num_classes, variant: str):
         if variant == "full":
             with open(tof_scaler_path, "rb") as f:
                 tof_scaler = pickle.load(f)
-            tof_in_channels = tof_scaler.mean_.shape[0]
+            tof_in_channels = _get_tof_in_channels(tof_scaler)
         else:
             tof_scaler = None
             tof_in_channels = 0
@@ -334,9 +376,11 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 
             # 2. Scale TOF sequential features
             if tof_scaler is not None and tof_arr.shape[1] > 0:
-                tof_channels = tof_scaler.mean_.shape[0]
-                tof_scaled = tof_scaler.transform(tof_arr.reshape(-1, tof_channels)).reshape(1, SEQ_LEN, tof_channels)
-                tof_scaled = tof_scaled.astype(np.float32)
+                tof_channels = _get_tof_in_channels(tof_scaler)
+                # Flatten to 2-D, apply per-sensor or global scaler, then reshape back
+                tof_flat = tof_arr.reshape(-1, tof_channels)
+                tof_scaled_flat = _transform_tof(tof_flat, tof_scaler)
+                tof_scaled = tof_scaled_flat.reshape(1, SEQ_LEN, tof_channels).astype(np.float32)
             else:
                 tof_scaled = np.empty((1, SEQ_LEN, 0), dtype=np.float32)
 

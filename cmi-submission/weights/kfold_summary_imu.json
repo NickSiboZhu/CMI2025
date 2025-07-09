@@ -2,42 +2,42 @@
   "fold_results": [
     {
       "fold": 1,
-      "best_val_score": 0.7232213076101712,
+      "best_val_score": 0.7195794529436672,
       "model_filename": "/home/ma-user/work/sibozhu/algorithm/cmi_competition/cmi-submission/weights/model_fold_1_imu.pth",
       "train_subjects": 65,
       "val_subjects": 16
     },
     {
       "fold": 2,
-      "best_val_score": 0.679769438348482,
+      "best_val_score": 0.6811794227676439,
       "model_filename": "/home/ma-user/work/sibozhu/algorithm/cmi_competition/cmi-submission/weights/model_fold_2_imu.pth",
       "train_subjects": 65,
       "val_subjects": 16
     },
     {
       "fold": 3,
-      "best_val_score": 0.6859683119563634,
+      "best_val_score": 0.6724304316031199,
       "model_filename": "/home/ma-user/work/sibozhu/algorithm/cmi_competition/cmi-submission/weights/model_fold_3_imu.pth",
       "train_subjects": 65,
       "val_subjects": 16
     },
     {
       "fold": 4,
-      "best_val_score": 0.6665764548771608,
+      "best_val_score": 0.6580174912520924,
       "model_filename": "/home/ma-user/work/sibozhu/algorithm/cmi_competition/cmi-submission/weights/model_fold_4_imu.pth",
       "train_subjects": 65,
       "val_subjects": 16
     },
     {
       "fold": 5,
-      "best_val_score": 0.6903237895868763,
+      "best_val_score": 0.6790595276101102,
       "model_filename": "/home/ma-user/work/sibozhu/algorithm/cmi_competition/cmi-submission/weights/model_fold_5_imu.pth",
       "train_subjects": 64,
       "val_subjects": 17
     }
   ],
-  "mean_best_score": 0.6891718604758108,
-  "std_best_score": 0.018814422180747224,
+  "mean_best_score": 0.6820532652353267,
+  "std_best_score": 0.020436527041720283,
   "best_fold": 1,
-  "best_fold_score": 0.7232213076101712
+  "best_fold_score": 0.7195794529436672
 }

@@ -562,32 +562,30 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         torch.save(model.state_dict(), model_filename)
         print(f"Model saved as '{model_filename}'")
         
-        # Save the scalers corresponding to this fold for inference pairing
-        non_tof_scaler_fold = fold['non_tof_scaler']
-        tof_scaler_fold = fold['tof_scaler']
-        static_scaler_fold = fold['static_scaler']
+        # Save the multimodal scalers for inference pairing
+        fold_scalers = fold
         
         # Create outputs directory if it doesn't exist
         os.makedirs(WEIGHT_DIR, exist_ok=True)
         
-        # Save all three scalers
-        non_tof_scaler_filename = os.path.join(WEIGHT_DIR, f'non_tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
-        static_scaler_filename = os.path.join(WEIGHT_DIR, f'static_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        # Save non-TOF scaler
+        non_tof_scaler_path = os.path.join(WEIGHT_DIR, f'non_tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(non_tof_scaler_path, 'wb') as f:
+            pickle.dump(fold_scalers['non_tof_scaler'], f)
+        print(f"Non-TOF scaler saved as '{non_tof_scaler_path}'")
         
-        with open(non_tof_scaler_filename, 'wb') as f:
-            pickle.dump(non_tof_scaler_fold, f)
-        with open(static_scaler_filename, 'wb') as f:
-            pickle.dump(static_scaler_fold, f)
-            
-        print(f"Non-TOF scaler saved as '{non_tof_scaler_filename}'")
-        print(f"Static scaler saved as '{static_scaler_filename}'")
+        # Save TOF scaler (list of scalers for full variant)
+        if variant == "full" and fold_scalers['tof_scaler'] is not None:
+            tof_scaler_path = os.path.join(WEIGHT_DIR, f'tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+            with open(tof_scaler_path, 'wb') as f:
+                pickle.dump(fold_scalers['tof_scaler'], f)
+            print(f"TOF scaler saved as '{tof_scaler_path}'")
         
-        # Save TOF scaler only if it exists (for full variant)
-        if tof_scaler_fold is not None:
-            tof_scaler_filename = os.path.join(WEIGHT_DIR, f'tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
-            with open(tof_scaler_filename, 'wb') as f:
-                pickle.dump(tof_scaler_fold, f)
-            print(f"TOF scaler saved as '{tof_scaler_filename}'")
+        # Save static scaler
+        static_scaler_path = os.path.join(WEIGHT_DIR, f'static_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(static_scaler_path, 'wb') as f:
+            pickle.dump(fold_scalers['static_scaler'], f)
+        print(f"Static scaler saved as '{static_scaler_path}'")
         
         # Store results
         fold_results.append({
