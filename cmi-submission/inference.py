@@ -39,7 +39,7 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
 from models.fusion import FusionModel
-from data_utils.data_preprocessing import pad_sequences, STATIC_FEATURE_COLS
+from data_utils.data_preprocessing import pad_sequences, STATIC_FEATURE_COLS, preprocess_single_sequence_multimodal
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
@@ -79,10 +79,10 @@ def _load_preprocessing_objects(variant: str):
     return le, scaler
 
 def _load_models(device, num_classes, variant: str):
-    """Load Fusion models together with their matching sequential & static scalers.
+    """Load multimodal Fusion models together with their matching scalers.
 
-    Returns a list of (model, seq_scaler, static_scaler) tuples. Works for both
-    5-fold ensembles and single-model submissions.
+    Returns a list of (model, non_tof_scaler, tof_scaler, static_scaler) tuples. 
+    Works for both 5-fold ensembles and single-model submissions.
     """
     pairs = []
 
@@ -98,50 +98,94 @@ def _load_models(device, num_classes, variant: str):
             parts = basename.split("_")
             fold_num = int(parts[2])  # e.g. model_fold_3_full.pth → 3
 
-            seq_scaler_path    = os.path.join(WEIGHT_DIR, f"seq_scaler_fold_{fold_num}_{variant}.pkl")
-            static_scaler_path = os.path.join(WEIGHT_DIR, f"static_scaler_fold_{fold_num}_{variant}.pkl")
+            non_tof_scaler_path = os.path.join(WEIGHT_DIR, f"non_tof_scaler_fold_{fold_num}_{variant}.pkl")
+            tof_scaler_path     = os.path.join(WEIGHT_DIR, f"tof_scaler_fold_{fold_num}_{variant}.pkl")
+            static_scaler_path  = os.path.join(WEIGHT_DIR, f"static_scaler_fold_{fold_num}_{variant}.pkl")
 
-            if not (os.path.exists(seq_scaler_path) and os.path.exists(static_scaler_path)):
-                raise FileNotFoundError(f"Missing scaler(s) for fold {fold_num} ({variant}).")
+            # Check if all required scalers exist
+            required_scalers = [non_tof_scaler_path, static_scaler_path]
+            if variant == "full":
+                required_scalers.append(tof_scaler_path)
+            
+            missing_scalers = [p for p in required_scalers if not os.path.exists(p)]
+            if missing_scalers:
+                raise FileNotFoundError(f"Missing scaler(s) for fold {fold_num} ({variant}): {missing_scalers}")
 
-            with open(seq_scaler_path, "rb") as f:
-                seq_scaler = pickle.load(f)
+            # Load scalers
+            with open(non_tof_scaler_path, "rb") as f:
+                non_tof_scaler = pickle.load(f)
             with open(static_scaler_path, "rb") as f:
                 static_scaler = pickle.load(f)
+            
+            if variant == "full":
+                with open(tof_scaler_path, "rb") as f:
+                    tof_scaler = pickle.load(f)
+                tof_in_channels = tof_scaler.mean_.shape[0]
+            else:
+                tof_scaler = None
+                tof_in_channels = 0
 
-            seq_in_channels      = seq_scaler.mean_.shape[0]
-            static_in_features   = static_scaler.mean_.shape[0]
+            non_tof_in_channels = non_tof_scaler.mean_.shape[0]
+            static_in_features  = static_scaler.mean_.shape[0]
 
-            model = FusionModel(seq_in_channels, static_in_features, num_classes, SEQ_LEN)
+            model = FusionModel(
+                seq_input_channels=non_tof_in_channels,
+                tof_input_channels=tof_in_channels,
+                static_input_features=static_in_features,
+                num_classes=num_classes,
+                sequence_length=SEQ_LEN
+            )
             model.load_state_dict(torch.load(p, map_location=device))
             model.to(device).eval()
 
-            pairs.append((model, seq_scaler, static_scaler))
+            pairs.append((model, non_tof_scaler, tof_scaler, static_scaler))
     else:
         # Single-model fallback
         weight_path = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
         if not os.path.exists(weight_path):
             raise FileNotFoundError(f"No weight file found for variant '{variant}'.")
 
-        seq_scaler_path    = os.path.join(WEIGHT_DIR, f"seq_scaler_{variant}.pkl")
-        static_scaler_path = os.path.join(WEIGHT_DIR, f"static_scaler_{variant}.pkl")
+        non_tof_scaler_path = os.path.join(WEIGHT_DIR, f"non_tof_scaler_{variant}.pkl")
+        tof_scaler_path     = os.path.join(WEIGHT_DIR, f"tof_scaler_{variant}.pkl")
+        static_scaler_path  = os.path.join(WEIGHT_DIR, f"static_scaler_{variant}.pkl")
 
-        if not (os.path.exists(seq_scaler_path) and os.path.exists(static_scaler_path)):
-            raise FileNotFoundError(f"Missing sequential/static scaler for single-model variant '{variant}'.")
+        # Check required scalers
+        required_scalers = [non_tof_scaler_path, static_scaler_path]
+        if variant == "full":
+            required_scalers.append(tof_scaler_path)
+            
+        missing_scalers = [p for p in required_scalers if not os.path.exists(p)]
+        if missing_scalers:
+            raise FileNotFoundError(f"Missing scaler(s) for single-model variant '{variant}': {missing_scalers}")
 
-        with open(seq_scaler_path, "rb") as f:
-            seq_scaler = pickle.load(f)
+        # Load scalers
+        with open(non_tof_scaler_path, "rb") as f:
+            non_tof_scaler = pickle.load(f)
         with open(static_scaler_path, "rb") as f:
             static_scaler = pickle.load(f)
+        
+        if variant == "full":
+            with open(tof_scaler_path, "rb") as f:
+                tof_scaler = pickle.load(f)
+            tof_in_channels = tof_scaler.mean_.shape[0]
+        else:
+            tof_scaler = None
+            tof_in_channels = 0
 
-        seq_in_channels    = seq_scaler.mean_.shape[0]
-        static_in_features = static_scaler.mean_.shape[0]
+        non_tof_in_channels = non_tof_scaler.mean_.shape[0]
+        static_in_features  = static_scaler.mean_.shape[0]
 
-        model = FusionModel(seq_in_channels, static_in_features, num_classes, SEQ_LEN)
+        model = FusionModel(
+            seq_input_channels=non_tof_in_channels,
+            tof_input_channels=tof_in_channels,
+            static_input_features=static_in_features,
+            num_classes=num_classes,
+            sequence_length=SEQ_LEN
+        )
         model.load_state_dict(torch.load(weight_path, map_location=device))
         model.to(device).eval()
 
-        pairs.append((model, seq_scaler, static_scaler))
+        pairs.append((model, non_tof_scaler, tof_scaler, static_scaler))
 
     return pairs
 
@@ -247,6 +291,7 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     # ---- build padded sequential tensor (unscaled)
     seq_arr = seq_df.sort_values("sequence_counter")[seq_feat_cols].to_numpy()
     seq_arr = pad_sequences([seq_arr], max_length=SEQ_LEN)[0]  # (L, F)
+    seq_arr = seq_arr.astype(np.float32)  # Ensure float32
 
     # ---- static demographic features (order must match training)
     if STATIC_FEATURE_COLS[0] in seq_df.columns:
@@ -268,25 +313,44 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     if sequence.is_empty():
         return MAP_NON_TARGET
 
-    variant, seq_arr, static_vec = preprocess_single_sequence(sequence, demographics)
+    variant, non_tof_arr, tof_arr, static_vec = preprocess_single_sequence_multimodal(sequence, demographics)
 
     res      = RESOURCES[variant]
     le       = res["label_encoder"]
-    pairs    = res["model_scaler_pairs"]  # List[(model, seq_scaler, static_scaler)]
+    pairs    = res["model_scaler_pairs"]  # List[(model, non_tof_scaler, tof_scaler, static_scaler)]
     num_cls  = res["num_classes"]
 
     with torch.no_grad():
         probs_sum = np.zeros((1, num_cls))
-        for model, seq_scaler, static_scaler in pairs:
+        for model, non_tof_scaler, tof_scaler, static_scaler in pairs:
             # ----- scale inputs -----
-            seq_channels = seq_scaler.mean_.shape[0]
-            seq_scaled = seq_scaler.transform(seq_arr.reshape(-1, seq_channels)).reshape(1, SEQ_LEN, seq_channels)
+            # 1. Scale non-TOF sequential features
+            if non_tof_scaler is not None and non_tof_arr.shape[1] > 0:
+                non_tof_channels = non_tof_scaler.mean_.shape[0]
+                non_tof_scaled = non_tof_scaler.transform(non_tof_arr.reshape(-1, non_tof_channels)).reshape(1, SEQ_LEN, non_tof_channels)
+                non_tof_scaled = non_tof_scaled.astype(np.float32)
+            else:
+                non_tof_scaled = np.empty((1, SEQ_LEN, 0), dtype=np.float32)
+
+            # 2. Scale TOF sequential features
+            if tof_scaler is not None and tof_arr.shape[1] > 0:
+                tof_channels = tof_scaler.mean_.shape[0]
+                tof_scaled = tof_scaler.transform(tof_arr.reshape(-1, tof_channels)).reshape(1, SEQ_LEN, tof_channels)
+                tof_scaled = tof_scaled.astype(np.float32)
+            else:
+                tof_scaled = np.empty((1, SEQ_LEN, 0), dtype=np.float32)
+
+            # 3. Scale static features
             static_scaled = static_scaler.transform(static_vec.reshape(1, -1))  # (1, static_features)
+            static_scaled = static_scaled.astype(np.float32)
 
-            xb_seq   = torch.from_numpy(seq_scaled).to(DEVICE)
-            xb_stat  = torch.from_numpy(static_scaled).to(DEVICE)
+            # Convert to tensors
+            xb_non_tof = torch.from_numpy(non_tof_scaled).to(DEVICE)
+            xb_tof     = torch.from_numpy(tof_scaled).to(DEVICE)
+            xb_static  = torch.from_numpy(static_scaled).to(DEVICE)
 
-            probs = torch.softmax(model(xb_seq, xb_stat), dim=1).cpu().numpy()
+            # Forward pass through multimodal model
+            probs = torch.softmax(model(xb_non_tof, xb_tof, xb_static), dim=1).cpu().numpy()
             probs_sum += probs
 
         probs = probs_sum / len(pairs)
@@ -299,5 +363,14 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 # ------------------ 启动评测服务器 ------------------
 if __name__ == "__main__":
     import kaggle_evaluation.cmi_inference_server as kis
-    print("🚀  Starting CMIInferenceServer …")
-    kis.CMIInferenceServer(predict).serve()
+    print("🚀 Starting CMIInferenceServer …")
+    inference_server = kis.CMIInferenceServer(predict)
+    if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+        inference_server.serve()
+    else:
+        inference_server.run_local_gateway(
+            data_paths=(
+                "/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv",
+                "/kaggle/input/cmi-detect-behavior-with-sensor-data/test_demographics.csv"
+            )
+        )

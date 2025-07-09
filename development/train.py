@@ -44,7 +44,7 @@ from utils.scheduler import get_cosine_schedule_with_warmup
 # Import our model and data preprocessing
 from models.fusion import FusionModel
 from models.datasets import MultimodalDataset
-from data_utils.data_preprocessing import prepare_data_kfold
+from data_utils.data_preprocessing import prepare_data_kfold_multimodal
 
 # Directory holding all models, scalers, summaries
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
@@ -207,11 +207,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     all_preds = []
     all_targets = []
     
-    for (seq_data, static_data), target in dataloader:
-        seq_data, static_data, target = seq_data.to(device), static_data.to(device), target.to(device)
+    for (non_tof_data, tof_data, static_data), target in dataloader:
+        non_tof_data = non_tof_data.to(device)
+        tof_data = tof_data.to(device)
+        static_data = static_data.to(device)
+        target = target.to(device)
         
         optimizer.zero_grad() # reset gradients
-        output = model(seq_data, static_data) # forward pass
+        output = model(non_tof_data, tof_data, static_data) # forward pass
         loss = criterion(output, target) # compute loss
         loss.backward() #  compute new gradients for each parameter
         optimizer.step() # update weights
@@ -250,9 +253,12 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_enco
     all_targets = []
     
     with torch.no_grad():
-        for (seq_data, static_data), target in dataloader:
-            seq_data, static_data, target = seq_data.to(device), static_data.to(device), target.to(device)
-            output = model(seq_data, static_data)
+        for (non_tof_data, tof_data, static_data), target in dataloader:
+            non_tof_data = non_tof_data.to(device)
+            tof_data = tof_data.to(device)
+            static_data = static_data.to(device)
+            target = target.to(device)
+            output = model(non_tof_data, tof_data, static_data)
             loss = criterion(output, target)
             
             total_loss += loss.item()
@@ -425,22 +431,25 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         device = setup_device()
     
     # Prepare all folds and get full labels & sequence IDs for OOF reconstruction
-    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold(show_stratification=show_stratification, variant=variant)
+    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(show_stratification=show_stratification, variant=variant)
     num_samples = len(y_all)
     oof_preds = np.full(num_samples, -1, dtype=int)
     oof_targets = y_all.copy()
     
     # Model parameters (same for all folds)
-    sample_seq_data = fold_data[0]['X_train_seq']
+    sample_non_tof_data = fold_data[0]['X_train_non_tof']
+    sample_tof_data = fold_data[0]['X_train_tof']
     sample_static_data = fold_data[0]['X_train_static']
     
-    seq_input_channels = sample_seq_data.shape[2]
+    non_tof_input_channels = sample_non_tof_data.shape[2]
+    tof_input_channels = sample_tof_data.shape[2]
     static_input_features = sample_static_data.shape[1]
-    sequence_length = sample_seq_data.shape[1]
+    sequence_length = sample_non_tof_data.shape[1]
     num_classes = len(label_encoder.classes_)
     
     print(f"\nModel configuration:")
-    print(f"  Sequential Channels: {seq_input_channels}")
+    print(f"  Non-TOF Sequential Channels: {non_tof_input_channels}")
+    print(f"  TOF Sequential Channels: {tof_input_channels}")
     print(f"  Static Features: {static_input_features}")
     print(f"  Sequence Length: {sequence_length}")
     print(f"  Number of classes: {num_classes}")
@@ -463,18 +472,32 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # print(f"Fold {fold_idx + 1} - Train: {X_train.shape}, Val: {X_val.shape}")
         
-        # # Create datasets and dataloaders
-        # train_dataset = GestureDataset(X_train, y_train)
-        # val_dataset = GestureDataset(X_val, y_val)
-        train_dataset = MultimodalDataset(fold['X_train_seq'], fold['X_train_static'], fold['y_train'])
-        val_dataset = MultimodalDataset(fold['X_val_seq'], fold['X_val_static'], fold['y_val'])
+        # Create multimodal datasets and dataloaders
+        train_dataset = MultimodalDataset(
+            fold['X_train_non_tof'], 
+            fold['X_train_tof'], 
+            fold['X_train_static'], 
+            fold['y_train']
+        )
+        val_dataset = MultimodalDataset(
+            fold['X_val_non_tof'], 
+            fold['X_val_tof'], 
+            fold['X_val_static'], 
+            fold['y_val']
+        )
         
         train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
-        model = FusionModel(seq_input_channels, static_input_features, num_classes, sequence_length)
+        model = FusionModel(
+            seq_input_channels=non_tof_input_channels,
+            tof_input_channels=tof_input_channels,
+            static_input_features=static_input_features,
+            num_classes=num_classes,
+            sequence_length=sequence_length
+        )
         
         try:
             model = model.to(device)
@@ -540,23 +563,31 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         print(f"Model saved as '{model_filename}'")
         
         # Save the scalers corresponding to this fold for inference pairing
-        seq_scaler_fold = fold['seq_scaler']
+        non_tof_scaler_fold = fold['non_tof_scaler']
+        tof_scaler_fold = fold['tof_scaler']
         static_scaler_fold = fold['static_scaler']
         
         # Create outputs directory if it doesn't exist
         os.makedirs(WEIGHT_DIR, exist_ok=True)
         
-        # Save both scalers
-        seq_scaler_filename = os.path.join(WEIGHT_DIR, f'seq_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        # Save all three scalers
+        non_tof_scaler_filename = os.path.join(WEIGHT_DIR, f'non_tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
         static_scaler_filename = os.path.join(WEIGHT_DIR, f'static_scaler_fold_{fold_idx + 1}_{variant}.pkl')
         
-        with open(seq_scaler_filename, 'wb') as f:
-            pickle.dump(seq_scaler_fold, f)
+        with open(non_tof_scaler_filename, 'wb') as f:
+            pickle.dump(non_tof_scaler_fold, f)
         with open(static_scaler_filename, 'wb') as f:
             pickle.dump(static_scaler_fold, f)
             
-        print(f"Sequential scaler saved as '{seq_scaler_filename}'")
+        print(f"Non-TOF scaler saved as '{non_tof_scaler_filename}'")
         print(f"Static scaler saved as '{static_scaler_filename}'")
+        
+        # Save TOF scaler only if it exists (for full variant)
+        if tof_scaler_fold is not None:
+            tof_scaler_filename = os.path.join(WEIGHT_DIR, f'tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+            with open(tof_scaler_filename, 'wb') as f:
+                pickle.dump(tof_scaler_fold, f)
+            print(f"TOF scaler saved as '{tof_scaler_filename}'")
         
         # Store results
         fold_results.append({
