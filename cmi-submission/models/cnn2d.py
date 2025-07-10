@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+from . import MODELS
 
 class TOF2DCNN(nn.Module):
     """
@@ -8,38 +9,35 @@ class TOF2DCNN(nn.Module):
     
     Each TOF sensor provides an 8x8 grid of depth values.
     This module processes multiple TOF sensors and extracts spatial features.
-    
-    Args:
-        num_tof_sensors (int): Number of TOF sensors (typically 5)
-        out_features (int): Output feature dimension after processing
     """
     
-    def __init__(self, num_tof_sensors=5, out_features=128):
+    def __init__(self, num_tof_sensors=5, out_features=128, 
+                 conv_channels=None, kernel_sizes=None):
         super(TOF2DCNN, self).__init__()
         
         self.num_tof_sensors = num_tof_sensors
         self.out_features = out_features
         
-        # 2D CNN layers for processing 8x8 grids
-        # Input: (batch_size, num_sensors, 8, 8)
-        self.conv_layers = nn.Sequential(
-            # First conv block
-            nn.Conv2d(num_tof_sensors, 32, kernel_size=3, padding=1),  # 8x8 -> 8x8
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 8x8 -> 4x4
-            
-            # Second conv block
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),  # 4x4 -> 4x4
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),  # 4x4 -> 2x2
-            
-            # Third conv block
-            nn.Conv2d(64, 128, kernel_size=2, padding=0),  # 2x2 -> 1x1
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-        )
+        # Dynamic 2D conv stack
+        if conv_channels is None:
+            conv_channels = [32, 64, 128]
+        if kernel_sizes is None:
+            kernel_sizes = [3, 3, 2]
+        assert len(conv_channels) == len(kernel_sizes), "conv_channels and kernel_sizes length mismatch"
+
+        layers = []
+        in_channels = num_tof_sensors
+        for i, (out_c, k) in enumerate(zip(conv_channels, kernel_sizes)):
+            layers.append(nn.Conv2d(in_channels, out_c, kernel_size=k, padding=k//2 if k > 2 else 0))
+            layers.append(nn.BatchNorm2d(out_c))
+            layers.append(nn.ReLU())
+            # Only add MaxPool2d for first layers, avoid over-pooling small spatial dimensions
+            if i < len(conv_channels) - 1:  # Don't pool on the last layer
+                layers.append(nn.MaxPool2d(2))
+            in_channels = out_c
+        
+        self.conv_layers = nn.Sequential(*layers)
+        self.last_conv_channels = conv_channels[-1]
         
         # Global average pooling to get fixed-size output
         self.global_pool = nn.AdaptiveAvgPool2d(1)
@@ -47,7 +45,7 @@ class TOF2DCNN(nn.Module):
         # Final projection layer
         self.projection = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128, out_features),
+            nn.Linear(self.last_conv_channels, out_features),
             nn.ReLU(),
             nn.Dropout(0.3)
         )
@@ -64,7 +62,7 @@ class TOF2DCNN(nn.Module):
             Tensor of shape (batch_size, out_features)
         """
         # Process through 2D convolutions
-        x = self.conv_layers(tof_grids)  # (batch, 128, 1, 1)
+        x = self.conv_layers(tof_grids)  # (batch, 128, 1, 1) after conv layers
         
         # Global pooling (redundant here since we already have 1x1, but good practice)
         x = self.global_pool(x)  # (batch, 128, 1, 1)
@@ -115,6 +113,7 @@ def reshape_tof_features(tof_features, num_sensors=5):
     return tof_grids
 
 
+@MODELS.register_module()
 class TemporalTOF2DCNN(nn.Module):
     """
     2D CNN for processing sequential TOF sensor data.
@@ -128,15 +127,16 @@ class TemporalTOF2DCNN(nn.Module):
         out_features (int): Output feature dimension
     """
     
-    def __init__(self, num_tof_sensors=5, seq_len=100, out_features=128):
+    def __init__(self, num_tof_sensors=5, seq_len=100, out_features=128,
+                 conv_channels=None, kernel_sizes=None):
         super(TemporalTOF2DCNN, self).__init__()
         
         self.num_tof_sensors = num_tof_sensors
         self.seq_len = seq_len
         self.out_features = out_features
         
-        # 2D CNN for processing individual timesteps
-        self.spatial_cnn = TOF2DCNN(num_tof_sensors, out_features)
+        # 2D CNN for processing individual timesteps (pass through conv params)
+        self.spatial_cnn = TOF2DCNN(num_tof_sensors, out_features, conv_channels, kernel_sizes)
         
         # Temporal aggregation layer (could be LSTM, attention, or simple pooling)
         self.temporal_aggregation = nn.Sequential(

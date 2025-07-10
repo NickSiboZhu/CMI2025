@@ -1,39 +1,48 @@
 import torch
 import torch.nn as nn
+from . import MODELS  # Import registry
 
-class Simple1DCNN(nn.Module):
+@MODELS.register_module()
+class CNN1D(nn.Module):
     """
     Simple 1D CNN for gesture classification.
     
     REFACTORED: This class is now modular. It can function as a standalone
     classifier or as a feature extractor for a larger fusion model.
     """
-    def __init__(self, input_channels, num_classes, sequence_length):
-        super(Simple1DCNN, self).__init__()
+    def __init__(self,
+                 input_channels: int,
+                 sequence_length: int = 100,
+                 # legacy arg for standalone classifier
+                 num_classes: int = 18,
+                 # v3 architecture lists
+                 filters: list = None,
+                 kernel_sizes: list = None):
+        super(CNN1D, self).__init__()
         
-        # --- 1. Feature Extractor Block ---
-        # All convolutional layers are now grouped into a single sequential module.
-        self.feature_extractor = nn.Sequential(
-            nn.Conv1d(input_channels, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.MaxPool1d(kernel_size=2),
-            
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            
-            # Global pooling layer to handle variable lengths and create a fixed-size output.
-            nn.AdaptiveMaxPool1d(1)
-        )
-        
-        # The output size of the feature_extractor is the number of channels from the last conv layer.
-        self.cnn_output_size = 256
+        # ------------------------------------------------------------------
+        # Dynamic conv stack -------------------------------------------------
+        # ------------------------------------------------------------------
+        if filters is None:
+            filters = [64, 128, 256]
+        if kernel_sizes is None:
+            kernel_sizes = [5, 5, 3]
+        assert len(filters) == len(kernel_sizes), "filters and kernel_sizes length mismatch"
+
+        layers = []
+        ln_layers = []  # store LayerNorm to apply after transpose
+        in_channels = input_channels
+        for out_c, k in zip(filters, kernel_sizes):
+            layers.append(nn.Conv1d(in_channels, out_c, kernel_size=k, padding=k//2))
+            ln_layers.append(nn.LayerNorm(out_c))
+            in_channels = out_c
+        self.conv_layers = nn.ModuleList(layers)
+        self.ln_layers = nn.ModuleList(ln_layers)
+
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.global_pool = nn.AdaptiveMaxPool1d(1)
+
+        self.cnn_output_size = filters[-1]
         
         # --- 2. Classifier Block ---
         # The original classifier head is kept for when this model is used standalone.
@@ -59,8 +68,7 @@ class Simple1DCNN(nn.Module):
     # --- NEW: Feature Extraction method ---
     def extract_features(self, x):
         """
-        This method only performs feature extraction. It will be called by the
-        main FusionModel.
+        This method only performs feature extraction with LayerNorm.
         
         Args:
             x: Input tensor of shape (batch_size, sequence_length, features)
@@ -68,14 +76,23 @@ class Simple1DCNN(nn.Module):
         Returns:
             A flattened feature tensor of shape (batch_size, cnn_output_size)
         """
-        # Conv1d expects: (batch_size, features, sequence_length)
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2)  # (batch, channels, seq_len)
+
+        for conv, ln in zip(self.conv_layers, self.ln_layers):
+            x = conv(x)
+            x = x.transpose(1, 2)  # (batch, seq_len, channels) for LN
+            x = ln(x)
+            x = x.transpose(1, 2)
+            x = torch.relu(x)
+            # Apply pooling except maybe last layer to keep information; here pool after every conv except last
+            if conv != self.conv_layers[-1]:
+                x = self.pool(x)
         
-        # Pass through the convolutional layers
-        x = self.feature_extractor(x) # Shape: (batch_size, 256, 1)
+        # Global pooling
+        x = self.global_pool(x)  # (batch, 256, 1)
         
         # Flatten the output for concatenation in the fusion model
-        x = x.view(x.size(0), -1) # Shape: (batch_size, 256)
+        x = x.view(x.size(0), -1)  # (batch, 256)
         
         return x
 

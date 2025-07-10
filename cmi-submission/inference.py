@@ -11,7 +11,7 @@ CMI – Detect Behavior with Sensor Data
             data_preprocessing.py   ← pad_sequences 在此
         models/
             __init__.py
-            cnn.py                  ← Simple1DCNN & GestureDataset
+            cnn.py                  ← CNN1D & GestureDataset
         weights/
             best_model.pth  或  model_fold_1.pth …
             label_encoder.pkl
@@ -38,7 +38,7 @@ BASE_DIR   = os.path.dirname(__file__)
 WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
-from models.fusion import FusionModel
+from models.multimodality import MultimodalityModel
 from data_utils.data_preprocessing import pad_sequences, STATIC_FEATURE_COLS, preprocess_single_sequence_multimodal
 from data_utils.tof_utils import interpolate_tof
 
@@ -170,7 +170,7 @@ def _load_models(device, num_classes, variant: str):
             non_tof_in_channels = non_tof_scaler.mean_.shape[0]
             static_in_features  = static_scaler.mean_.shape[0]
 
-            model = FusionModel(
+            model = MultimodalityModel(
                 seq_input_channels=non_tof_in_channels,
                 tof_input_channels=tof_in_channels,
                 static_input_features=static_in_features,
@@ -217,7 +217,7 @@ def _load_models(device, num_classes, variant: str):
         non_tof_in_channels = non_tof_scaler.mean_.shape[0]
         static_in_features  = static_scaler.mean_.shape[0]
 
-        model = FusionModel(
+        model = MultimodalityModel(
             seq_input_channels=non_tof_in_channels,
             tof_input_channels=tof_in_channels,
             static_input_features=static_in_features,

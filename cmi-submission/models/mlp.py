@@ -1,5 +1,7 @@
 import torch.nn as nn
+from . import MODELS  # Import registry
 
+@MODELS.register_module()
 class MLP(nn.Module):
     """
     An MLP (Multi-Layer Perceptron) branch for processing static tabular features.
@@ -7,36 +9,50 @@ class MLP(nn.Module):
     This class builds a simple neural network to convert participant demographics 
     (e.g., age, sex) into a dense feature vector (embedding).
     """
-    def __init__(self, static_input_features: int, mlp_output_size: int = 32):
+    def __init__(self,
+                 # v2 legacy args
+                 static_input_features: int = None,
+                 mlp_output_size: int = None,
+                 # v3 new args
+                 input_features: int = None,
+                 hidden_dims: list = None,
+                 output_dim: int = None,
+                 dropout_rate: float = 0.5):
         """
-        Initializes the layers of the MLP branch.
-
-        Args:
-            static_input_features (int): Number of input static features (7 in this project).
-            mlp_output_size (int): The final output feature dimension of the MLP branch. Defaults to 32.
+        Dynamic constructor that supports both the original (static_input_features, mlp_output_size)
+        signature and the new v3 signature based on a list of hidden_dims.
         """
         super(MLP, self).__init__()
-        
-        # We use nn.Sequential to chain all layers together neatly.
-        # Data will pass through these layers in the defined order.
-        self.layers = nn.Sequential(
-            # First fully connected layer: Maps the 7 input features to a 64-dimensional hidden space.
-            nn.Linear(static_input_features, 64),
-            
-            # ReLU activation function: Introduces non-linearity, allowing the model to learn more complex relationships.
-            nn.ReLU(),
-            
-            # Dropout layer: Randomly "turns off" some neurons during training, an effective method to prevent overfitting.
-            nn.Dropout(0.5),
-            
-            # Second fully connected layer: Compresses the 64-dimensional hidden features to the final 32-dimensional output.
-            # This 32D vector is the feature embedding for the static data.
-            nn.Linear(64, mlp_output_size)
-        )
+
+        # Back-compat mapping ------------------------------------------------
+        if input_features is None:
+            input_features = static_input_features
+        if output_dim is None and mlp_output_size is not None:
+            output_dim = mlp_output_size
+        if hidden_dims is None:
+            hidden_dims = [64]
+        if output_dim is None:
+            output_dim = 32
+
+        layers = []
+        in_dim = input_features
+        for h_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, h_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            in_dim = h_dim
+        layers.append(nn.Linear(in_dim, output_dim))
+
+        self.layers = nn.Sequential(*layers)
+        self.output_dim = output_dim
 
     def forward(self, x):
         """
         Defines the forward pass logic for the MLP branch.
         """
         return self.layers(x)
+
+    # New helper for MultimodalityModel
+    def get_output_size(self):
+        return self.output_dim
 
