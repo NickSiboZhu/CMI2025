@@ -52,7 +52,7 @@ def load_py_config(config_path):
 # Ensure shared code in cmi-submission/ is the one we import everywhere
 # ----------------------------------------------------------------------
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))             # …/development
-SUBM_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, '..', 'cmi-submission'))
+SUBM_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, '..', 'cmi-submission'))   # .. means go up one level
 
 # Pre-pend so it has priority over the local development/ path.
 if SUBM_DIR not in sys.path:
@@ -395,24 +395,22 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
     oof_preds = np.full(num_samples, -1, dtype=int)
     oof_targets = y_all.copy()
     
+    # Dynamically inject feature dimensions from actual data
+    sample_non_tof = fold_data[0]['X_train_non_tof']
+    sample_static = fold_data[0]['X_train_static']
+    
+    non_tof_channels = sample_non_tof.shape[2]
+    static_features = sample_static.shape[1]
+    
+    print(f"Auto-detected dimensions:")
+    print(f"  Non-TOF sequential channels: {non_tof_channels}")
+    print(f"  Static features: {static_features}")
+    
+    # Inject into model config
+    model_cfg['cnn_branch_cfg']['input_channels'] = non_tof_channels
+    model_cfg['mlp_branch_cfg']['input_features'] = static_features
+    
     # Model parameters (same for all folds)
-    # sample_non_tof_data = fold_data[0]['X_train_non_tof']
-    # sample_tof_data = fold_data[0]['X_train_tof']
-    # sample_static_data = fold_data[0]['X_train_static']
-    
-    # non_tof_input_channels = sample_non_tof_data.shape[2]
-    # tof_input_channels = sample_tof_data.shape[2]
-    # static_input_features = sample_static_data.shape[1]
-    # sequence_length = sample_non_tof_data.shape[1]
-    # num_classes = len(label_encoder.classes_)
-    
-    # print(f"\nModel configuration:")
-    # print(f"  Non-TOF Sequential Channels: {non_tof_input_channels}")
-    # print(f"  TOF Sequential Channels: {tof_input_channels}")
-    # print(f"  Static Features: {static_input_features}")
-    # print(f"  Sequence Length: {sequence_length}")
-    # print(f"  Number of classes: {num_classes}")
-    
     # Display model configuration from config file
     print(f"\nModel configuration from config file:")
     for k, v in (model_cfg or {}).items():
@@ -443,10 +441,6 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # Get fold data
         fold = fold_data[fold_idx]
-        # X_train, X_val = fold['X_train'], fold['X_val']
-        # y_train, y_val = fold['y_train'], fold['y_val']
-        
-        # print(f"Fold {fold_idx + 1} - Train: {X_train.shape}, Val: {X_val.shape}")
         
         # Create multimodal datasets and dataloaders
         train_dataset = MultimodalDataset(
@@ -467,14 +461,6 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
-        # model_cfg = {
-        #     'type': 'MultimodalityModel',
-        #     'seq_input_channels': non_tof_input_channels,
-        #     'tof_input_channels': tof_input_channels,
-        #     'static_input_features': static_input_features,
-        #     'num_classes': num_classes,
-        #     'sequence_length': sequence_length
-        # }
         model = build_from_cfg(model_cfg, MODELS)
         
         # Configure loss function for this fold
@@ -549,7 +535,11 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # Save model for this fold
         model_filename = os.path.join(WEIGHT_DIR, f'model_fold_{fold_idx + 1}_{variant}.pth')
-        torch.save(model.state_dict(), model_filename)
+        checkpoint = {
+            'state_dict': model.state_dict(),
+            'model_cfg': model_cfg
+        }
+        torch.save(checkpoint, model_filename)
         print(f"Model saved as '{model_filename}'")
         
         # Save the multimodal scalers for inference pairing

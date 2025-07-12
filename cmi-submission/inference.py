@@ -170,14 +170,30 @@ def _load_models(device, num_classes, variant: str):
             non_tof_in_channels = non_tof_scaler.mean_.shape[0]
             static_in_features  = static_scaler.mean_.shape[0]
 
-            model = MultimodalityModel(
-                seq_input_channels=non_tof_in_channels,
-                tof_input_channels=tof_in_channels,
-                static_input_features=static_in_features,
-                num_classes=num_classes,
-                sequence_length=SEQ_LEN
-            )
-            model.load_state_dict(torch.load(p, map_location=device))
+            # Build model **with the same architecture used during training**
+            ckpt = torch.load(p, map_location=device)
+            if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
+                model_cfg = ckpt['model_cfg']
+                # Remove 'type' key as it's for registry, not constructor
+                model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
+                state_dict = ckpt['state_dict']
+                model = MultimodalityModel(**model_cfg)
+                model.load_state_dict(state_dict)
+            else:
+                # Fallback for legacy checkpoints without config – use previous hard-coded builder
+                if variant == "full":
+                    cnn_branch_cfg = dict(type='CNN1D', input_channels=non_tof_in_channels, sequence_length=SEQ_LEN, filters=[64, 128, 256], kernel_sizes=[5, 5, 3])
+                    mlp_branch_cfg = dict(type='MLP', input_features=static_in_features, hidden_dims=[64, 128], output_dim=32, dropout_rate=0.5)
+                    fusion_head_cfg = dict(type='FusionHead', input_dim=None, num_classes=num_classes, hidden_dims=[512, 256, 128], dropout_rates=[0.5, 0.4, 0.3])
+                    tof_branch_cfg = dict(type='TemporalTOF2DCNN', num_tof_sensors=5, seq_len=SEQ_LEN, out_features=128, conv_channels=[32, 64, 128], kernel_sizes=[3, 3, 2])
+                else:
+                    cnn_branch_cfg = dict(type='CNN1D', input_channels=non_tof_in_channels, sequence_length=SEQ_LEN, filters=[32, 64, 128], kernel_sizes=[5, 5, 3])
+                    mlp_branch_cfg = dict(type='MLP', input_features=static_in_features, hidden_dims=[64], output_dim=32, dropout_rate=0.5)
+                    fusion_head_cfg = dict(type='FusionHead', input_dim=None, num_classes=num_classes, hidden_dims=[256, 128], dropout_rates=[0.5, 0.3])
+                    tof_branch_cfg = dict(type='TemporalTOF2DCNN', num_tof_sensors=5, seq_len=SEQ_LEN, out_features=128)
+
+                model = MultimodalityModel(seq_input_channels=non_tof_in_channels, tof_input_channels=tof_in_channels, static_input_features=static_in_features, num_classes=num_classes, sequence_length=SEQ_LEN, cnn_branch_cfg=cnn_branch_cfg, mlp_branch_cfg=mlp_branch_cfg, fusion_head_cfg=fusion_head_cfg, tof_branch_cfg=tof_branch_cfg)
+                model.load_state_dict(ckpt if not isinstance(ckpt, dict) else ckpt)
             model.to(device).eval()
 
             pairs.append((model, non_tof_scaler, tof_scaler, static_scaler))
@@ -217,14 +233,72 @@ def _load_models(device, num_classes, variant: str):
         non_tof_in_channels = non_tof_scaler.mean_.shape[0]
         static_in_features  = static_scaler.mean_.shape[0]
 
-        model = MultimodalityModel(
-            seq_input_channels=non_tof_in_channels,
-            tof_input_channels=tof_in_channels,
-            static_input_features=static_in_features,
-            num_classes=num_classes,
-            sequence_length=SEQ_LEN
-        )
-        model.load_state_dict(torch.load(weight_path, map_location=device))
+        # Build model **with the same architecture used during training**
+        ckpt = torch.load(weight_path, map_location=device)
+        if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
+            model_cfg = ckpt['model_cfg']
+            # Remove 'type' key as it's for registry, not constructor
+            model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
+            state_dict = ckpt['state_dict']
+            model = MultimodalityModel(**model_cfg)
+            model.load_state_dict(state_dict)
+        else:
+            # Fallback for legacy checkpoints without config – use previous hard-coded builder
+            if variant == "full":
+                cnn_branch_cfg = dict(type='CNN1D',
+                                      input_channels=non_tof_in_channels,
+                                      sequence_length=SEQ_LEN,
+                                      filters=[64, 128, 256],
+                                      kernel_sizes=[5, 5, 3])
+                mlp_branch_cfg = dict(type='MLP',
+                                      input_features=static_in_features,
+                                      hidden_dims=[64, 128],
+                                      output_dim=32,
+                                      dropout_rate=0.5)
+                fusion_head_cfg = dict(type='FusionHead',
+                                       input_dim=None,  # filled inside model
+                                       num_classes=num_classes,
+                                       hidden_dims=[512, 256, 128],
+                                       dropout_rates=[0.5, 0.4, 0.3])
+                tof_branch_cfg = dict(type='TemporalTOF2DCNN',
+                                      num_tof_sensors=5,
+                                      seq_len=SEQ_LEN,
+                                      out_features=128,
+                                      conv_channels=[32, 64, 128],
+                                      kernel_sizes=[3, 3, 2])
+            else:  # imu variant
+                cnn_branch_cfg = dict(type='CNN1D',
+                                      input_channels=non_tof_in_channels,
+                                      sequence_length=SEQ_LEN,
+                                      filters=[32, 64, 128],
+                                      kernel_sizes=[5, 5, 3])
+                mlp_branch_cfg = dict(type='MLP',
+                                      input_features=static_in_features,
+                                      hidden_dims=[64],
+                                      output_dim=32,
+                                      dropout_rate=0.5)
+                fusion_head_cfg = dict(type='FusionHead',
+                                       input_dim=None,
+                                       num_classes=num_classes,
+                                       hidden_dims=[256, 128],
+                                       dropout_rates=[0.5, 0.3])
+                tof_branch_cfg = dict(type='TemporalTOF2DCNN',
+                                      num_tof_sensors=5,
+                                      seq_len=SEQ_LEN,
+                                      out_features=128)
+
+            model = MultimodalityModel(
+                seq_input_channels=non_tof_in_channels,
+                tof_input_channels=tof_in_channels,
+                static_input_features=static_in_features,
+                num_classes=num_classes,
+                sequence_length=SEQ_LEN,
+                cnn_branch_cfg=cnn_branch_cfg,
+                mlp_branch_cfg=mlp_branch_cfg,
+                fusion_head_cfg=fusion_head_cfg,
+                tof_branch_cfg=tof_branch_cfg,
+            )
+            model.load_state_dict(ckpt if not isinstance(ckpt, dict) else ckpt)
         model.to(device).eval()
 
         pairs.append((model, non_tof_scaler, tof_scaler, static_scaler))

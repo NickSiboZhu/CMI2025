@@ -48,9 +48,10 @@ class MultimodalityModel(nn.Module):
         if cnn_branch_cfg is None:
             if seq_input_channels is None:
                 raise ValueError("Either cnn_branch_cfg or seq_input_channels must be provided")
-            cnn_branch_cfg = dict(input_channels=seq_input_channels,
-                                  num_classes=num_classes,
-                                  sequence_length=sequence_length)
+            cnn_branch_cfg = dict(type='CNN1D',
+                                 input_channels=seq_input_channels,
+                                 num_classes=num_classes,
+                                 sequence_length=sequence_length)
         else:
             # Ensure required keys exist, or fill in from legacy args
             cnn_branch_cfg = cnn_branch_cfg.copy()
