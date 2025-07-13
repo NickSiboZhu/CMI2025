@@ -52,7 +52,3 @@ class MLP(nn.Module):
         """
         return self.layers(x)
 
-    # New helper for MultimodalityModel
-    def get_output_size(self):
-        return self.output_dim
-

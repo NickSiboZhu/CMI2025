@@ -194,6 +194,91 @@ class BilinearFusionHead(nn.Module):
         return self.classifier(final_features)
 
 
+@MODELS.register_module()
+class TransformerFusionHead(nn.Module):
+    """
+    Transformer-style fusion head with a learnable [CLS] token.
+
+    Workflow:
+        1. Each modality vector is linearly projected to a common `embed_dim`.
+        2. A learnable CLS token is prepended → sequence length = (#modalities + 1).
+        3. Sequence is passed through `depth` layers of `nn.TransformerEncoder`.
+        4. Output of CLS token (position 0) is fed to a classifier `Linear` layer.
+    """
+
+    def __init__(self,
+                 branch_dims,
+                 num_classes,
+                 input_dim=None,  # kept for compatibility with MultimodalityModel
+                 embed_dim=256,
+                 num_heads=4,
+                 depth=2,
+                 dropout=0.1,
+                 use_positional_encoding=False):
+        super().__init__()
+
+        self.branch_dims = branch_dims
+        self.embed_dim = embed_dim
+        self.num_tokens = len(branch_dims)
+
+        # 1. Per-branch projections → embed_dim
+        self.proj_layers = nn.ModuleList([
+            nn.Linear(d, embed_dim) for d in branch_dims
+        ])
+
+        # 2. Learnable CLS token (1, 1, E)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        self.use_pe = use_positional_encoding
+        if self.use_pe:
+            # Positional embedding for up to (num_tokens+1) tokens
+            self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens + 1, embed_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=embed_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+
+        # Final classifier on CLS token
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, num_classes)
+        )
+
+    def forward(self, combined_features):
+        """combined_features: concat([mod1, mod2, …]) shape (B, sum(branch_dims))"""
+        B = combined_features.size(0)
+        # Split & project each modality
+        feats = []
+        start = 0
+        for proj, dim in zip(self.proj_layers, self.branch_dims):
+            end = start + dim
+            feats.append(proj(combined_features[:, start:end]))
+            start = end
+        tokens = torch.stack(feats, dim=1)              # (B, N, E)  N = num_tokens
+
+        # prepend CLS
+        cls_tok = self.cls_token.expand(B, -1, -1)      # (B, 1, E)
+        x = torch.cat([cls_tok, tokens], dim=1)          # (B, N+1, E)
+
+        # optional positional encoding (not crucial when #tokens is small)
+        if self.use_pe:
+            x = x + self.pos_embed
+
+        # Transformer encoder
+        x = self.transformer(x)                          # (B, N+1, E)
+
+        cls_out = x[:, 0]                                # (B, E)
+        return self.classifier(cls_out)
+
+
 # Alias for backward compatibility
 @MODELS.register_module()
 class FusionHead(LinearFusionHead):

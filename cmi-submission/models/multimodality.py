@@ -22,97 +22,82 @@ class MultimodalityModel(nn.Module):
     The features from all branches are fused and passed to a final classifier head.
     """
     def __init__(self,
-                 # --- legacy positional args ---
-                 seq_input_channels: int = None,
-                 tof_input_channels: int = 320,
-                 static_input_features: int = 7,
+                 # --- required configs ---
                  num_classes: int = 18,
                  sequence_length: int = 100,
-                 # --- new optional branch configs ---
+                 # --- branch configs ---
                  cnn_branch_cfg: dict = None,
                  mlp_branch_cfg: dict = None,
                  fusion_head_cfg: dict = None,
                  tof_branch_cfg: dict = None,
+                 # --- modality toggles ---
+                 use_tof: bool = True,
                  ):
         """
-        MultimodalityModel v2 constructor. 100% backward-compatible with the original
-        5-argument signature, but now also accepts branch-level config dicts.
-        If a branch config dict is provided, it takes precedence; otherwise we
-        fall back to the legacy defaults.
+        MultimodalityModel constructor. All configuration is provided via config dicts.
+        Each branch (CNN1D, MLP, TOF2D) has its own config dict for maximum flexibility.
         """
         super(MultimodalityModel, self).__init__()
+
+        # Store modality flags
+        self.use_tof = use_tof
 
         # ------------------------------------------------------------------
         # 1. Build 1-D CNN branch
         # ------------------------------------------------------------------
         if cnn_branch_cfg is None:
-            if seq_input_channels is None:
-                raise ValueError("Either cnn_branch_cfg or seq_input_channels must be provided")
-            cnn_branch_cfg = dict(type='CNN1D',
-                                 input_channels=seq_input_channels,
-                                 num_classes=num_classes,
-                                 sequence_length=sequence_length)
-        else:
-            # Ensure required keys exist, or fill in from legacy args
-            cnn_branch_cfg = cnn_branch_cfg.copy()
-            cnn_branch_cfg.setdefault('input_channels', seq_input_channels)
-            cnn_branch_cfg.setdefault('num_classes', num_classes)
-            cnn_branch_cfg.setdefault('sequence_length', sequence_length)
+            raise ValueError("cnn_branch_cfg is required")
+        
+        cnn_branch_cfg = cnn_branch_cfg.copy()
 
         self.cnn_1d_branch = build_from_cfg(cnn_branch_cfg, MODELS)
-        self.cnn_1d_output_size = self.cnn_1d_branch.get_cnn_output_size()
+        self.cnn_1d_output_size = getattr(self.cnn_1d_branch, 'cnn_output_size', None)
+        if self.cnn_1d_output_size is None:
+            raise AttributeError("CNN1D model must have attribute 'cnn_output_size'")
 
         # ------------------------------------------------------------------
-        # 2. Build 2-D CNN branch for TOF
+        # 2. Build 2-D CNN branch for TOF (optional)
         # ------------------------------------------------------------------
-        if tof_branch_cfg is None:
-            # Legacy fallback: use minimal TOF config
-            tof_branch_cfg = dict(type='TemporalTOF2DCNN',
-                                  num_tof_sensors=5,
-                                  seq_len=sequence_length,
-                                  out_features=128)
-        
-        tof_branch_cfg = tof_branch_cfg.copy()
-        tof_branch_cfg.setdefault('seq_len', sequence_length)
-        self.cnn_2d_branch = build_from_cfg(tof_branch_cfg, MODELS)
-        # Infer output size from config or instance
-        self.tof_2d_output_size = tof_branch_cfg.get('out_features', getattr(self.cnn_2d_branch, 'out_features', 128))
+        if self.use_tof:
+            if tof_branch_cfg is None:
+                # Legacy fallback: use minimal TOF config
+                tof_branch_cfg = dict(type='TemporalTOF2DCNN',
+                                      num_tof_sensors=5,
+                                      seq_len=sequence_length,
+                                      out_features=128)
+
+            tof_branch_cfg = tof_branch_cfg.copy()
+            self.cnn_2d_branch = build_from_cfg(tof_branch_cfg, MODELS)
+            # Infer output size
+            self.tof_2d_output_size = tof_branch_cfg.get('out_features', getattr(self.cnn_2d_branch, 'out_features', 128))
+        else:
+            # TOF disabled → no branch, zero additional features
+            self.cnn_2d_branch = None
+            self.tof_2d_output_size = 0
 
         # ------------------------------------------------------------------
         # 3. Build MLP branch
         # ------------------------------------------------------------------
         if mlp_branch_cfg is None:
-            # Legacy fallback: use minimal MLP config
-            mlp_branch_cfg = dict(type='MLP',
-                                  input_features=static_input_features,
-                                  output_dim=32)
-        else:
-            mlp_branch_cfg = mlp_branch_cfg.copy()
-            mlp_branch_cfg.setdefault('input_features', static_input_features)
-            mlp_branch_cfg.setdefault('output_dim', 32)
+            raise ValueError("mlp_branch_cfg is required")
+        
+        mlp_branch_cfg = mlp_branch_cfg.copy()
+        mlp_branch_cfg.setdefault('output_dim', 32)
 
         # build branch
         self.mlp_branch = build_from_cfg(mlp_branch_cfg, MODELS)
-        self.mlp_output_size = getattr(self.mlp_branch, 'get_output_size', lambda: mlp_branch_cfg.get('output_dim', 32))()
+        self.mlp_output_size = getattr(self.mlp_branch, 'output_dim', mlp_branch_cfg.get('output_dim', 32))
 
         # ------------------------------------------------------------------
         # 4. Fusion head (configurable)
         # ------------------------------------------------------------------
         combined_feature_size = self.cnn_1d_output_size + self.tof_2d_output_size + self.mlp_output_size
 
-        if fusion_head_cfg is None:
-            # Legacy fallback: use default LinearFusionHead
-            fusion_head_cfg = dict(type='FusionHead',
-                                   input_dim=combined_feature_size,
-                                   num_classes=num_classes,
-                                   hidden_dims=[256, 128, 64],
-                                   dropout_rates=[0.5, 0.4, 0.3])
-        else:
-            # Ensure required parameters are set
-            fusion_head_cfg = fusion_head_cfg.copy()
-            fusion_head_cfg.setdefault('type', 'FusionHead')
-            fusion_head_cfg.setdefault('input_dim', combined_feature_size)
-            fusion_head_cfg.setdefault('num_classes', num_classes)
+        # Ensure required parameters are set
+        fusion_head_cfg = fusion_head_cfg.copy()
+        fusion_head_cfg.setdefault('type', 'FusionHead')
+        fusion_head_cfg.setdefault('input_dim', combined_feature_size)
+        fusion_head_cfg.setdefault('num_classes', num_classes)
         
         # Build fusion head via registry
         self.classifier_head = build_from_cfg(fusion_head_cfg, MODELS)
@@ -127,21 +112,22 @@ class MultimodalityModel(nn.Module):
             static_input: Static demographic data (batch_size, static_features)
         """
         # 1. Process sequential data through the 1D CNN branch
-        cnn_1d_features = self.cnn_1d_branch.extract_features(seq_input)
+        cnn_1d_features = self.cnn_1d_branch(seq_input)
         
-        # 2. Process TOF data through the 2D CNN branch (only if TOF features exist)
-        if tof_input.shape[2] > 0:  # Check if TOF features are present
+        # 2. Process TOF data (only if enabled)
+        if self.use_tof:
             cnn_2d_features = self.cnn_2d_branch(tof_input)
         else:
-            # Create zero tensor with correct shape for missing TOF features
-            batch_size = seq_input.shape[0]
-            cnn_2d_features = torch.zeros(batch_size, self.tof_2d_output_size, device=seq_input.device)
+            cnn_2d_features = None
         
         # 3. Process static data through the MLP branch
         mlp_features = self.mlp_branch(static_input)
         
         # 4. Concatenate the features from all branches
-        combined_features = torch.cat((cnn_1d_features, cnn_2d_features, mlp_features), dim=1)
+        if cnn_2d_features is not None:
+            combined_features = torch.cat((cnn_1d_features, cnn_2d_features, mlp_features), dim=1)
+        else:
+            combined_features = torch.cat((cnn_1d_features, mlp_features), dim=1)
         
         # 5. Pass the fused features through the final classifier head
         output = self.classifier_head(combined_features)
@@ -157,7 +143,7 @@ class MultimodalityModel(nn.Module):
         
         # Get info from individual branches
         cnn_1d_info = self.cnn_1d_branch.get_model_info()
-        cnn_2d_info = self.cnn_2d_branch.get_model_info()
+        cnn_2d_info = self.cnn_2d_branch.get_model_info() if self.use_tof and self.cnn_2d_branch is not None else {'total_params': 0}
         mlp_info = self.mlp_branch.get_model_info()
         
         return {

@@ -32,7 +32,8 @@ model = dict(
         dropout_rate=0.5
     ),
 
-    # No tof_branch_cfg - will use dummy/zero features
+    # Disable TOF branch entirely for IMU variant
+    use_tof=False,
 
     # Fusion head blueprint - smaller combined feature size
     fusion_head_cfg=dict(

@@ -33,7 +33,7 @@ class TOF2DCNN(nn.Module):
             layers.append(nn.ReLU())
             # Only add MaxPool2d for first layers, avoid over-pooling small spatial dimensions
             if i < len(conv_channels) - 1:  # Don't pool on the last layer
-                layers.append(nn.MaxPool2d(2))
+                layers.append(nn.MaxPool2d(2)) # 2x2 max pool
             in_channels = out_c
         
         self.conv_layers = nn.Sequential(*layers)
@@ -116,31 +116,48 @@ def reshape_tof_features(tof_features, num_sensors=5):
 @MODELS.register_module()
 class TemporalTOF2DCNN(nn.Module):
     """
-    2D CNN for processing sequential TOF sensor data.
+    2-stage module for sequential TOF data.
+
+    Stage 1: `TOF2DCNN` extracts spatial features for every timestep.
+    Stage 2: an optional **learnable** temporal model (default LSTM) replaces
+    the previous mean-pooling.  The LSTM's last hidden state is projected back
+    to `out_features`, so the branch interface towards the fusion head stays
+    unchanged.
     
-    This module processes TOF grids across time steps, applying 2D CNN
-    to each timestep and then aggregating temporal information.
-    
-    Args:
-        num_tof_sensors (int): Number of TOF sensors (typically 5)
-        seq_len (int): Sequence length
-        out_features (int): Output feature dimension
+    Args (new):
+        lstm_hidden (int|None): Hidden size of LSTM.  If None ⇒ `out_features`.
+        lstm_layers (int): Number of stacked LSTM layers.
+        bidirectional (bool): Use bidirectional LSTM if True.
     """
-    
+
     def __init__(self, num_tof_sensors=5, seq_len=100, out_features=128,
-                 conv_channels=None, kernel_sizes=None):
+                 conv_channels=None, kernel_sizes=None,
+                 lstm_hidden=None, lstm_layers=1, bidirectional=False):
         super(TemporalTOF2DCNN, self).__init__()
-        
+
         self.num_tof_sensors = num_tof_sensors
         self.seq_len = seq_len
         self.out_features = out_features
-        
-        # 2D CNN for processing individual timesteps (pass through conv params)
-        self.spatial_cnn = TOF2DCNN(num_tof_sensors, out_features, conv_channels, kernel_sizes)
-        
-        # Temporal aggregation layer (could be LSTM, attention, or simple pooling)
-        self.temporal_aggregation = nn.Sequential(
-            nn.Linear(out_features, out_features),
+
+        # ------------- Spatial CNN applied per-frame -------------
+        self.spatial_cnn = TOF2DCNN(num_tof_sensors, out_features,
+                                    conv_channels, kernel_sizes)
+
+        # ------------- Temporal model (LSTM) ---------------------
+        lstm_hidden = lstm_hidden or out_features
+        self.bidirectional = bidirectional
+
+        self.lstm = nn.LSTM(
+            input_size=out_features,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            batch_first=True,
+            bidirectional=bidirectional,
+        )
+
+        proj_in_dim = lstm_hidden * (2 if bidirectional else 1)
+        self.projection = nn.Sequential(
+            nn.Linear(proj_in_dim, out_features),
             nn.ReLU(),
             nn.Dropout(0.3)
         )
@@ -168,15 +185,18 @@ class TemporalTOF2DCNN(nn.Module):
         spatial_features = self.spatial_cnn(tof_grids_flat)  # (batch_size * seq_len, out_features)
         
         # Reshape back to sequential format
-        spatial_features = spatial_features.view(batch_size, seq_len, self.out_features)
-        
-        # Temporal aggregation (simple mean pooling for now)
-        # You could replace this with LSTM or attention mechanism
-        temporal_features = torch.mean(spatial_features, dim=1)  # (batch_size, out_features)
-        
-        # Final projection
-        output = self.temporal_aggregation(temporal_features)
-        
+        spatial_features = spatial_features.view(batch_size, seq_len, self.out_features)  # (B, L, C)
+
+        # ----------- LSTM across time -------------
+        # lstm_out: (B, L, H)  | h_n: (layers*dir, B, H)
+        lstm_out, (h_n, _) = self.lstm(spatial_features)
+
+        # Use the last layer's forward (or combined) hidden state
+        temporal_features = h_n[-1]  # (B, H)
+
+        # Final projection back to out_features for fusion head
+        output = self.projection(temporal_features)
+         
         return output
     
     def get_model_info(self):
