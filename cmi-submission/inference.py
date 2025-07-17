@@ -1,4 +1,30 @@
 #!/usr/bin/env python3
+"""
+CMI – Detect Behavior with Sensor Data
+--------------------------------------
+推理脚本（Code Competition 版本）
+
+此版本为合并版本，整合了以下流程：
+- 使用高级特征工程 (feature_engineering)
+- 采用“先标准化后Padding”的正确数据处理流程
+- 支持多模态模型 (MultimodalityModel)
+- 使用 ColumnTransformer 进行统一的特征缩放
+
+目录结构::
+    cmi-submission/
+        data_utils/
+            __init__.py
+            data_preprocessing.py   ← 核心预处理逻辑在此
+            tof_utils.py
+        models/
+            __init__.py
+            multimodality.py        ← 多模态模型在此
+        weights/
+            model_fold_1_full.pth …
+            scaler_fold_1_full.pkl  ← 每个折叠对应一个ColumnTransformer
+            label_encoder_full.pkl
+        inference.py                ← 当前文件
+"""
 
 import os
 import pickle
@@ -20,175 +46,173 @@ BASE_DIR   = os.path.dirname(__file__)
 WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
-from models.cnn import Simple1DCNN, GestureDataset
-from data_utils.data_preprocessing import pad_sequences, feature_engineering
+# 从zsb分支引入多模态模型
+from models.multimodality import MultimodalityModel 
+# 从你的分支(HEAD)引入核心预处理逻辑和常量
+from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
-# We support two variants: "full" (uses THM/TOF sensors) and "imu" (IMU-only).
-# Each variant has its own scaler and model weight files.
+# 我们支持两种变体: "full" (使用 THM/TOF 传感器) 和 "imu" (仅IMU).
+# 每种变体都有其自己的scaler和模型权重文件。
 
 MAP_NON_TARGET = "Drink from bottle/cup"
-SEQ_LEN        = 100          # 与训练保持一致
+SEQ_LEN        = 100      # 与训练保持一致
 
 def _load_preprocessing_objects(variant: str):
-    """Load label encoder and (optionally) a scaler for the given variant.
-
-    A scaler file is no longer required because we load per-fold scalers later.
-    We attempt to load one for backward compatibility but simply return None if it
-    does not exist.
+    """
+    为给定变体加载标签编码器 (label encoder)。
     """
     le_path = os.path.join(WEIGHT_DIR, f"label_encoder_{variant}.pkl")
     if not os.path.exists(le_path):
-        # Fallback to generic file name (old submissions)
+        # 回退到通用文件名 (旧的提交)
         le_path = os.path.join(WEIGHT_DIR, "label_encoder.pkl")
+    if not os.path.exists(le_path):
+        raise FileNotFoundError(f"Label encoder for variant '{variant}' not found at {le_path}")
 
     with open(le_path, "rb") as f:
         le = pickle.load(f)
+    
+    return le
 
-    # Try to load an accompanying scaler but don't fail if it's missing
-    possible_scalers = [
-        os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl"),
-        os.path.join(WEIGHT_DIR, "scaler.pkl"),
-    ]
-    scaler = None
-    for path in possible_scalers:
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                scaler = pickle.load(f)
-            break
-
-    return le, scaler
-
-def _load_models(device, num_classes, variant: str) -> List[Tuple[torch.nn.Module, "StandardScaler"]]:
-    """Load models together with their matching scaler.
-
-    Returns a list of (model, scaler) tuples so that each model gets the
-    exact feature scaling it was trained with (Option B). For single-model
-    variants we still return a one-element list.
+def _load_models(device, num_classes, variant: str):
+    """
+    加载多模态模型及其匹配的 ColumnTransformer scalers。
+    返回一个 (model, scaler) 元组的列表。
+    适用于 K-Fold 集成和单一模型提交。
     """
     pairs = []
 
-    # 搜索 5-fold 文件
-    fold_paths = [
-        os.path.join(WEIGHT_DIR, f"model_fold_{i}_{variant}.pth") for i in range(1, 6)
-    ]
+    # 首先查找 K-Fold 模型
+    fold_paths = [os.path.join(WEIGHT_DIR, f"model_fold_{i}_{variant}.pth") for i in range(1, 6)]
     fold_paths = [p for p in fold_paths if os.path.exists(p)]
 
     if fold_paths:
         print(f"🧩  [{variant}] Detected {len(fold_paths)} fold models → ensemble")
         for p in fold_paths:
             basename = os.path.basename(p)
-            # Derive fold number to locate matching scaler
-            # Pattern: model_fold_{i}_{variant}.pth
             parts = basename.split("_")
-            try:
-                fold_num = int(parts[2])  # parts: ['model','fold','{i}','{variant}.pth']
-            except (IndexError, ValueError):
-                raise ValueError(f"Unexpected model filename format: {basename}")
+            fold_num = int(parts[2])  # e.g. model_fold_3_full.pth → 3
 
+            # <--- 核心改动：加载与每个模型对应的单个 ColumnTransformer scaler
             scaler_path = os.path.join(WEIGHT_DIR, f"scaler_fold_{fold_num}_{variant}.pkl")
             if not os.path.exists(scaler_path):
-                raise FileNotFoundError(f"Expected scaler file '{scaler_path}' for model '{basename}' not found.")
-
+                raise FileNotFoundError(f"Missing scaler for fold {fold_num} ({variant}): {scaler_path}")
+            
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
 
-            in_channels = len(scaler.get_feature_names_out())
-            m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
-            m.load_state_dict(torch.load(p, map_location=device))
-            m.to(device).eval()
+            # 从scaler获取输入维度信息
+            feature_names = scaler.get_feature_names_out()
+            static_in_features = len([c for c in feature_names if c in STATIC_FEATURE_COLS])
+            tof_in_channels = len([c for c in feature_names if c.startswith('tof_')])
+            non_tof_in_channels = len(feature_names) - static_in_features - tof_in_channels
 
-            pairs.append((m, scaler))
+            # 使用训练时保存的配置构建模型
+            ckpt = torch.load(p, map_location=device)
+            if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
+                model_cfg = ckpt['model_cfg']
+                # 移除'type'键，因为它用于注册表，而不是构造函数
+                model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
+                state_dict = ckpt['state_dict']
+                model = MultimodalityModel(**model_cfg)
+                model.load_state_dict(state_dict)
+            else:
+                # 为没有配置的旧checkpoint提供回退
+                raise ValueError(f"Checkpoint for {p} is in a legacy format without 'model_cfg'. Please retrain and save with model config.")
+
+            model.to(device).eval()
+            pairs.append((model, scaler))
     else:
-        single = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
-        if not os.path.exists(single):
-            raise FileNotFoundError(
-                f"No model weights found for variant '{variant}' in weights/"
-            )
-        print(f"🧩  [{variant}] Using single model {os.path.basename(single)}")
-
-        # Load single scaler
+        # 单一模型回退逻辑
+        print(f"SINGLE MODEL for variant: {variant}")
+        weight_path = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
         scaler_path = os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl")
+
+        if not os.path.exists(weight_path):
+             raise FileNotFoundError(f"No weight file found for variant '{variant}'.")
         if not os.path.exists(scaler_path):
-            scaler_path = os.path.join(WEIGHT_DIR, "scaler.pkl")
+            raise FileNotFoundError(f"No scaler file found for variant '{variant}'.")
+
         with open(scaler_path, "rb") as f:
             scaler = pickle.load(f)
 
-        in_channels = len(scaler.get_feature_names_out())
-        m = Simple1DCNN(in_channels, num_classes, SEQ_LEN)
-        m.load_state_dict(torch.load(single, map_location=device))
-        m.to(device).eval()
-
-        pairs.append((m, scaler))
+        feature_names = scaler.get_feature_names_out()
+        static_in_features = len([c for c in feature_names if c in STATIC_FEATURE_COLS])
+        tof_in_channels = len([c for c in feature_names if c.startswith('tof_')])
+        non_tof_in_channels = len(feature_names) - static_in_features - tof_in_channels
+        
+        # 使用与 K-Fold 相同的逻辑加载模型
+        ckpt = torch.load(weight_path, map_location=device)
+        if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
+            model_cfg = ckpt['model_cfg']
+            model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
+            state_dict = ckpt['state_dict']
+            model = MultimodalityModel(**model_cfg)
+            model.load_state_dict(state_dict)
+        else:
+            raise ValueError(f"Checkpoint for {weight_path} is in a legacy format without 'model_cfg'. Please retrain and save with model config.")
+        
+        model.to(device).eval()
+        pairs.append((model, scaler))
 
     return pairs
 
 print("🔧  Initialising inference resources …")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
 
 VARIANTS = ["full", "imu"]
 RESOURCES = {}
 
 for v in VARIANTS:
-    le, _ = _load_preprocessing_objects(v)  # scaler is optional / unused here
-    num_classes = len(le.classes_)
-    model_scaler_pairs = _load_models(DEVICE, num_classes, v)
+    try:
+        le = _load_preprocessing_objects(v)
+        num_classes = len(le.classes_)
+        model_scaler_pairs = _load_models(DEVICE, num_classes, v)
 
-    # Use the first scaler just to extract in_channels for bookkeeping
-    first_scaler = model_scaler_pairs[0][1]
-    in_channels = len(first_scaler.get_feature_names_out())
+        RESOURCES[v] = {
+            "label_encoder": le,
+            "num_classes": num_classes,
+            "model_scaler_pairs": model_scaler_pairs, # <-- 现在是 (model, ColumnTransformer) 对
+        }
+        print(f"✅  Resources for '{v}' variant loaded successfully.")
+    except FileNotFoundError as e:
+        print(f"⚠️  Could not load resources for '{v}' variant: {e}. This variant will be unavailable.")
 
-    RESOURCES[v] = {
-        "label_encoder": le,
-        "in_channels": in_channels,
-        "num_classes": num_classes,
-        "model_scaler_pairs": model_scaler_pairs,
-    }
-
-print("✅  Models / Scalers / LabelEncoders for all variants loaded. Ready.")
+print("✅  Resource initialization complete. Ready for inference.")
 
 
 # ------------------ 单序列预处理 ------------------
 def _decide_variant(seq_df: "pd.DataFrame") -> str:
     """
-    Return 'imu' if all rows in THM OR all rows in TOF columns are NaN/-1, else 'full'.
-    
-    Logic: The hidden dataset has all columns, but some sequences have all null/-1 values
-    in either THM or TOF sensor columns. If either sensor type has NO valid data across
-    all rows in the sequence, use the IMU-only model.
+    如果 THM 或 TOF 列中的所有行都是 NaN/-1，则返回 'imu'，否则返回 'full'。
     """
     thm_cols = [c for c in seq_df.columns if c.startswith("thm_")]
     tof_cols = [c for c in seq_df.columns if c.startswith("tof_")]
 
-    # If no THM/TOF columns exist at all, use IMU (defensive fallback)
     if not thm_cols and not tof_cols:
         return "imu"
     
-    # Check if ALL rows in THM columns are null/-1
     thm_all_missing = True
     if thm_cols:
         thm_df = seq_df[thm_cols].replace(-1.0, np.nan)
-        # If ANY cell in THM columns has valid data, then THM is not all missing
         thm_all_missing = not thm_df.notna().values.any()
     
-    # Check if ALL rows in TOF columns are null/-1  
     tof_all_missing = True
     if tof_cols:
         tof_df = seq_df[tof_cols].replace(-1.0, np.nan)
-        # If ANY cell in TOF columns has valid data, then TOF is not all missing
         tof_all_missing = not tof_df.notna().values.any()
     
-    # Use IMU model if either sensor type is completely missing across all rows
     if (thm_cols and thm_all_missing) or (tof_cols and tof_all_missing):
         return "imu"
         
-    return "full"  # Both sensor types have at least some valid data
+    return "full"
 
 def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     """
-    Preprocesses a single sequence by applying the full ToF and IMU feature engineering pipeline,
-    ensuring it perfectly matches the training process.
+    通过应用完整的 ToF 和 IMU 特征工程流程来预处理单个序列，
+    确保它与训练过程完全匹配。
     """
     seq_df = seq_pl.to_pandas()
     if not demog_pl.is_empty():
@@ -196,26 +220,32 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
 
     variant = _decide_variant(seq_df)
     
-    print(f"🧬 Preprocessing with variant: {variant}")
+    # 检查所选变体是否可用
+    if variant not in RESOURCES:
+        fallback_variant = "imu" if "imu" in RESOURCES else "full"
+        print(f"🧬 Variant '{variant}' not available, falling back to '{fallback_variant}'")
+        variant = fallback_variant
+    else:
+        print(f"🧬 Preprocessing with variant: {variant}")
 
-    # 1. First, handle all ToF interpolation if needed.
-    # This must be done BEFORE feature engineering.
+    # 1. 首先，如果需要，处理所有 ToF 插值。
+    # 这必须在特征工程之前完成。
     if variant != "imu":
         seq_df = interpolate_tof(seq_df)
 
-    # 2. Next, apply the advanced feature engineering.
-    # This function creates new IMU features and handles all NaN values robustly.
+    # 2. 接下来，应用高级特征工程。
+    # 此函数创建新的IMU特征并稳健地处理所有NaN值。
     processed_df, feature_cols = feature_engineering(seq_df)
 
-    # 3. If the determined variant is IMU-only, filter out non-IMU columns.
-    # The scaler for the IMU model was trained only on these columns.
+    # 3. 如果确定的变体是仅IMU，则过滤掉非IMU列。
+    # IMU模型的scaler仅在这些列上进行训练。
     if variant == "imu":
+        imu_engineered_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
         demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm', 'sex_M']
-        imu_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
-        # Keep IMU columns plus any available demographic columns
-        feature_cols = imu_cols + [c for c in demographic_cols if c in processed_df.columns]
+        # 保留IMU列以及任何可用的人口统计列
+        feature_cols = imu_engineered_cols + [c for c in demographic_cols if c in processed_df.columns]
 
-    # 4. Return the final feature DataFrame, correctly ordered and ready for scaling.
+    # 4. 返回最终的特征DataFrame，正确排序并准备好进行缩放。
     final_features_df = processed_df.sort_values("sequence_counter")[feature_cols]
 
     return variant, final_features_df
@@ -229,39 +259,53 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     if sequence.is_empty():
         return MAP_NON_TARGET
 
-    # 1. Preprocess sequence to get an unpadded feature DataFrame
+    # 1. 预处理序列以获得一个未填充的、待标准化的特征DataFrame
     variant, features_df = preprocess_single_sequence(sequence, demographics)
 
-    res      = RESOURCES[variant]
-    le       = res["label_encoder"]
-    pairs    = res["model_scaler_pairs"]  # List[(model, scaler)]
-    num_cls  = res["num_classes"]
+    res                  = RESOURCES[variant]
+    le                   = res["label_encoder"]
+    model_scaler_pairs   = res["model_scaler_pairs"]
+    num_cls              = res["num_classes"]
 
     with torch.no_grad():
         probs_sum = np.zeros((1, num_cls))
         
-        # 2. Loop through each model and its corresponding scaler
-        for model, scaler in pairs:
-            # 3. Apply scaling to the unpadded 2D DataFrame
-            X_scaled_unpadded = scaler.transform(features_df)
-
-            # 4. ✨ CORRECTED PADDING CALL ✨
-            # Apply padding AFTER scaling, using the correct function signature.
-            # Your function takes a list of sequences and max_length.
-            X_padded = pad_sequences(
-                [X_scaled_unpadded], 
-                max_length=SEQ_LEN
-            )
-
-            # 5. Convert to tensor and predict
-            # The shape from pad_sequences is (1, SEQ_LEN, num_features)
-            xb = torch.from_numpy(X_padded.astype(np.float32)).to(DEVICE)
+        # 2. 循环遍历每个模型及其对应的 ColumnTransformer scaler
+        for model, scaler in model_scaler_pairs:
             
-            probs = torch.softmax(model(xb), dim=1).cpu().numpy()
+            # 3. ✨ 标准化: 对整个特征DataFrame应用scaler
+            X_scaled_unpadded = scaler.transform(features_df)
+            scaled_feature_names = scaler.get_feature_names_out()
+
+            # 4. ✨ 拆分多模态数据 (在标准化之后)
+            static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS]
+            tof_cols = [c for c in scaled_feature_names if c.startswith('tof_')]
+            non_tof_cols = [c for c in scaled_feature_names if c not in static_cols and not c.startswith('tof_')]
+            
+            static_indices = [list(scaled_feature_names).index(c) for c in static_cols]
+            tof_indices = [list(scaled_feature_names).index(c) for c in tof_cols]
+            non_tof_indices = [list(scaled_feature_names).index(c) for c in non_tof_cols]
+            
+            static_arr_unpadded = X_scaled_unpadded[:, static_indices]
+            tof_arr_unpadded = X_scaled_unpadded[:, tof_indices]
+            non_tof_arr_unpadded = X_scaled_unpadded[:, non_tof_indices]
+
+            # 5. ✨ Padding (在标准化和拆分之后)
+            X_non_tof_padded = pad_sequences([non_tof_arr_unpadded], max_length=SEQ_LEN)
+            X_tof_padded = pad_sequences([tof_arr_unpadded], max_length=SEQ_LEN)
+            X_static = static_arr_unpadded[0:1, :] # 静态特征取第一行即可
+
+            # 6. 转换为Tensor并预测
+            xb_non_tof = torch.from_numpy(X_non_tof_padded.astype(np.float32)).to(DEVICE)
+            xb_tof = torch.from_numpy(X_tof_padded.astype(np.float32)).to(DEVICE)
+            xb_static = torch.from_numpy(X_static.astype(np.float32)).to(DEVICE)
+            
+            # Forward pass through multimodal model
+            probs = torch.softmax(model(xb_non_tof, xb_tof, xb_static), dim=1).cpu().numpy()
             probs_sum += probs
 
         # Average the probabilities for the ensemble
-        probs = probs_sum / len(pairs)
+        probs = probs_sum / len(model_scaler_pairs)
 
     pred_idx = int(np.argmax(probs, axis=1)[0])
     label    = le.inverse_transform([pred_idx])[0]
@@ -276,11 +320,8 @@ if __name__ == "__main__":
     if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         inference_server.serve()
     else:
-        try:
-            os.chdir('/kaggle/working/')
-        except Exception as e:
-            print(f"Could not change directory to /kaggle/working/: {e}")
-        
+        # 本地测试时，确保路径指向正确
+        # 例如: /kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv
         inference_server.run_local_gateway(
             data_paths=(
                 "/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv",

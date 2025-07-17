@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Gesture Recognition Training Script (with Competition Metric)
+Gesture Recognition Training Script (Config-Driven)
 
 This script handles the complete training pipeline for gesture recognition using
-1D CNN with 5-fold cross-validation and group-aware splitting. It uses the
+multimodal fusion with 5-fold cross-validation and group-aware splitting. It uses the
 official Kaggle competition metric for model selection and evaluation.
 
 Usage:
-    python train.py                     # Full 5-fold cross-validation
-    python train.py --single            # Single train/val split
-    python train.py --stratification    # Show stratification details
-    python train.py --gpu 1             # Use specific GPU
+    python train.py <config_file>                           # Config-driven training (required)
+    python train.py ../cmi-submission/configs/multimodality_model_v1_full_config.py  # Example with config
+    python train.py <config_file> --stratification          # Show stratification details
+    
+Configuration:
+    All training parameters are specified in the config file:
+    - Model architecture (MultimodalityModel with registry system)
+    - Training settings (epochs, learning rate, loss function)
+    - Data settings (variant, batch size)
+    - Environment settings (GPU selection)
+    
+Note: Models use LayerNorm for sequential data (better for sensor sequences)
 """
 
 import torch
@@ -18,7 +26,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
-import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, f1_score
 import time
 import json
@@ -28,11 +35,24 @@ import sys
 import os
 import pickle
 import pandas as pd
+import importlib.util, runpy
+
+# --- Helper to load python config file ---
+
+def load_py_config(config_path):
+    """Dynamically load a Python config file as a module and return the namespace as an object with attribute access."""
+    cfg_dict = runpy.run_path(config_path)
+    class _CfgObj(dict):
+        def __getattr__(self, item):
+            return self[item]
+        __setattr__ = dict.__setitem__
+    return _CfgObj(cfg_dict)
+
 # ----------------------------------------------------------------------
 # Ensure shared code in cmi-submission/ is the one we import everywhere
 # ----------------------------------------------------------------------
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))             # …/development
-SUBM_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, '..', 'cmi-submission'))
+SUBM_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, '..', 'cmi-submission'))   # .. means go up one level
 
 # Pre-pend so it has priority over the local development/ path.
 if SUBM_DIR not in sys.path:
@@ -40,16 +60,14 @@ if SUBM_DIR not in sys.path:
 
 # from transformers import get_cosine_schedule_with_warmup
 from utils.scheduler import get_cosine_schedule_with_warmup
-
-# Add current directory to Python path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from utils.focal_loss import FocalLoss
+from utils.registry import build_from_cfg
+from models import MODELS
 
 # Import our model and data preprocessing
-from models.cnn import Simple1DCNN, GestureDataset
-from data_utils.data_preprocessing import (
-    prepare_data_kfold,
-    prepare_data_single_split,
-)
+from models.multimodality import MultimodalityModel
+from models.datasets import MultimodalDataset
+from data_utils.data_preprocessing import prepare_data_kfold_multimodal
 
 # Directory holding all models, scalers, summaries
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
@@ -212,11 +230,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     all_preds = []
     all_targets = []
     
-    for batch_idx, (data, target) in enumerate(dataloader):
-        data, target = data.to(device), target.to(device)
+    for (non_tof_data, tof_data, static_data), target in dataloader:
+        non_tof_data = non_tof_data.to(device)
+        tof_data = tof_data.to(device)
+        static_data = static_data.to(device)
+        target = target.to(device)
         
         optimizer.zero_grad() # reset gradients
-        output = model(data) # forward pass
+        output = model(non_tof_data, tof_data, static_data) # forward pass
         loss = criterion(output, target) # compute loss
         loss.backward() #  compute new gradients for each parameter
         optimizer.step() # update weights
@@ -255,9 +276,12 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_enco
     all_targets = []
     
     with torch.no_grad():
-        for data, target in dataloader:
-            data, target = data.to(device), target.to(device)
-            output = model(data)
+        for (non_tof_data, tof_data, static_data), target in dataloader:
+            non_tof_data = non_tof_data.to(device)
+            tof_data = tof_data.to(device)
+            static_data = static_data.to(device)
+            target = target.to(device)
+            output = model(non_tof_data, tof_data, static_data)
             loss = criterion(output, target)
             
             total_loss += loss.item()
@@ -277,9 +301,10 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_enco
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start_lr=0.001, device='cpu', variant: str = 'full', fold_tag: str = ''):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start_lr=0.001, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
     """Train the model with validation, using competition metric for model selection."""
-    criterion = nn.CrossEntropyLoss()
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=1e-2)
     
     # Setup cosine schedule with warmup (10% warmup steps)
@@ -358,143 +383,8 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start
     return history
 
 
-def evaluate_model(model, dataloader, label_encoder, device='cpu'):
-    """Evaluate model and print detailed metrics including competition score."""
-    model.eval()
-    
-    # Use the validation function to get all metrics
-    _, _, comp_score, all_preds, all_targets = validate_and_evaluate_epoch(model, dataloader, nn.CrossEntropyLoss(), device, label_encoder)
 
-    print(f"\n🏆 Final Competition Score on Validation Set: {comp_score:.4f}")
-
-    # Classification report
-    print("\nClassification Report:")
-    print(classification_report(
-        all_targets, 
-        all_preds, 
-        target_names=label_encoder.classes_,
-        zero_division=0
-    ))
-    
-    # Accuracy by class
-    print("\nAccuracy by class:")
-    for i, class_name in enumerate(label_encoder.classes_):
-        mask = np.array(all_targets) == i
-        if np.sum(mask) > 0:
-            acc = np.mean(np.array(all_preds)[mask] == np.array(all_targets)[mask])
-            print(f"{class_name}: {acc:.3f} ({np.sum(mask)} samples)")
-    
-    return all_preds, all_targets
-
-
-def plot_training_history(history, save_path='training_history.png'):
-    """Plot training history, including the new competition score."""
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 4))
-    
-    # Competition Score
-    ax1.plot(history['train_competition_score'], label='Train Score', color='blue')
-    ax1.plot(history['val_competition_score'], label='Val Score', color='orange')
-    ax1.set_title('Competition Score')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Score')
-    ax1.legend()
-    ax1.grid(True, linestyle='--', alpha=0.6)
-
-    # Accuracy
-    ax2.plot(history['train_accuracy'], label='Train Accuracy')
-    ax2.plot(history['val_accuracy'], label='Val Accuracy')
-    ax2.set_title('Model Accuracy')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Accuracy (%)')
-    ax2.legend()
-    ax2.grid(True, linestyle='--', alpha=0.6)
-    
-    # Loss
-    ax3.plot(history['train_loss'], label='Train Loss')
-    ax3.plot(history['val_loss'], label='Val Loss')
-    ax3.set_title('Model Loss')
-    ax3.set_xlabel('Epoch')
-    ax3.set_ylabel('Loss')
-    ax3.legend()
-    ax3.grid(True, linestyle='--', alpha=0.6)
-    
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.show()
-    print(f"Training history plot saved to {save_path}")
-
-
-def train_single_model(epochs=50, start_lr=0.001, device=None, variant: str = 'full'):
-    """Train a single model with single train/val split"""
-    print("🎯 TRAINING SINGLE MODEL")
-    print("="*60)
-    
-    # Setup device
-    if device is None:
-        device = setup_device()
-    
-    # Prepare data
-    print("Preparing data for single model training...")
-    X_train, X_val, y_train, y_val, label_encoder = prepare_data_single_split(variant)
-    
-    # Model parameters
-    input_channels = X_train.shape[2]
-    sequence_length = X_train.shape[1]
-    num_classes = len(label_encoder.classes_)
-    
-    print(f"\nModel configuration:")
-    print(f"Input shape: {X_train.shape}")
-    print(f"Input channels (features): {input_channels}")
-    print(f"Sequence length: {sequence_length}")
-    print(f"Number of classes: {num_classes}")
-    
-    # Create datasets and dataloaders
-    train_dataset = GestureDataset(X_train, y_train)
-    val_dataset = GestureDataset(X_val, y_val)
-    
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    
-    # Build model
-    print("\nBuilding model...")
-    model = Simple1DCNN(input_channels, num_classes, sequence_length)
-    model = model.to(device)
-    
-    # Print model info
-    model_info = model.get_model_info()
-    print(f"\nModel Summary:")
-    print(f"Total parameters: {model_info['total_params']:,}")
-    print(f"Model size: {model_info['model_size_mb']:.1f} MB")
-    
-    # Train model
-    print("\nTraining model...")
-    history = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        label_encoder=label_encoder,
-        epochs=epochs,
-        start_lr=start_lr,
-        device=device,
-        variant=variant,
-    )
-    
-    # Evaluate model
-    print("\nEvaluating model...")
-    y_pred, y_true = evaluate_model(model, val_loader, label_encoder, device)
-    
-    # Plot training history
-    plot_training_history(history, os.path.join(WEIGHT_DIR, f'single_model_history_{variant}.png'))
-    
-    # Save final model
-    model_path = os.path.join(WEIGHT_DIR, f'single_model_{variant}.pth')
-    torch.save(model.state_dict(), model_path)
-    print(f"\nModel saved as '{model_path}'")
-    
-    return model, history
-
-
-def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full'):
+def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -505,21 +395,43 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         device = setup_device()
     
     # Prepare all folds and get full labels & sequence IDs for OOF reconstruction
-    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold(show_stratification=show_stratification, variant=variant)
+    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(show_stratification=show_stratification, variant=variant)
     num_samples = len(y_all)
     oof_preds = np.full(num_samples, -1, dtype=int)
     oof_targets = y_all.copy()
     
-    # Model parameters (same for all folds)
-    input_channels = fold_data[0]['X_train'].shape[2]
-    sequence_length = fold_data[0]['X_train'].shape[1]
-    num_classes = len(label_encoder.classes_)
+    # Dynamically inject feature dimensions from actual data
+    sample_non_tof = fold_data[0]['X_train_non_tof']
+    sample_static = fold_data[0]['X_train_static']
     
-    print(f"\nModel configuration:")
-    print(f"Input channels (features): {input_channels}")
-    print(f"Sequence length: {sequence_length}")
-    print(f"Number of classes: {num_classes}")
-    print(f"Class names: {list(label_encoder.classes_)}")
+    non_tof_channels = sample_non_tof.shape[2]
+    static_features = sample_static.shape[1]
+    
+    print(f"Auto-detected dimensions:")
+    print(f"  Non-TOF sequential channels: {non_tof_channels}")
+    print(f"  Static features: {static_features}")
+    
+    # Inject into model config
+    model_cfg['cnn_branch_cfg']['input_channels'] = non_tof_channels
+    model_cfg['mlp_branch_cfg']['input_features'] = static_features
+    
+    # Model parameters (same for all folds)
+    # Display model configuration from config file
+    print(f"\nModel configuration from config file:")
+    for k, v in (model_cfg or {}).items():
+        if k != 'type':
+            print(f"  {k}: {v}")
+
+    # Configure loss function and normalization
+    print(f"\nTraining Configuration:")
+    if loss_function == 'focal':
+        print(f"  Loss Function: Focal Loss (gamma={focal_gamma}, alpha={focal_alpha})")
+    else:
+        print(f"  Loss Function: Cross Entropy Loss")
+    print(f"  Normalization: LayerNorm (better for sequential sensor data)")
+    print(f"    - 1D CNN: LayerNorm for temporal features")
+    print(f"    - 2D CNN: BatchNorm for spatial features") 
+    print(f"    - Fusion Head: LayerNorm for combined features")
     
     # Store results for all folds
     fold_results = []
@@ -534,25 +446,40 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # Get fold data
         fold = fold_data[fold_idx]
-        X_train, X_val = fold['X_train'], fold['X_val']
-        y_train, y_val = fold['y_train'], fold['y_val']
         
-        print(f"Fold {fold_idx + 1} - Train: {X_train.shape}, Val: {X_val.shape}")
+        # Create multimodal datasets and dataloaders
+        train_dataset = MultimodalDataset(
+            fold['X_train_non_tof'], 
+            fold['X_train_tof'], 
+            fold['X_train_static'], 
+            fold['y_train']
+        )
+        val_dataset = MultimodalDataset(
+            fold['X_val_non_tof'], 
+            fold['X_val_tof'], 
+            fold['X_val_static'], 
+            fold['y_val']
+        )
         
-        # Create datasets and dataloaders
-        train_dataset = GestureDataset(X_train, y_train)
-        val_dataset = GestureDataset(X_val, y_val)
-        
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
-        model = Simple1DCNN(input_channels, num_classes, sequence_length)
+        model = build_from_cfg(model_cfg, MODELS)
+        
+        # Configure loss function for this fold
+        if loss_function == 'focal':
+            criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
+            print(f"  Using Focal Loss (gamma={focal_gamma}, alpha={focal_alpha})")
+        else:
+            criterion = nn.CrossEntropyLoss()
+            print(f"  Using Cross Entropy Loss")
         
         try:
             model = model.to(device)
-            print(f"Model loaded to {device}")
+            criterion = criterion.to(device)
+            print(f"Model and criterion loaded to {device}")
             
             # Train model
             print(f"\nTraining fold {fold_idx + 1}...")
@@ -566,6 +493,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
                 device=device,
                 variant=variant,
                 fold_tag=f'_{fold_idx+1}',
+                criterion=criterion,
             )
             
         except RuntimeError as e:
@@ -577,6 +505,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
                 torch.cuda.empty_cache()
                 device_fallback = torch.device('cpu')
                 model = model.to(device_fallback)
+                criterion = criterion.to(device_fallback)
                 
                 # Recreate data loaders with smaller batch size for CPU
                 train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
@@ -593,6 +522,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
                     device=device_fallback,
                     variant=variant,
                     fold_tag=f'_{fold_idx+1}',
+                    criterion=criterion,
                 )
                 device = device_fallback  # Update device for evaluation
             else:
@@ -610,19 +540,37 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # Save model for this fold
         model_filename = os.path.join(WEIGHT_DIR, f'model_fold_{fold_idx + 1}_{variant}.pth')
-        torch.save(model.state_dict(), model_filename)
+        checkpoint = {
+            'state_dict': model.state_dict(),
+            'model_cfg': model_cfg
+        }
+        torch.save(checkpoint, model_filename)
         print(f"Model saved as '{model_filename}'")
         
-        # Save the scaler corresponding to this fold for inference pairing
-        scaler_fold = fold['scaler']
+        # Save the multimodal scalers for inference pairing
+        fold_scalers = fold
         
         # Create outputs directory if it doesn't exist
         os.makedirs(WEIGHT_DIR, exist_ok=True)
         
-        scaler_filename = os.path.join(WEIGHT_DIR, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
-        with open(scaler_filename, 'wb') as f:
-            pickle.dump(scaler_fold, f)
-        print(f"Scaler saved as '{scaler_filename}'")
+        # Save non-TOF scaler
+        non_tof_scaler_path = os.path.join(WEIGHT_DIR, f'non_tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(non_tof_scaler_path, 'wb') as f:
+            pickle.dump(fold_scalers['non_tof_scaler'], f)
+        print(f"Non-TOF scaler saved as '{non_tof_scaler_path}'")
+        
+        # Save TOF scaler (list of scalers for full variant)
+        if variant == "full" and fold_scalers['tof_scaler'] is not None:
+            tof_scaler_path = os.path.join(WEIGHT_DIR, f'tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+            with open(tof_scaler_path, 'wb') as f:
+                pickle.dump(fold_scalers['tof_scaler'], f)
+            print(f"TOF scaler saved as '{tof_scaler_path}'")
+        
+        # Save static scaler
+        static_scaler_path = os.path.join(WEIGHT_DIR, f'static_scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(static_scaler_path, 'wb') as f:
+            pickle.dump(fold_scalers['static_scaler'], f)
+        print(f"Static scaler saved as '{static_scaler_path}'")
         
         # Store results
         fold_results.append({
@@ -694,40 +642,54 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
 
 
 def main():
-    """Main training function with command line interface"""
-    parser = argparse.ArgumentParser(description="Gesture Recognition Training")
-    parser.add_argument('--single', action='store_true', help='Train single model instead of 5-fold CV')
+    """Main training function - config file required"""
+    parser = argparse.ArgumentParser(description="Gesture Recognition Training (Config Required)")
+    parser.add_argument('--config', required=True, help='Path to python config file for training')
     parser.add_argument('--stratification', action='store_true', help='Show stratification details')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
-    parser.add_argument('--start_lr', type=float, default=0.001, help='Initial learning rate')
-    parser.add_argument('--gpu', type=int, help='Specific GPU ID to use')
-    parser.add_argument('--variant', choices=['full', 'imu'], default='full', help='Sensor variant to train (full or imu-only)')
     
     args = parser.parse_args()
     
-    # Setup device
-    device = setup_device(args.gpu)
+    # Load configuration
+    print(f"Loading config from: {args.config}")
+    cfg = load_py_config(args.config)
     
-    # Train model(s)
-    if args.single:
-        model, history = train_single_model(
-            epochs=args.epochs, 
-            start_lr=args.start_lr, 
-            device=device,
-            variant=args.variant,
-        )
-        print("✅ Single model training completed!")
-        return model, history
-    else:
-        fold_models, fold_histories, fold_results = train_kfold_models(
-            epochs=args.epochs, 
-            start_lr=args.start_lr, 
-            show_stratification=args.stratification,
-            device=device,
-            variant=args.variant,
-        )
-        print("✅ 5-fold cross-validation training completed!")
-        return fold_models, fold_histories, fold_results
+    # Extract parameters from config
+    epochs = cfg.training.get('epochs', 50)
+    start_lr = cfg.training.get('start_lr', 0.001)
+    variant = cfg.data.get('variant', 'full')
+    loss_function = 'focal' if cfg.training.get('loss', {}).get('type') == 'FocalLoss' else 'ce'
+    focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
+    focal_alpha = cfg.training.get('loss', {}).get('alpha', 1.0)
+    gpu_id = cfg.environment.get('gpu_id')
+    
+    print(f"\nTraining Configuration from {args.config}:")
+    print(f"  Epochs: {epochs}")
+    print(f"  Learning Rate: {start_lr}")
+    print(f"  Variant: {variant}")
+    print(f"  Loss Function: {loss_function}")
+    if loss_function == 'focal':
+        print(f"  Focal Gamma: {focal_gamma}")
+        print(f"  Focal Alpha: {focal_alpha}")
+    print(f"  GPU ID: {gpu_id}")
+    
+    # Setup device
+    device = setup_device(gpu_id)
+    
+    # Train models using config
+    fold_models, fold_histories, fold_results = train_kfold_models(
+        epochs=epochs,
+        start_lr=start_lr,
+        show_stratification=args.stratification,
+        device=device,
+        variant=variant,
+        loss_function=loss_function,
+        focal_gamma=focal_gamma,
+        focal_alpha=focal_alpha,
+        model_cfg=cfg.model,
+    )
+    
+    print("✅ Config-driven training completed!")
+    return fold_models, fold_histories, fold_results
 
 
 if __name__ == "__main__":
