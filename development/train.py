@@ -225,7 +225,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     Train for one epoch.
     MODIFIED: Now also returns predictions and targets for metric calculation.
     """
-    model.train()
+    model.train() 
     total_loss = 0
     all_preds = []
     all_targets = []
@@ -476,57 +476,26 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
             criterion = nn.CrossEntropyLoss()
             print(f"  Using Cross Entropy Loss")
         
-        try:
-            model = model.to(device)
-            criterion = criterion.to(device)
-            print(f"Model and criterion loaded to {device}")
-            
-            # Train model
-            print(f"\nTraining fold {fold_idx + 1}...")
-            history = train_model(
-                model=model,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                label_encoder=label_encoder,
-                epochs=epochs,
-                start_lr=start_lr,
-                device=device,
-                variant=variant,
-                fold_tag=f'_{fold_idx+1}',
-                criterion=criterion,
-            )
-            
-        except RuntimeError as e:
-            if "cuDNN" in str(e) or "CUDA out of memory" in str(e):
-                print(f"⚠️  GPU Error: {e}")
-                print("🔄 Falling back to CPU...")
-                
-                # Clear GPU cache and move to CPU
-                torch.cuda.empty_cache()
-                device_fallback = torch.device('cpu')
-                model = model.to(device_fallback)
-                criterion = criterion.to(device_fallback)
-                
-                # Recreate data loaders with smaller batch size for CPU
-                train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-                val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
-                
-                print(f"Retrying training on CPU with batch_size=8...")
-                history = train_model(
-                    model=model,
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    label_encoder=label_encoder,
-                    epochs=epochs,
-                    start_lr=start_lr,
-                    device=device_fallback,
-                    variant=variant,
-                    fold_tag=f'_{fold_idx+1}',
-                    criterion=criterion,
-                )
-                device = device_fallback  # Update device for evaluation
-            else:
-                raise e
+        model = model.to(device)
+        # 编译模型加速训练，需要torch2.x版本
+        model = torch.compile(model)
+        criterion = criterion.to(device)
+        print(f"Model and criterion loaded to {device}")
+        
+        # Train model
+        print(f"\nTraining fold {fold_idx + 1}...")
+        history = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            label_encoder=label_encoder,
+            epochs=epochs,
+            start_lr=start_lr,
+            device=device,
+            variant=variant,
+            fold_tag=f'_{fold_idx+1}',
+            criterion=criterion,
+        )
         
         # Evaluate model and capture predictions for OOF
         print(f"\nEvaluating fold {fold_idx + 1}...")
@@ -547,38 +516,11 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         torch.save(checkpoint, model_filename)
         print(f"Model saved as '{model_filename}'")
         
-        # Save the multimodal scalers for inference pairing
-        fold_scalers = fold
-        
-        # Create outputs directory if it doesn't exist
-        os.makedirs(WEIGHT_DIR, exist_ok=True)
-        
-        # Save non-TOF scaler
-        non_tof_scaler_path = os.path.join(WEIGHT_DIR, f'non_tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
-        with open(non_tof_scaler_path, 'wb') as f:
-            pickle.dump(fold_scalers['non_tof_scaler'], f)
-        print(f"Non-TOF scaler saved as '{non_tof_scaler_path}'")
-        
-        # Save TOF scaler (list of scalers for full variant)
-        if variant == "full" and fold_scalers['tof_scaler'] is not None:
-            tof_scaler_path = os.path.join(WEIGHT_DIR, f'tof_scaler_fold_{fold_idx + 1}_{variant}.pkl')
-            with open(tof_scaler_path, 'wb') as f:
-                pickle.dump(fold_scalers['tof_scaler'], f)
-            print(f"TOF scaler saved as '{tof_scaler_path}'")
-        
-        # Save static scaler
-        static_scaler_path = os.path.join(WEIGHT_DIR, f'static_scaler_fold_{fold_idx + 1}_{variant}.pkl')
-        with open(static_scaler_path, 'wb') as f:
-            pickle.dump(fold_scalers['static_scaler'], f)
-        print(f"Static scaler saved as '{static_scaler_path}'")
-        
         # Store results
         fold_results.append({
             'fold': fold_idx + 1,
             'best_val_score': best_val_score,
-            'model_filename': model_filename,
-            'train_subjects': len(set(fold['train_subjects'])),
-            'val_subjects': len(set(fold['val_subjects']))
+            'model_filename': model_filename
         })
         
         fold_models.append(model)
@@ -602,14 +544,10 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
     print(f"\nBest performing fold: Fold {best_fold_idx + 1} (Score: {best_scores[best_fold_idx]:.4f})")
     
     # Copy best model as the main model
-    best_model_filename = fold_results[best_fold_idx]['model_filename']
-    dest_best = os.path.join(WEIGHT_DIR, f'best_model_{variant}.pth')
-    shutil.copy(best_model_filename, dest_best)
-    # delete the temporary best model file
-    if os.path.exists(best_model_filename):
-        os.remove(best_model_filename)
-        print(f"Temporary best model file '{best_model_filename}' deleted.")
-    print(f"Best model copied to '{dest_best}'")
+    # best_model_filename = fold_results[best_fold_idx]['model_filename']
+    # dest_best = os.path.join(WEIGHT_DIR, f'best_model_{variant}.pth')
+    # shutil.copy(best_model_filename, dest_best)
+    # print(f"Best model copied to '{dest_best}'")
     
     # Save summary
     summary = {

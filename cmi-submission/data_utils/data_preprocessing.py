@@ -240,12 +240,23 @@ def load_and_preprocess_data(variant: str = "full"):
     
     # --- *** NEW: APPLY ADVANCED FEATURE ENGINEERING *** ---
     train_df, feature_cols = feature_engineering(train_df)
+
+    #  将静态特征列添加回总特征列表
+    # 1. 找出数据中实际存在的静态列
+    existing_static_cols = [c for c in STATIC_FEATURE_COLS if c in train_df.columns]
+    
+    # 2. 将它们添加到 feature_cols 列表中，并去重
+    for col in existing_static_cols:
+        if col not in feature_cols:
+            feature_cols.append(col)
     
     # --- Filter features based on variant if necessary ---
     if variant == "imu":
+        # 确保在imu模式下，特征列只包含IMU和人口统计学特征
         imu_engineered_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
-        demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm', 'sex_M']
-        feature_cols = imu_engineered_cols + [c for c in demographic_cols if c in train_df.columns]
+        demographic_cols = [c for c in STATIC_FEATURE_COLS if c in train_df.columns]
+        # 合并并去重
+        feature_cols = sorted(list(set(imu_engineered_cols + demographic_cols)))
         
     print(f"Variant: {variant}. Final feature columns after filtering: {len(feature_cols)}")
 
@@ -390,7 +401,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     return X_train_normalized, X_val_normalized, scaler
 
 
-def prepare_data_kfold_multimodal(variant: str = "full", n_splits: int = 5):
+def prepare_data_kfold_multimodal(show_stratification=False,variant: str = "full", n_splits: int = 5):
     """
     为多模态模型准备 K-Fold 交叉验证数据。
     遵循正确的数据处理流程: Split -> Normalize -> Pad。

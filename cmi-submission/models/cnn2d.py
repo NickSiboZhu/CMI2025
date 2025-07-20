@@ -191,9 +191,16 @@ class TemporalTOF2DCNN(nn.Module):
         # lstm_out: (B, L, H)  | h_n: (layers*dir, B, H)
         lstm_out, (h_n, _) = self.lstm(spatial_features)
 
-        # Use the last layer's forward (or combined) hidden state
-        temporal_features = h_n[-1]  # (B, H)
-
+        # h_n shape is (num_layers * num_directions, batch, hidden_size)
+        # We want the hidden state from the last layer
+        if self.bidirectional:
+            # Concatenate the final forward and backward hidden states
+            # h_n is shaped (L*D, B, H), we take the last layer's forward ([-2]) and backward ([-1])
+            temporal_features = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
+        else:
+            # Just take the final forward hidden state
+            temporal_features = h_n[-1,:,:]
+            
         # Final projection back to out_features for fusion head
         output = self.projection(temporal_features)
          

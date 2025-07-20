@@ -6,7 +6,7 @@
 data = dict(
     variant='imu',  # Fixed: must match data preprocessing logic
     max_length=100,
-    batch_size=32,
+    batch_size=128,
 )
 
 # -------------------------- Model Architecture -----------------------

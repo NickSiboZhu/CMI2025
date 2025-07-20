@@ -116,45 +116,61 @@ def _load_models(device, num_classes, variant: str):
                 model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
                 state_dict = ckpt['state_dict']
                 model = MultimodalityModel(**model_cfg)
-                model.load_state_dict(state_dict)
+                # 移除 torch.compile 产生的 `_orig_mod.` 前缀
+                # 检查键是否以 `_orig_mod.` 开头
+                is_compiled = any(key.startswith('_orig_mod.') for key in state_dict.keys())
+                if is_compiled:
+                    print("Model was trained with torch.compile(). Cleaning state_dict keys...")
+                    from collections import OrderedDict
+                    new_state_dict = OrderedDict()
+                    for k, v in state_dict.items():
+                        # 去掉 '_orig_mod.' 前缀
+                        name = k.replace('_orig_mod.', '', 1) 
+                        new_state_dict[name] = v
+                    model.load_state_dict(new_state_dict)
+                else:
+                    # 如果没有前缀，则正常加载
+                    model.load_state_dict(state_dict)
             else:
                 # 为没有配置的旧checkpoint提供回退
                 raise ValueError(f"Checkpoint for {p} is in a legacy format without 'model_cfg'. Please retrain and save with model config.")
 
             model.to(device).eval()
+            model = torch.compile(model, mode="reduce-overhead")
             pairs.append((model, scaler))
     else:
-        # 单一模型回退逻辑
-        print(f"SINGLE MODEL for variant: {variant}")
-        weight_path = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
-        scaler_path = os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl")
+        print(f"No K-Fold models found")
+        # # 单一模型回退逻辑
+        # print(f"SINGLE MODEL for variant: {variant}")
+        # weight_path = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
+        # scaler_path = os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl")
 
-        if not os.path.exists(weight_path):
-             raise FileNotFoundError(f"No weight file found for variant '{variant}'.")
-        if not os.path.exists(scaler_path):
-            raise FileNotFoundError(f"No scaler file found for variant '{variant}'.")
+        # if not os.path.exists(weight_path):
+        #      raise FileNotFoundError(f"No weight file found for variant '{variant}'.")
+        # if not os.path.exists(scaler_path):
+        #     raise FileNotFoundError(f"No scaler file found for variant '{variant}'.")
 
-        with open(scaler_path, "rb") as f:
-            scaler = pickle.load(f)
+        # with open(scaler_path, "rb") as f:
+        #     scaler = pickle.load(f)
 
-        feature_names = scaler.get_feature_names_out()
-        static_in_features = len([c for c in feature_names if c in STATIC_FEATURE_COLS])
-        tof_in_channels = len([c for c in feature_names if c.startswith('tof_')])
-        non_tof_in_channels = len(feature_names) - static_in_features - tof_in_channels
+        # feature_names = scaler.get_feature_names_out()
+        # static_in_features = len([c for c in feature_names if c in STATIC_FEATURE_COLS])
+        # tof_in_channels = len([c for c in feature_names if c.startswith('tof_')])
+        # non_tof_in_channels = len(feature_names) - static_in_features - tof_in_channels
         
-        # 使用与 K-Fold 相同的逻辑加载模型
-        ckpt = torch.load(weight_path, map_location=device)
-        if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
-            model_cfg = ckpt['model_cfg']
-            model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
-            state_dict = ckpt['state_dict']
-            model = MultimodalityModel(**model_cfg)
-            model.load_state_dict(state_dict)
-        else:
-            raise ValueError(f"Checkpoint for {weight_path} is in a legacy format without 'model_cfg'. Please retrain and save with model config.")
+        # # 使用与 K-Fold 相同的逻辑加载模型
+        # ckpt = torch.load(weight_path, map_location=device)
+        # if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
+        #     model_cfg = ckpt['model_cfg']
+        #     model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
+        #     state_dict = ckpt['state_dict']
+        #     model = MultimodalityModel(**model_cfg)
+        #     model.load_state_dict(state_dict)
+        # else:
+        #     raise ValueError(f"Checkpoint for {weight_path} is in a legacy format without 'model_cfg'. Please retrain and save with model config.")
         
-        model.to(device).eval()
-        pairs.append((model, scaler))
+        # model.to(device).eval()
+        # pairs.append((model, scaler))
 
     return pairs
 
@@ -220,7 +236,6 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
 
     variant = _decide_variant(seq_df)
     
-    # 检查所选变体是否可用
     if variant not in RESOURCES:
         fallback_variant = "imu" if "imu" in RESOURCES else "full"
         print(f"🧬 Variant '{variant}' not available, falling back to '{fallback_variant}'")
@@ -229,24 +244,34 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
         print(f"🧬 Preprocessing with variant: {variant}")
 
     # 1. 首先，如果需要，处理所有 ToF 插值。
-    # 这必须在特征工程之前完成。
     if variant != "imu":
         seq_df = interpolate_tof(seq_df)
 
     # 2. 接下来，应用高级特征工程。
-    # 此函数创建新的IMU特征并稳健地处理所有NaN值。
     processed_df, feature_cols = feature_engineering(seq_df)
 
-    # 3. 如果确定的变体是仅IMU，则过滤掉非IMU列。
-    # IMU模型的scaler仅在这些列上进行训练。
+    # --- ！！！关键修复：将静态特征列添加回总特征列表！！！ ---
+    # 找出数据中实际存在的静态列
+    existing_static_cols = [c for c in STATIC_FEATURE_COLS if c in processed_df.columns]
+    
+    # 将它们添加到 feature_cols 列表中，并去重
+    for col in existing_static_cols:
+        if col not in feature_cols:
+            feature_cols.append(col)
+    # -----------------------------------------------------------------
+
+    # 3. 如果确定的变体是仅IMU，则再次确认过滤
     if variant == "imu":
         imu_engineered_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
-        demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm', 'sex_M']
-        # 保留IMU列以及任何可用的人口统计列
-        feature_cols = imu_engineered_cols + [c for c in demographic_cols if c in processed_df.columns]
+        demographic_cols = [c for c in STATIC_FEATURE_COLS if c in processed_df.columns]
+        feature_cols = sorted(list(set(imu_engineered_cols + demographic_cols)))
 
-    # 4. 返回最终的特征DataFrame，正确排序并准备好进行缩放。
-    final_features_df = processed_df.sort_values("sequence_counter")[feature_cols]
+    # 4. 返回最终的特征DataFrame，它现在包含了所有scaler需要的列
+    #    并确保列的顺序与训练时一致（虽然ColumnTransformer不强求顺序，但这是个好习惯）
+    final_features_df = processed_df.sort_values("sequence_counter")
+    
+    # 确保返回的DataFrame只包含feature_cols中的列，并按此顺序排列
+    final_features_df = final_features_df[[c for c in feature_cols if c in final_features_df.columns]]
 
     return variant, final_features_df
 
@@ -320,8 +345,7 @@ if __name__ == "__main__":
     if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         inference_server.serve()
     else:
-        # 本地测试时，确保路径指向正确
-        # 例如: /kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv
+        os.chdir("/kaggle/working")
         inference_server.run_local_gateway(
             data_paths=(
                 "/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv",
