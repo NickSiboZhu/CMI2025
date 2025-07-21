@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import polars as pl
 from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
 from sklearn.model_selection import StratifiedGroupKFold
 import pickle
@@ -10,16 +11,16 @@ from sklearn.compose import ColumnTransformer
 from scipy.spatial.transform import Rotation as R
 import warnings
 
-# --- START: Advanced Feature Engineering (from your branch) ---
-
-def remove_gravity_from_acc(acc_data, rot_data):
+def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
-    Removes the gravity component from accelerometer data using quaternion rotations.
+    [Internal Helper] Polars-native version of remove_gravity_from_acc.
+    Accepts and returns a Polars DataFrame.
     """
-    acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values if isinstance(acc_data, pd.DataFrame) else acc_data
-    quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values if isinstance(rot_data, pd.DataFrame) else rot_data
+    acc_values = group_df.select(['acc_x', 'acc_y', 'acc_z']).to_numpy()
+    quat_values = group_df.select(['rot_x', 'rot_y', 'rot_z', 'rot_w']).to_numpy()
+    
     linear_accel = np.zeros_like(acc_values)
-    gravity_world = np.array([0, 0, 9.81]) # Standard gravity vector
+    gravity_world = np.array([0, 0, 9.81])
     
     for i in range(acc_values.shape[0]):
         if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
@@ -30,144 +31,161 @@ def remove_gravity_from_acc(acc_data, rot_data):
             gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
             linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
         except (ValueError, IndexError):
-            # Fallback to raw acceleration if quaternion is invalid
             linear_accel[i, :] = acc_values[i, :]
             
-    return linear_accel
+    return pl.DataFrame({
+        'linear_acc_x': linear_accel[:, 0],
+        'linear_acc_y': linear_accel[:, 1],
+        'linear_acc_z': linear_accel[:, 2],
+    })
 
-def calculate_angular_velocity_from_quat(rot_data, time_delta=1/10):
+def _calculate_angular_velocity_from_quat_polars(group_df: pl.DataFrame, time_delta=1/10) -> pl.DataFrame:
     """
-    Calculates angular velocity from quaternion data.
-    NOTE: time_delta is set to 1/10 assuming 10Hz data.
+    [Internal Helper] Polars-native version of calculate_angular_velocity.
     """
-    quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values if isinstance(rot_data, pd.DataFrame) else rot_data
-    angular_vel = np.zeros((quat_values.shape[0], 3))
+    quat_values = group_df.select(['rot_x', 'rot_y', 'rot_z', 'rot_w']).to_numpy()
     
-    # Use diff to get rotation between consecutive timestamps
+    if len(quat_values) < 2:
+        return pl.DataFrame({
+            'angular_vel_x': np.zeros(len(quat_values)),
+            'angular_vel_y': np.zeros(len(quat_values)),
+            'angular_vel_z': np.zeros(len(quat_values)),
+        }, schema={'angular_vel_x': pl.Float64, 'angular_vel_y': pl.Float64, 'angular_vel_z': pl.Float64})
+
     q_t_plus_dt = R.from_quat(quat_values)
     q_t = R.from_quat(np.roll(quat_values, 1, axis=0))
-    
-    # First element has no previous, handle safely
-    q_t.as_quat()[0] = q_t_plus_dt.as_quat()[0] 
+    q_t.as_quat()[0] = q_t_plus_dt.as_quat()[0]
     
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning) # Suppress warnings about near-identity rotations
+        warnings.simplefilter("ignore", UserWarning)
         rot_delta = q_t.inv() * q_t_plus_dt
-    
+        
     angular_vel = rot_delta.as_rotvec() / time_delta
-    
-    # Set the first element's velocity to zero as it cannot be calculated
     angular_vel[0, :] = 0
     
-    return angular_vel
-
-def calculate_angular_distance(rot_data):
+    return pl.DataFrame({
+        'angular_vel_x': angular_vel[:, 0],
+        'angular_vel_y': angular_vel[:, 1],
+        'angular_vel_z': angular_vel[:, 2],
+    })
+    
+def _calculate_angular_distance_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
-    Calculates the angular distance between consecutive quaternion rotations.
+    [Internal Helper] Polars-native version of calculate_angular_distance.
     """
-    quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values if isinstance(rot_data, pd.DataFrame) else rot_data
-    angular_dist = np.zeros(quat_values.shape[0])
+    quat_values = group_df.select(['rot_x', 'rot_y', 'rot_z', 'rot_w']).to_numpy()
 
-    # A more efficient vectorized approach
+    if len(quat_values) < 2:
+        return pl.DataFrame({'angular_distance': np.zeros(len(quat_values))}, schema={'angular_distance': pl.Float64})
+        
     q2 = R.from_quat(quat_values)
     q1 = R.from_quat(np.roll(quat_values, 1, axis=0))
-    
-    # First element has no previous, handle safely
     q1.as_quat()[0] = q2.as_quat()[0]
     
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         dR = q1.inv() * q2
-    
+        
     angular_dist = np.linalg.norm(dR.as_rotvec(), axis=1)
-    
-    # Set the first element's distance to zero
     angular_dist[0] = 0
     
-    return angular_dist
+    return pl.DataFrame({'angular_distance': angular_dist})
 
-def feature_engineering(train_df: pd.DataFrame):
-    """
+
+def feature_engineering(train_df: pd.DataFrame): 
+    """ 
     Applies the full feature engineering pipeline.
-    MODIFIED: Includes a detailed logging step to inspect NaNs before the final fix.
-    """
-    print("\nApplying advanced feature engineering...")
-    
-    # Suppress potential SettingWithCopyWarning
-    pd.options.mode.chained_assignment = None
+    MODIFIED: Uses Polars internally with optimized helper functions for a massive speedup,
+    while keeping the public interface (input/output) unchanged (still pandas).
+    """ 
+    print("\nApplying advanced feature engineering (with Polars backend)...")
 
-    # --- Initial NaN handling for raw data ---
-    cols_to_process = [c for c in train_df.columns if c.startswith('acc_') or c.startswith('rot_')]
-    train_df[cols_to_process] = train_df.groupby('sequence_id')[cols_to_process].transform(
-        lambda x: x.interpolate(method='linear', limit_direction='both')
+    # --- 步骤 1: 从 Pandas 转换为 Polars ---
+    # 保存原始索引，以便最后恢复
+    original_index = train_df.index
+    pl_df = pl.from_pandas(train_df)
+
+    cols_to_process = [c for c in pl_df.columns if c.startswith('acc_') or c.startswith('rot_')]
+
+    # --- 步骤 2: 使用 Polars 表达式进行高性能计算 ---
+    # 初始 NaN 处理和四元数修正
+    pl_df = pl_df.with_columns(
+        pl.col(cols_to_process).interpolate().over('sequence_id').fill_null(0.0)
+    ).with_columns(
+        pl.when((pl.col('rot_x') == 0) & (pl.col('rot_y') == 0) & (pl.col('rot_z') == 0) & (pl.col('rot_w') == 0))
+          .then(1.0)
+          .otherwise(pl.col('rot_w'))
+          .alias('rot_w')
     )
-    train_df[cols_to_process] = train_df[cols_to_process].fillna(0.0)
-    rot_cols = ['rot_x', 'rot_y', 'rot_z', 'rot_w']
-    zero_norm_mask = (train_df[rot_cols] == 0).all(axis=1)
-    if zero_norm_mask.any():
-        train_df.loc[zero_norm_mask, 'rot_w'] = 1.0
-    
-    # --- Feature Calculation (this will create new NaNs from .diff()) ---
+
     print("Calculating engineered features...")
-    train_df['acc_mag'] = np.sqrt(train_df['acc_x']**2 + train_df['acc_y']**2 + train_df['acc_z']**2)
-    train_df['rot_angle'] = 2 * np.arccos(train_df['rot_w'].clip(-1, 1))
-    train_df['acc_mag_jerk'] = train_df.groupby('sequence_id')['acc_mag'].diff()
-    train_df['rot_angle_vel'] = train_df.groupby('sequence_id')['rot_angle'].diff()
-    
-    linear_accel_df = train_df.groupby('sequence_id').apply(
-        lambda df: pd.DataFrame(remove_gravity_from_acc(df[['acc_x', 'acc_y', 'acc_z']], df[rot_cols]), 
-                                columns=['linear_acc_x', 'linear_acc_y', 'linear_acc_z'], index=df.index), 
-        include_groups=False
-    ).droplevel(0)
-    train_df = train_df.join(linear_accel_df)
-
-    train_df['linear_acc_mag'] = np.sqrt(train_df['linear_acc_x']**2 + train_df['linear_acc_y']**2 + train_df['linear_acc_z']**2)
-    train_df['linear_acc_mag_jerk'] = train_df.groupby('sequence_id')['linear_acc_mag'].diff()
-
-    angular_velocity_df = train_df.groupby('sequence_id').apply(
-        lambda df: pd.DataFrame(calculate_angular_velocity_from_quat(df[rot_cols]), 
-                                columns=['angular_vel_x', 'angular_vel_y', 'angular_vel_z'], index=df.index), 
-        include_groups=False
-    ).droplevel(0)
-    train_df = train_df.join(angular_velocity_df)
-    
-    train_df[['angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z']] = train_df.groupby('sequence_id')[['angular_vel_x', 'angular_vel_y', 'angular_vel_z']].diff()
-    train_df[['angular_snap_x', 'angular_snap_y', 'angular_snap_z']] = train_df.groupby('sequence_id')[['angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z']].diff()
-
-    angular_distance_df = train_df.groupby('sequence_id').apply(
-        lambda df: pd.DataFrame(calculate_angular_distance(df[rot_cols]), 
-                                columns=['angular_distance'], index=df.index), 
-        include_groups=False
-    ).droplevel(0)
-    train_df = train_df.join(angular_distance_df)
-
-    # --- Define the final list of all features created ---
-    final_feature_cols = [
-        'acc_x', 'acc_y', 'acc_z', 'rot_w', 'rot_x', 'rot_y', 'rot_z', 
-        'acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel', 
-        'linear_acc_x', 'linear_acc_y', 'linear_acc_z', 
-        'linear_acc_mag', 'linear_acc_mag_jerk', 
-        'angular_vel_x', 'angular_vel_y', 'angular_vel_z', 
-        'angular_distance', 'angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z',
-        'angular_snap_x', 'angular_snap_y', 'angular_snap_z'
-    ]
-    tof_thm_cols = [c for c in train_df.columns if c.startswith('tof_') or c.startswith('thm_')]
-    final_feature_cols.extend(tof_thm_cols)
-    final_feature_cols = [c for c in final_feature_cols if c in train_df.columns]
-
-    # --- Final, comprehensive NaN cleanup ---
-    print(f"Cleaning up all NaNs generated during feature engineering...")
-    train_df[final_feature_cols] = train_df.groupby('sequence_id')[final_feature_cols].transform(
-        lambda x: x.interpolate(method='linear', limit_direction='both')
+    # 计算基础特征及其导数
+    pl_df = pl_df.with_columns(
+        (pl.col('acc_x')**2 + pl.col('acc_y')**2 + pl.col('acc_z')**2).sqrt().alias('acc_mag'),
+        (2 * pl.col('rot_w').clip(-1, 1).arccos()).alias('rot_angle'),
+    ).with_columns(
+        pl.col('acc_mag').diff().over('sequence_id').alias('acc_mag_jerk'),
+        pl.col('rot_angle').diff().over('sequence_id').alias('rot_angle_vel'),
     )
-    train_df[final_feature_cols] = train_df[final_feature_cols].fillna(0.0)
+
+    # --- 步骤 3: 使用 map_groups 高效调用新的 Polars 辅助函数 ---
+    
+    # 计算线性加速度
+    linear_accel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_remove_gravity_from_acc_polars)
+    pl_df = pl.concat([pl_df, linear_accel_results], how='horizontal')
+    
+    pl_df = pl_df.with_columns(
+        (pl.col('linear_acc_x')**2 + pl.col('linear_acc_y')**2 + pl.col('linear_acc_z')**2).sqrt().alias('linear_acc_mag')
+    ).with_columns(
+        pl.col('linear_acc_mag').diff().over('sequence_id').alias('linear_acc_mag_jerk')
+    )
+
+    # 计算角速度
+    angular_vel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_velocity_from_quat_polars)
+    pl_df = pl.concat([pl_df, angular_vel_results], how='horizontal')
+    
+    # 计算角速度的导数 (Jerk, Snap)
+    pl_df = pl_df.with_columns(
+        pl.col(['angular_vel_x', 'angular_vel_y', 'angular_vel_z']).diff().over('sequence_id').name.suffix('_jerk')
+    ).rename({
+        "angular_vel_x_jerk": "angular_jerk_x", "angular_vel_y_jerk": "angular_jerk_y", "angular_vel_z_jerk": "angular_jerk_z"
+    })
+    pl_df = pl_df.with_columns(
+        pl.col(['angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z']).diff().over('sequence_id').name.suffix('_snap')
+    ).rename({
+        "angular_jerk_x_snap": "angular_snap_x", "angular_jerk_y_snap": "angular_snap_y", "angular_jerk_z_snap": "angular_snap_z"
+    })
+
+    # 计算角距离
+    angular_dist_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_distance_polars)
+    pl_df = pl.concat([pl_df, angular_dist_results], how='horizontal')
+    
+    # --- 步骤 4: 定义最终特征列并进行最终清理 ---
+    final_feature_cols = [ 
+        'acc_x', 'acc_y', 'acc_z', 'rot_w', 'rot_x', 'rot_y', 'rot_z',  
+        'acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel',  
+        'linear_acc_x', 'linear_acc_y', 'linear_acc_z',  
+        'linear_acc_mag', 'linear_acc_mag_jerk',  
+        'angular_vel_x', 'angular_vel_y', 'angular_vel_z',  
+        'angular_distance', 'angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z', 
+        'angular_snap_x', 'angular_snap_y', 'angular_snap_z' 
+    ] 
+    tof_thm_cols = [c for c in pl_df.columns if c.startswith('tof_') or c.startswith('thm_')] 
+    final_feature_cols.extend(tof_thm_cols) 
+    final_feature_cols = [c for c in final_feature_cols if c in pl_df.columns] 
+
+    print("Cleaning up all NaNs generated during feature engineering...")
+    pl_df = pl_df.with_columns(
+        pl.col(final_feature_cols).interpolate().over('sequence_id').fill_null(0.0)
+    )
     
     print(f"Generated {len(final_feature_cols)} features after engineering.")
-    
-    # Restore pandas options
-    pd.options.mode.chained_assignment = 'warn'
-    
-    return train_df, final_feature_cols
+
+    # --- 步骤 5: 从 Polars 转换回 Pandas，恢复原始接口 ---
+    final_pandas_df = pl_df.to_pandas()
+    final_pandas_df.index = original_index # 恢复原始索引，确保DataFrame结构完全一致
+
+    return final_pandas_df, final_feature_cols
 
 # Static feature columns (shared between training and inference)
 STATIC_FEATURE_COLS = [
@@ -375,7 +393,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
         
     final_tof_cols = [c for c in tof_cols if c in X_train.columns]
     if final_tof_cols:
-        transformer_list.append(('tof_scaler', TofScaler(), final_tof_cols))
+        transformer_list.append(('minmax', MinMaxScaler(), final_tof_cols))
 
     scaler = ColumnTransformer(
         transformers=transformer_list,
