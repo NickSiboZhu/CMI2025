@@ -20,9 +20,6 @@ class CNN1D(nn.Module):
                  kernel_sizes: list = None):
         super(CNN1D, self).__init__()
         
-        # ------------------------------------------------------------------
-        # Dynamic conv stack -------------------------------------------------
-        # ------------------------------------------------------------------
         if filters is None:
             filters = [64, 128, 256]
         if kernel_sizes is None:
@@ -30,36 +27,32 @@ class CNN1D(nn.Module):
         assert len(filters) == len(kernel_sizes), "filters and kernel_sizes length mismatch"
 
         layers = []
-        ln_layers = []  # store LayerNorm to apply after transpose
+        self.bn_layers = nn.ModuleList()
         in_channels = input_channels
         for out_c, k in zip(filters, kernel_sizes):
             layers.append(nn.Conv1d(in_channels, out_c, kernel_size=k, padding=k//2))
-            ln_layers.append(nn.LayerNorm(out_c))
+            self.bn_layers.append(nn.BatchNorm1d(out_c))
             in_channels = out_c
         self.conv_layers = nn.ModuleList(layers)
-        self.ln_layers = nn.ModuleList(ln_layers)
 
         self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
         self.global_pool = nn.AdaptiveMaxPool1d(1)
 
         self.cnn_output_size = filters[-1]
     
-    
     def forward(self, x):
         """
-        Defines the full forward pass for using this model as a standalone classifier.
+        Defines the full forward pass for using this model as a feature extractor.
         """
-        # ---- Feature extraction pathway (convs + LN + pooling) ----
-        x = x.transpose(1, 2)  # (batch, channels, seq_len)
+        x = x.transpose(1, 2)  # (batch, channels, seq_len) -> Conv1d的标准输入格式
 
-        for conv, ln in zip(self.conv_layers, self.ln_layers):
+        for i, conv in enumerate(self.conv_layers):
             x = conv(x)
-            x = x.transpose(1, 2)  # (batch, seq_len, channels) for LN
-            x = ln(x)
-            x = x.transpose(1, 2)
+            x = self.bn_layers[i](x)
             x = torch.relu(x)
+            
             # Apply pooling except on the last conv layer
-            if conv != self.conv_layers[-1]:
+            if i < len(self.conv_layers) - 1:
                 x = self.pool(x)
 
         # Global pooling to collapse temporal dimension

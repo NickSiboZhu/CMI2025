@@ -353,7 +353,7 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start_lr=0.001, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start_lr=0.001, patience=15, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -375,7 +375,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start
     }
     
     best_val_score = 0
-    patience = 15
+    patience = patience
     patience_counter = 0
     
     print(f"Training on device: {device}")
@@ -436,7 +436,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
+def train_kfold_models(epochs=50, start_lr=0.001, batch_size=32, patience=15, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -526,9 +526,9 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
             fold['X_val_static'], 
             fold['y_val']
         )
-        
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -557,6 +557,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
             label_encoder=label_encoder,
             epochs=epochs,
             start_lr=start_lr,
+            patience=patience,
             device=device,
             variant=variant,
             fold_tag=f'_{fold_idx+1}',
@@ -655,6 +656,8 @@ def main():
     epochs = cfg.training.get('epochs', 50)
     start_lr = cfg.training.get('start_lr', 0.001)
     variant = cfg.data.get('variant', 'full')
+    batch_size = cfg.data.get('batch_size', 32)
+    patience = cfg.training.get('patience', 15)
     loss_function = 'focal' if cfg.training.get('loss', {}).get('type') == 'FocalLoss' else 'ce'
     focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
     focal_alpha = cfg.training.get('loss', {}).get('alpha', 1.0)
@@ -663,6 +666,8 @@ def main():
     print(f"\nTraining Configuration from {args.config}:")
     print(f"  Epochs: {epochs}")
     print(f"  Learning Rate: {start_lr}")
+    print(f"  Batch Size: {batch_size}")
+    print(f"  Patience: {patience}")
     print(f"  Variant: {variant}")
     print(f"  Loss Function: {loss_function}")
     if loss_function == 'focal':
@@ -677,6 +682,8 @@ def main():
     fold_models, fold_histories, fold_results = train_kfold_models(
         epochs=epochs,
         start_lr=start_lr,
+        batch_size=batch_size,
+        patience=patience,
         show_stratification=args.stratification,
         device=device,
         variant=variant,
