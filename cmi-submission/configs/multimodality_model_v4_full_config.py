@@ -20,7 +20,12 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[5, 5, 3]
+        kernel_sizes=[5, 5, 3],
+        strides=[2, 2, 1],
+        temporal_module='global_max',  # Choose from 'global_avg', 'global_max', 'lstm'
+        lstm_hidden=128,
+        lstm_layers=1,
+        lstm_bidirectional=True,
     ),
 
     # MLP branch blueprint
@@ -41,7 +46,7 @@ model = dict(
         conv_channels=[32, 64, 128],
         lstm_layers=1,
         lstm_hidden=128,
-        kernel_sizes=[3, 3, 2]
+        kernel_sizes=[3, 3]
     ),
 
     # Fusion head blueprint
@@ -55,7 +60,7 @@ model = dict(
 # ----------------------- Training Strategy ---------------------------
 training = dict(
     epochs=100,
-    patience=15,
+    patience=20,
     start_lr=1e-3,
     optimizer=dict(type='AdamW', lr=0.001, weight_decay=1e-4),
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
