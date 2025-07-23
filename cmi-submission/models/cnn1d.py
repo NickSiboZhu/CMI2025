@@ -36,7 +36,7 @@ class CNN1D(nn.Module):
         self.conv_layers = nn.ModuleList(layers)
 
         self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
-        self.global_pool = nn.AdaptiveMaxPool1d(1)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
 
         self.cnn_output_size = filters[-1]
     
