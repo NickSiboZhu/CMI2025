@@ -273,16 +273,17 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     all_targets = []
     
     # MODIFIED: Unpack sample_weights from the dataloader
-    for (non_tof_data, tof_data, static_data), target, sample_weights in dataloader:
+    for (non_tof_data, tof_data, static_data, mask), target, sample_weights in dataloader:
         non_tof_data = non_tof_data.to(device)
         tof_data = tof_data.to(device)
         static_data = static_data.to(device)
+        mask = mask.to(device)
         target = target.to(device)
-        # NEW: Move sample weights to the device
         sample_weights = sample_weights.to(device)
         
         optimizer.zero_grad()
-        output = model(non_tof_data, tof_data, static_data)
+        # ✨ 将mask传递给模型
+        output = model(non_tof_data, tof_data, static_data, mask=mask)
         
         # NEW: Manual weighted loss calculation
         # The criterion must be initialized with reduction='none'
@@ -326,12 +327,15 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
     
     with torch.no_grad():
         # MODIFIED: Unpack the dummy weight value, but don't use it
-        for (non_tof_data, tof_data, static_data), target, _ in dataloader:
+        for (non_tof_data, tof_data, static_data, mask), target, _ in dataloader:
             non_tof_data = non_tof_data.to(device)
             tof_data = tof_data.to(device)
             static_data = static_data.to(device)
+            mask = mask.to(device) # ✨ 将mask移动到device
             target = target.to(device)
-            output = model(non_tof_data, tof_data, static_data)
+            
+            # ✨ 将mask传递给模型
+            output = model(non_tof_data, tof_data, static_data, mask=mask)
             
             # MODIFIED: Calculate loss using the local, unweighted criterion
             loss = val_criterion(output, target)
@@ -517,14 +521,15 @@ def train_kfold_models(epochs=50, start_lr=0.001, batch_size=32, patience=15, sh
             fold['X_train_tof'], 
             fold['X_train_static'], 
             fold['y_train'],
-            class_weight_dict=class_weight_dict # Pass weights here
+            mask=fold['train_mask'],  # ✨ 传递训练mask
+            class_weight_dict=class_weight_dict
         )
-        # Validation dataset does not need weights
         val_dataset = MultimodalDataset(
             fold['X_val_non_tof'], 
             fold['X_val_tof'], 
             fold['X_val_static'], 
-            fold['y_val']
+            fold['y_val'],
+            mask=fold['val_mask']    # ✨ 传递验证mask
         )
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)

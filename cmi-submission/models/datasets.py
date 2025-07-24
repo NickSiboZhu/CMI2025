@@ -13,7 +13,7 @@ class MultimodalDataset(Dataset):
     4. Sample weights for weighted loss calculation
     """
     
-    def __init__(self, X_non_tof, X_tof, X_static, y, class_weight_dict=None):
+    def __init__(self, X_non_tof, X_tof, X_static, y, mask, class_weight_dict=None):
         """
         Initialize multimodal dataset.
         
@@ -29,6 +29,7 @@ class MultimodalDataset(Dataset):
         self.X_tof = torch.FloatTensor(X_tof)
         self.X_static = torch.FloatTensor(X_static)
         self.y = torch.LongTensor(y)
+        self.mask = torch.FloatTensor(mask)
         
         # Validate shapes
         assert len(self.X_non_tof) == len(self.X_tof) == len(self.X_static) == len(self.y), \
@@ -46,18 +47,15 @@ class MultimodalDataset(Dataset):
     
     def __getitem__(self, idx):
         """
-        Get a single sample, including its weight if available.
-        
         Returns:
-            tuple: ((non_tof_data, tof_data, static_data), label, sample_weight)
+            tuple: ((non_tof_data, tof_data, static_data, mask), label, sample_weight)
         """
-        data_tuple = (self.X_non_tof[idx], self.X_tof[idx], self.X_static[idx])
+        # ✨ 将mask添加到数据元组中
+        data_tuple = (self.X_non_tof[idx], self.X_tof[idx], self.X_static[idx], self.mask[idx])
         label = self.y[idx]
         
-        # ✨ NEW: Return the specific sample's weight
         if self.sample_weights is not None:
             weight = self.sample_weights[idx]
             return data_tuple, label, weight
         else:
-            # If no weights are provided (e.g., for validation set), return a dummy weight of 1.0
             return data_tuple, label, 1.0

@@ -102,7 +102,7 @@ class MultimodalityModel(nn.Module):
         # Build fusion head via registry
         self.classifier_head = build_from_cfg(fusion_head_cfg, MODELS)
 
-    def forward(self, seq_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, seq_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
         Defines the forward pass logic of the multimodal fusion model.
         
@@ -112,11 +112,11 @@ class MultimodalityModel(nn.Module):
             static_input: Static demographic data (batch_size, static_features)
         """
         # 1. Process sequential data through the 1D CNN branch
-        cnn_1d_features = self.cnn_1d_branch(seq_input)
+        cnn_1d_features = self.cnn_1d_branch(seq_input,  mask=mask)
         
         # 2. Process TOF data (only if enabled)
         if self.use_tof:
-            cnn_2d_features = self.cnn_2d_branch(tof_input)
+            cnn_2d_features = self.cnn_2d_branch(tof_input,  mask=mask)
         else:
             cnn_2d_features = None
         

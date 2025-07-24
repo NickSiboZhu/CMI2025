@@ -287,38 +287,44 @@ def load_and_preprocess_data(variant: str = "full"):
 
 def pad_sequences(sequences, max_length=None):
     """
-    Pad sequences to same length, keeping the END of each sequence (most critical part)
+    Pad sequences to same length and generate a corresponding attention mask.
     
     Strategy:
-    - Keep the LAST max_length timesteps of each sequence
-    - Pad with zeros at the BEGINNING if sequence is shorter
-    - Truncate from the BEGINNING if sequence is longer
-    
-    This preserves the end of gestures which contains the most discriminative information.
+    - Keep the LAST max_length timesteps of each sequence.
+    - Pad with zeros at the BEGINNING if sequence is shorter.
+    - Truncate from the BEGINNING if sequence is longer.
+    - Generate a mask where 1s indicate real data and 0s indicate padding.
     """
     if not sequences:
-        return np.array([])
+        return np.array([]), np.array([])
     if max_length is None:
         max_length = max(len(seq) for seq in sequences)
     
     print(f"Padding sequences to length: {max_length}")
-    print("Strategy: Keep END of sequences, pad zeros at BEGINNING")
+    print("Strategy: Keep END of sequences, pad zeros at BEGINNING, generate mask")
     
     num_features = sequences[0].shape[1]
     padded_sequences = np.zeros((len(sequences), max_length, num_features))
+    # ✨ 新增: 创建一个mask矩阵，初始全为0 (padding)
+    masks = np.zeros((len(sequences), max_length), dtype=np.float32) 
     
     for i, seq in enumerate(sequences):
         seq_length = len(seq)
         
         if seq_length >= max_length:
-            # Take the LAST max_length timesteps (truncate from beginning)
+            # 取最后 max_length 个时间步
             padded_sequences[i, :, :] = seq[-max_length:, :]
+            # mask全为1，因为没有padding
+            masks[i, :] = 1.0
         else:
-            # Pad with zeros at the BEGINNING, keep original sequence at the END
+            # 在序列前端补零
             start_idx = max_length - seq_length
             padded_sequences[i, start_idx:, :] = seq
-    
-    return padded_sequences
+            # 在mask的对应位置标记为1 (真实数据)
+            masks[i, start_idx:] = 1.0
+            
+    # ✨ 返回padding后的序列和对应的mask
+    return padded_sequences, masks
 
 class TofScaler(BaseEstimator, TransformerMixin):
     """
@@ -477,8 +483,10 @@ def prepare_data_kfold_multimodal(show_stratification=False,variant: str = "full
             train_tof_list.append(group[tof_cols].values)
 
         X_train_static = np.array(train_static_list)
-        X_train_non_tof = pad_sequences(train_non_tof_list, max_length=max_length)
-        X_train_tof = pad_sequences(train_tof_list, max_length=max_length)
+        X_train_non_tof, train_non_tof_mask = pad_sequences(train_non_tof_list, max_length=max_length)
+        X_train_tof, train_tof_mask = pad_sequences(train_tof_list, max_length=max_length)
+        # 假设两个mask应该相同，因为它们源自相同的序列长度
+        train_mask = train_non_tof_mask
 
         # 处理验证集
         val_static_list, val_non_tof_list, val_tof_list = [], [], []
@@ -489,8 +497,9 @@ def prepare_data_kfold_multimodal(show_stratification=False,variant: str = "full
             val_tof_list.append(group[tof_cols].values)
 
         X_val_static = np.array(val_static_list)
-        X_val_non_tof = pad_sequences(val_non_tof_list, max_length=max_length)
-        X_val_tof = pad_sequences(val_tof_list, max_length=max_length)
+        X_val_non_tof, val_non_tof_mask = pad_sequences(val_non_tof_list, max_length=max_length)
+        X_val_tof, val_tof_mask = pad_sequences(val_tof_list, max_length=max_length)
+        val_mask = val_non_tof_mask
 
         print(f"Train shapes: Non-TOF={X_train_non_tof.shape}, TOF={X_train_tof.shape}, Static={X_train_static.shape}")
         print(f"Val shapes:   Non-TOF={X_val_non_tof.shape}, TOF={X_val_tof.shape}, Static={X_val_static.shape}")
@@ -501,10 +510,12 @@ def prepare_data_kfold_multimodal(show_stratification=False,variant: str = "full
             'X_train_tof': X_train_tof,
             'X_train_static': X_train_static,
             'y_train': y_train_fold,
+            'train_mask': train_mask,
             'X_val_non_tof': X_val_non_tof,
             'X_val_tof': X_val_tof,
             'X_val_static': X_val_static,
             'y_val': y_val_fold,
+            'val_mask': val_mask,
             'scaler': scaler_fold, # <--- 保存 ColumnTransformer scaler
             'val_idx': val_seq_indices,
         })

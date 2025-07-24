@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from . import MODELS
+from torch.nn.utils.rnn import pack_padded_sequence
 
 class TOF2DCNN(nn.Module):
     """
@@ -162,48 +163,54 @@ class TemporalTOF2DCNN(nn.Module):
             nn.Dropout(0.3)
         )
     
-    def forward(self, tof_sequence):
+    def forward(self, tof_sequence, mask=None):
         """
-        Forward pass for temporal TOF processing.
-        
-        Args:
-            tof_sequence: Tensor of shape (batch_size, seq_len, num_sensors * 64)
-        
-        Returns:
-            Tensor of shape (batch_size, out_features)
+        Forward pass with BATCH-WISE alignment for sequences padded at the BEGINNING.
         """
         batch_size, seq_len, _ = tof_sequence.shape
-        
-        # Reshape to grids: (batch_size, seq_len, num_sensors, 8, 8)
+
+        if mask is None:
+            mask = torch.ones(batch_size, seq_len, device=tof_sequence.device)
+
+        # --- 空间特征提取部分 (不变) ---
+        # ... (这部分代码完全不变) ...
         tof_grids = reshape_tof_features(tof_sequence, self.num_tof_sensors)
-        
-        # Process each timestep through 2D CNN
-        # Reshape to (batch_size * seq_len, num_sensors, 8, 8)
         tof_grids_flat = tof_grids.view(batch_size * seq_len, self.num_tof_sensors, 8, 8)
-        
-        # Apply 2D CNN to all timesteps
-        spatial_features = self.spatial_cnn(tof_grids_flat)  # (batch_size * seq_len, out_features)
-        
-        # Reshape back to sequential format
-        spatial_features = spatial_features.view(batch_size, seq_len, self.out_features)  # (B, L, C)
+        spatial_features = self.spatial_cnn(tof_grids_flat)
+        spatial_features = spatial_features.view(batch_size, seq_len, self.out_features)
 
-        # ----------- LSTM across time -------------
-        # lstm_out: (B, L, H)  | h_n: (layers*dir, B, H)
-        lstm_out, (h_n, _) = self.lstm(spatial_features)
+        # --- ✨ 数据对齐与时序处理 (核心修改) ---
 
-        # h_n shape is (num_layers * num_directions, batch, hidden_size)
-        # We want the hidden state from the last layer
+        # 1. 计算真实长度
+        lengths = mask.sum(dim=1).to(torch.int64)
+
+        # 2. 创建一个新的空张量用于存放对齐后的数据
+        aligned_features = torch.zeros_like(spatial_features)
+
+        # 3. 对批次中的每个序列进行数据对齐（搬运）
+        # 这个循环在GPU上操作，比在CPU上逐个处理高效得多
+        for i in range(batch_size):
+            L = lengths[i]
+            if L > 0:
+                # 将原序列的尾部真实数据，复制到新序列的头部
+                aligned_features[i, :L] = spatial_features[i, -L:]
+
+        # 4. 使用对齐后的数据进行打包
+        packed_input = pack_padded_sequence(
+            aligned_features, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+
+        # 5. 将打包数据送入LSTM
+        _, (h_n, _) = self.lstm(packed_input)
+
+        # --- 特征提取 (不变) ---
         if self.bidirectional:
-            # Concatenate the final forward and backward hidden states
-            # h_n is shaped (L*D, B, H), we take the last layer's forward ([-2]) and backward ([-1])
             temporal_features = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
         else:
-            # Just take the final forward hidden state
             temporal_features = h_n[-1,:,:]
-            
-        # Final projection back to out_features for fusion head
+
         output = self.projection(temporal_features)
-         
+
         return output
     
     def get_model_info(self):
