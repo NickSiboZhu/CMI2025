@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from . import MODELS
+from torch.nn.utils.rnn import pack_padded_sequence
 
 class TOF2DCNN(nn.Module):
     """
@@ -134,19 +135,18 @@ class TemporalTOF2DCNN(nn.Module):
             nn.Dropout(0.3)
         )
     
-    def forward(self, tof_sequence):
+    def forward(self, tof_sequence, mask=None):
         """
-        Forward pass for temporal TOF processing.
-        
-        Args:
-            tof_sequence: Tensor of shape (batch_size, seq_len, num_sensors * 64)
-        
-        Returns:
-            Tensor of shape (batch_size, out_features)
+        Forward pass with BATCH-WISE alignment for sequences padded at the BEGINNING.
         """
         batch_size, seq_len, _ = tof_sequence.shape
-        
-        # Directly reshape to (batch_size * seq_len, num_sensors, 8, 8) for 2D CNN processing
+
+        if mask is None:
+            mask = torch.ones(batch_size, seq_len, device=tof_sequence.device)
+
+        # --- Spatial feature extraction ---
+        # Reshape to (batch_size * seq_len, num_sensors, 8, 8) for 2D CNN processing
+        # `input_channels` here represents the number of TOF sensors.
         tof_grids_flat = tof_sequence.view(batch_size * seq_len, self.input_channels, 8, 8)
         
         # Apply 2D CNN to all timesteps
@@ -155,23 +155,42 @@ class TemporalTOF2DCNN(nn.Module):
         # Reshape back to sequential format
         spatial_features = spatial_features.view(batch_size, seq_len, self.out_features)  # (B, L, C)
 
-        # ----------- LSTM across time -------------
-        # lstm_out: (B, L, H)  | h_n: (layers*dir, B, H)
-        lstm_out, (h_n, _) = self.lstm(spatial_features)
+        # --- Data alignment and temporal processing (Core change) ---
 
-        # h_n shape is (num_layers * num_directions, batch, hidden_size)
-        # We want the hidden state from the last layer
+        # 1. Calculate true lengths
+        lengths = mask.sum(dim=1).to(torch.int64)
+
+        # 2. Create a new empty tensor for aligned data
+        aligned_features = torch.zeros_like(spatial_features)
+
+        # 3. Align data for each sequence in the batch
+        # This loop is on the GPU and is more efficient than CPU-side processing.
+        for i in range(batch_size):
+            L = lengths[i]
+            if L > 0:
+                # Copy the true data from the end of the original sequence
+                # to the beginning of the new sequence.
+                aligned_features[i, :L] = spatial_features[i, -L:]
+
+        # 4. Pack the aligned data
+        # Move lengths to CPU as required by pack_padded_sequence
+        packed_input = pack_padded_sequence(
+            aligned_features, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+
+        # 5. Feed packed data into LSTM
+        _, (h_n, _) = self.lstm(packed_input)
+
+        # --- Feature projection ---
         if self.bidirectional:
-            # Concatenate the final forward and backward hidden states
-            # h_n is shaped (L*D, B, H), we take the last layer's forward ([-2]) and backward ([-1])
+            # Concatenate final forward and backward hidden states
             temporal_features = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
         else:
-            # Just take the final forward hidden state
+            # Use the final hidden state of the last layer
             temporal_features = h_n[-1,:,:]
-            
-        # Final projection back to out_features for fusion head
+
         output = self.projection(temporal_features)
-         
+
         return output
     
     def get_model_info(self):

@@ -116,25 +116,25 @@ class MultimodalityModel(nn.Module):
         # Build fusion head via registry
         self.classifier_head = build_from_cfg(fusion_head_cfg, MODELS)
 
-    def forward(self, seq_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor, 
-                thm_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, imu_input: torch.Tensor, thm_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
         Defines the forward pass logic of the multimodal fusion model.
         
         Args:
-            seq_input: IMU sequential sensor data (batch_size, seq_len, imu_features)
+            imu_input: IMU sequential sensor data (batch_size, seq_len, imu_features)
+            thm_input: THM sequential sensor data (batch_size, seq_len, thm_features)
             tof_input: TOF sensor data (batch_size, seq_len, 320) - 5 sensors × 64 pixels
             static_input: Static demographic data (batch_size, static_features)
-            thm_input: THM sequential sensor data (batch_size, seq_len, thm_features)
+            mask: An optional boolean tensor to mask padded elements in sequences. (batch_size, seq_len)
         """
         # 1. Process IMU data through the 1D CNN branch
-        imu_features = self.imu_branch(seq_input)
+        imu_features = self.imu_branch(imu_input, mask=mask)
         
-        # 2. Process THM data through its dedicated 1D CNN branch
-        thm_features = self.thm_branch(thm_input) if self.use_thm else None
+        # 2. Process THM data (optional)
+        thm_features = self.thm_branch(thm_input, mask=mask) if self.use_thm else None
         
-        # 3. Process TOF data (only if enabled)
-        tof_features = self.tof_branch(tof_input) if self.use_tof else None
+        # 3. Process TOF data (optional)
+        tof_features = self.tof_branch(tof_input, mask=mask) if self.use_tof else None
         
         # 4. Process static data through the MLP branch
         mlp_features = self.mlp_branch(static_input)
@@ -145,7 +145,7 @@ class MultimodalityModel(nn.Module):
             features_to_concat.insert(1, thm_features)
         if tof_features is not None:
             features_to_concat.append(tof_features)
-            
+        
         combined_features = torch.cat(features_to_concat, dim=1)
         
         # 6. Pass the fused features through the final classifier head

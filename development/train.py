@@ -25,8 +25,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import torch._dynamo
 import numpy as np
 from sklearn.metrics import classification_report, f1_score
+from sklearn.preprocessing import LabelEncoder
 import time
 import json
 import shutil
@@ -72,6 +74,47 @@ from data_utils.data_preprocessing import prepare_data_kfold_multimodal
 # Directory holding all models, scalers, summaries
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
 os.makedirs(WEIGHT_DIR, exist_ok=True)
+
+def calculate_composite_weights_18_class(y_18_class_series: pd.Series, 
+                                           label_encoder_18_class: LabelEncoder, 
+                                           target_gesture_names: list):
+    """
+    为18分类模型计算自定义复合权重字典 {class_index: weight}。
+    """
+    # 1. 根据新的推导计算类别重要性
+    # BFRB类别的重要性: 0.5*(1/16) + 0.5*(1/9)
+    IMP_BFRB = 25 / 288
+    # 单个NON-BFRB类别的重要性: 0.5*(1/20) + 0.5*(1/90)
+    IMP_NON_BFRB_INDIVIDUAL = 11 / 360
+    
+    class_counts = y_18_class_series.value_counts()
+    
+    raw_weights = {}
+    for name in label_encoder_18_class.classes_:
+        count = class_counts.get(name, 1)  # 避免除以零
+        if name in target_gesture_names:
+            # 这是一个BFRB (target) 类别
+            raw_weights[name] = IMP_BFRB / count
+        else:
+            # 这是一个NON-BFRB (non-target) 类别
+            raw_weights[name] = IMP_NON_BFRB_INDIVIDUAL / count
+            
+    # 标准化权重 (使平均值为1)
+    total_raw_weight = sum(raw_weights.values())
+    num_classes = len(raw_weights)
+    avg_raw_weight = total_raw_weight / num_classes if num_classes > 0 else 1.0
+    avg_raw_weight = avg_raw_weight if avg_raw_weight > 1e-9 else 1.0
+    
+    normalized_weights = {name: w / avg_raw_weight for name, w in raw_weights.items()}
+    
+    # 创建最终的 class_weight 字典 {class_index: weight}
+    class_weight_dict = {
+        idx: normalized_weights.get(name, 1.0)
+        for idx, name in enumerate(label_encoder_18_class.classes_)
+    }
+    print(class_weight_dict)
+
+    return class_weight_dict
 
 # --- NEW: Competition Metric Configuration ---
 # Define BFRB vs Non-BFRB categories based on gesture names rather than indices
@@ -223,28 +266,39 @@ def setup_device(gpu_id=None):
 def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None):
     """
     Train for one epoch.
-    MODIFIED: Now also returns predictions and targets for metric calculation.
+    MODIFIED: Now handles sample weights for weighted loss calculation.
     """
     model.train() 
     total_loss = 0
     all_preds = []
     all_targets = []
     
-    for (imu_data, tof_data, static_data, thm_data), target in dataloader:
+    # MODIFIED: Unpack sample_weights and mask from the dataloader
+    for (imu_data, thm_data, tof_data, static_data, mask), target, sample_weights in dataloader:
         imu_data = imu_data.to(device)
         thm_data = thm_data.to(device)
         tof_data = tof_data.to(device)
         static_data = static_data.to(device)
+        mask = mask.to(device)
         target = target.to(device)
+        sample_weights = sample_weights.to(device)
         
-        optimizer.zero_grad() # reset gradients
-        output = model(imu_data, tof_data, static_data, thm_data) # forward pass
-        loss = criterion(output, target) # compute loss
-        loss.backward() #  compute new gradients for each parameter
-        optimizer.step() # update weights
+        optimizer.zero_grad()
+        
+        # Pass the mask to the model
+        output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
+        
+        # Manual weighted loss calculation
+        # The criterion must be initialized with reduction='none'
+        per_sample_loss = criterion(output, target)
+        weighted_loss = per_sample_loss * sample_weights
+        loss = weighted_loss.mean() # Get the mean of weighted losses
+        
+        loss.backward()
+        optimizer.step()
         
         if scheduler is not None:
-            scheduler.step() # update learning rate
+            scheduler.step()
         
         total_loss += loss.item()
         pred = output.argmax(dim=1)
@@ -260,31 +314,35 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     return avg_loss, accuracy, all_preds, all_targets
 
 
-def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_encoder):
+def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
     """
     Validate for one epoch and compute all relevant metrics.
-    
-    Returns:
-        avg_loss (float): Average validation loss.
-        accuracy (float): Validation accuracy.
-        comp_score (float): Competition metric score.
-        all_preds (list): All predictions for the epoch.
-        all_targets (list): All ground truth targets for the epoch.
+    MODIFIED: Uses its own standard CrossEntropyLoss for validation loss to avoid
+              being affected by weighted loss from training.
     """
     model.eval()
     total_loss = 0
     all_preds = []
     all_targets = []
     
+    # Instantiate its own criterion for unweighted loss calculation
+    val_criterion = nn.CrossEntropyLoss().to(device)
+    
     with torch.no_grad():
-        for (imu_data, tof_data, static_data, thm_data), target in dataloader:
+        # MODIFIED: Unpack the dummy weight value, but don't use it
+        for (imu_data, thm_data, tof_data, static_data, mask), target, _ in dataloader:
             imu_data = imu_data.to(device)
             thm_data = thm_data.to(device)
             tof_data = tof_data.to(device)
             static_data = static_data.to(device)
+            mask = mask.to(device) # Move mask to device
             target = target.to(device)
-            output = model(imu_data, tof_data, static_data, thm_data)
-            loss = criterion(output, target)
+            
+            # Pass the mask to the model
+            output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
+            
+            # Calculate loss using the local, unweighted criterion
+            loss = val_criterion(output, target)
             
             total_loss += loss.item()
             pred = output.argmax(dim=1)
@@ -337,7 +395,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         train_score = competition_metric(train_targets, train_preds, label_encoder)
         
         # Validate
-        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, criterion, device, label_encoder)
+        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder)
         
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -385,7 +443,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
 
-def train_kfold_models(epochs=50, patience=15, batch_size=32, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
+def train_kfold_models(epochs=50, start_lr=0.001, batch_size=32, patience=15, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -465,23 +523,38 @@ def train_kfold_models(epochs=50, patience=15, batch_size=32, start_lr=0.001, sh
         
         # Get fold data
         fold = fold_data[fold_idx]
+
+        # Create a pandas Series with gesture names for the weight function
+        y_train_series = pd.Series(label_encoder.inverse_transform(fold['y_train']))
+        
+        # The weight function returns a {class_index: weight} dictionary
+        class_weight_dict = calculate_composite_weights_18_class(
+            y_18_class_series=y_train_series,
+            label_encoder_18_class=label_encoder,
+            target_gesture_names=list(BFRB_GESTURES)
+        )
+        print("Sample weights calculated.")
         
         # Create multimodal datasets and dataloaders
+        # MODIFIED: Pass the class_weight_dict to the training dataset
         train_dataset = MultimodalDataset(
             fold['X_train_imu'],
             fold['X_train_thm'],
-            fold['X_train_tof'],
-            fold['X_train_static'],
-            fold['y_train']
+            fold['X_train_tof'], 
+            fold['X_train_static'], 
+            fold['y_train'],
+            mask=fold['train_mask'],  # Pass the training mask
+            class_weight_dict=class_weight_dict
         )
         val_dataset = MultimodalDataset(
             fold['X_val_imu'],
             fold['X_val_thm'],
-            fold['X_val_tof'],
-            fold['X_val_static'],
-            fold['y_val']
+            fold['X_val_tof'], 
+            fold['X_val_static'], 
+            fold['y_val'],
+            mask=fold['val_mask']    # Pass the validation mask
         )
-        
+
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         
@@ -491,15 +564,47 @@ def train_kfold_models(epochs=50, patience=15, batch_size=32, start_lr=0.001, sh
         
         # Configure loss function for this fold
         if loss_function == 'focal':
-            criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma)
-            print(f"  Using Focal Loss (gamma={focal_gamma}, alpha={focal_alpha})")
+            criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none')
+            print(f"  Using Focal Loss (gamma={focal_gamma}, alpha={focal_alpha}, reduction='none')")
         else:
-            criterion = nn.CrossEntropyLoss()
-            print(f"  Using Cross Entropy Loss")
+            criterion = nn.CrossEntropyLoss(reduction='none')
+            print(f"  Using Cross Entropy Loss (reduction='none')")
         
         model = model.to(device)
-        # 编译模型加速训练，需要torch2.x版本
-        # model = torch.compile(model)
+        
+        # Compile model for faster training
+        try:
+            # Configure torch.compile settings for better compatibility
+            torch._dynamo.config.suppress_errors = True
+            torch._dynamo.config.verbose = False  # Reduce verbose output
+            
+            # Try different compilation strategies (uncomment one that works best)
+            
+            # Strategy 1: reduce-overhead mode (matches inference)
+            model = torch.compile(model, mode="reduce-overhead")
+            
+            # Strategy 2: If reduce-overhead fails, try default mode
+            # model = torch.compile(model, mode="default")
+            
+            # Strategy 3: If both fail, try with specific backend
+            # model = torch.compile(model, mode="reduce-overhead", backend="aot_eager")
+            
+            # Strategy 4: Most conservative - only compile specific parts
+            # model = torch.compile(model, mode="default", disable=["flash_attention"])
+            
+            print("✅ Model compiled successfully for faster training")
+            
+        except Exception as e:
+            print(f"⚠️  torch.compile failed: {str(e)}")
+            print("   Falling back to eager mode (training will still work)")
+            # Optionally, you can try a more conservative compilation
+            try:
+                print("   Trying conservative compilation...")
+                model = torch.compile(model, mode="default", backend="aot_eager")
+                print("✅ Conservative compilation successful")
+            except:
+                print("   Conservative compilation also failed, using eager mode")
+        
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
         
@@ -521,7 +626,7 @@ def train_kfold_models(epochs=50, patience=15, batch_size=32, start_lr=0.001, sh
         
         # Evaluate model and capture predictions for OOF
         print(f"\nEvaluating fold {fold_idx + 1}...")
-        _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, nn.CrossEntropyLoss(), device, label_encoder)
+        _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder)
         
         # Store into OOF array using original indices
         oof_preds[fold['val_idx']] = all_preds_val
@@ -577,12 +682,6 @@ def train_kfold_models(epochs=50, patience=15, batch_size=32, start_lr=0.001, sh
     # Find best fold
     best_fold_idx = np.argmax(best_scores)
     print(f"\nBest performing fold: Fold {best_fold_idx + 1} (Score: {best_scores[best_fold_idx]:.4f})")
-    
-    # Copy best model as the main model
-    # best_model_filename = fold_results[best_fold_idx]['model_filename']
-    # dest_best = os.path.join(WEIGHT_DIR, f'best_model_{variant}.pth')
-    # shutil.copy(best_model_filename, dest_best)
-    # print(f"Best model copied to '{dest_best}'")
     
     # Save summary
     summary = {
@@ -641,6 +740,7 @@ def main():
     print(f"  Epochs: {epochs}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {start_lr}")
+    print(f"  Patience: {patience}")
     print(f"  Variant: {variant}")
     print(f"  Loss Function: {loss_function}")
     if loss_function == 'focal':

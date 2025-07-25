@@ -318,20 +318,21 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             thm_arr    = X_scaled_unpadded[:, thm_idx]
             imu_arr    = X_scaled_unpadded[:, imu_idx]
 
-            # 5. Padding
-            X_imu_pad = pad_sequences([imu_arr], max_length=SEQ_LEN)
-            X_thm_pad = pad_sequences([thm_arr], max_length=SEQ_LEN)
-            X_tof_pad = pad_sequences([tof_arr], max_length=SEQ_LEN)
-            X_static  = static_arr[0:1, :]
+            # 5. ✨ 分别对 IMU 和 THM 进行 Padding 并生成 mask
+            X_imu_pad, imu_mask = pad_sequences([imu_arr], max_length=SEQ_LEN)
+            X_thm_pad, thm_mask = pad_sequences([thm_arr], max_length=SEQ_LEN)
+            X_tof_pad, _                = pad_sequences([tof_arr], max_length=SEQ_LEN)
+            X_static                    = static_arr[0:1, :]  # 静态特征取第一行即可
 
             # 6. 转换为Tensor并预测
-            xb_imu   = torch.from_numpy(X_imu_pad.astype(np.float32)).to(DEVICE)
-            xb_thm   = torch.from_numpy(X_thm_pad.astype(np.float32)).to(DEVICE)
-            xb_tof  = torch.from_numpy(X_tof_pad.astype(np.float32)).to(DEVICE)
-            xb_static = torch.from_numpy(X_static.astype(np.float32)).to(DEVICE)
-            
+            xb_imu     = torch.from_numpy(X_imu_pad.astype(np.float32)).to(DEVICE)
+            xb_thm     = torch.from_numpy(X_thm_pad.astype(np.float32)).to(DEVICE)
+            xb_tof     = torch.from_numpy(X_tof_pad.astype(np.float32)).to(DEVICE)
+            xb_static  = torch.from_numpy(X_static.astype(np.float32)).to(DEVICE)
+            xb_mask    = torch.from_numpy(imu_mask.astype(np.float32)).to(DEVICE)
+
             # Forward pass through multimodal model
-            probs = torch.softmax(model(xb_imu, xb_tof, xb_static, xb_thm), dim=1).cpu().numpy()
+            probs = torch.softmax(model(xb_imu, xb_thm, xb_tof, xb_static, mask=xb_mask), dim=1).cpu().numpy()
             probs_sum += probs
 
         # Average the probabilities for the ensemble

@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import polars as pl
 from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
 from sklearn.model_selection import StratifiedGroupKFold
 import pickle
@@ -10,16 +11,16 @@ from sklearn.compose import ColumnTransformer
 from scipy.spatial.transform import Rotation as R
 import warnings
 
-# --- START: Advanced Feature Engineering (from your branch) ---
-
-def remove_gravity_from_acc(acc_data, rot_data):
+def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
-    Removes the gravity component from accelerometer data using quaternion rotations.
+    [Internal Helper] Polars-native version of remove_gravity_from_acc.
+    Accepts and returns a Polars DataFrame.
     """
-    acc_values = acc_data[['acc_x', 'acc_y', 'acc_z']].values if isinstance(acc_data, pd.DataFrame) else acc_data
-    quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values if isinstance(rot_data, pd.DataFrame) else rot_data
+    acc_values = group_df.select(['acc_x', 'acc_y', 'acc_z']).to_numpy()
+    quat_values = group_df.select(['rot_x', 'rot_y', 'rot_z', 'rot_w']).to_numpy()
+    
     linear_accel = np.zeros_like(acc_values)
-    gravity_world = np.array([0, 0, 9.81]) # Standard gravity vector
+    gravity_world = np.array([0, 0, 9.81])
     
     for i in range(acc_values.shape[0]):
         if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
@@ -30,144 +31,161 @@ def remove_gravity_from_acc(acc_data, rot_data):
             gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
             linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
         except (ValueError, IndexError):
-            # Fallback to raw acceleration if quaternion is invalid
             linear_accel[i, :] = acc_values[i, :]
             
-    return linear_accel
+    return pl.DataFrame({
+        'linear_acc_x': linear_accel[:, 0],
+        'linear_acc_y': linear_accel[:, 1],
+        'linear_acc_z': linear_accel[:, 2],
+    })
 
-def calculate_angular_velocity_from_quat(rot_data, time_delta=1/10):
+def _calculate_angular_velocity_from_quat_polars(group_df: pl.DataFrame, time_delta=1/10) -> pl.DataFrame:
     """
-    Calculates angular velocity from quaternion data.
-    NOTE: time_delta is set to 1/10 assuming 10Hz data.
+    [Internal Helper] Polars-native version of calculate_angular_velocity.
     """
-    quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values if isinstance(rot_data, pd.DataFrame) else rot_data
-    angular_vel = np.zeros((quat_values.shape[0], 3))
+    quat_values = group_df.select(['rot_x', 'rot_y', 'rot_z', 'rot_w']).to_numpy()
     
-    # Use diff to get rotation between consecutive timestamps
+    if len(quat_values) < 2:
+        return pl.DataFrame({
+            'angular_vel_x': np.zeros(len(quat_values)),
+            'angular_vel_y': np.zeros(len(quat_values)),
+            'angular_vel_z': np.zeros(len(quat_values)),
+        }, schema={'angular_vel_x': pl.Float64, 'angular_vel_y': pl.Float64, 'angular_vel_z': pl.Float64})
+
     q_t_plus_dt = R.from_quat(quat_values)
     q_t = R.from_quat(np.roll(quat_values, 1, axis=0))
-    
-    # First element has no previous, handle safely
-    q_t.as_quat()[0] = q_t_plus_dt.as_quat()[0] 
+    q_t.as_quat()[0] = q_t_plus_dt.as_quat()[0]
     
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore", UserWarning) # Suppress warnings about near-identity rotations
+        warnings.simplefilter("ignore", UserWarning)
         rot_delta = q_t.inv() * q_t_plus_dt
-    
+        
     angular_vel = rot_delta.as_rotvec() / time_delta
-    
-    # Set the first element's velocity to zero as it cannot be calculated
     angular_vel[0, :] = 0
     
-    return angular_vel
-
-def calculate_angular_distance(rot_data):
+    return pl.DataFrame({
+        'angular_vel_x': angular_vel[:, 0],
+        'angular_vel_y': angular_vel[:, 1],
+        'angular_vel_z': angular_vel[:, 2],
+    })
+    
+def _calculate_angular_distance_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
-    Calculates the angular distance between consecutive quaternion rotations.
+    [Internal Helper] Polars-native version of calculate_angular_distance.
     """
-    quat_values = rot_data[['rot_x', 'rot_y', 'rot_z', 'rot_w']].values if isinstance(rot_data, pd.DataFrame) else rot_data
-    angular_dist = np.zeros(quat_values.shape[0])
+    quat_values = group_df.select(['rot_x', 'rot_y', 'rot_z', 'rot_w']).to_numpy()
 
-    # A more efficient vectorized approach
+    if len(quat_values) < 2:
+        return pl.DataFrame({'angular_distance': np.zeros(len(quat_values))}, schema={'angular_distance': pl.Float64})
+        
     q2 = R.from_quat(quat_values)
     q1 = R.from_quat(np.roll(quat_values, 1, axis=0))
-    
-    # First element has no previous, handle safely
     q1.as_quat()[0] = q2.as_quat()[0]
     
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         dR = q1.inv() * q2
-    
+        
     angular_dist = np.linalg.norm(dR.as_rotvec(), axis=1)
-    
-    # Set the first element's distance to zero
     angular_dist[0] = 0
     
-    return angular_dist
+    return pl.DataFrame({'angular_distance': angular_dist})
 
-def feature_engineering(train_df: pd.DataFrame):
-    """
+
+def feature_engineering(train_df: pd.DataFrame): 
+    """ 
     Applies the full feature engineering pipeline.
-    MODIFIED: Includes a detailed logging step to inspect NaNs before the final fix.
-    """
-    print("\nApplying advanced feature engineering...")
-    
-    # Suppress potential SettingWithCopyWarning
-    pd.options.mode.chained_assignment = None
+    MODIFIED: Uses Polars internally with optimized helper functions for a massive speedup,
+    while keeping the public interface (input/output) unchanged (still pandas).
+    """ 
+    print("\nApplying advanced feature engineering (with Polars backend)...")
 
-    # --- Initial NaN handling for raw data ---
-    cols_to_process = [c for c in train_df.columns if c.startswith('acc_') or c.startswith('rot_')]
-    train_df[cols_to_process] = train_df.groupby('sequence_id')[cols_to_process].transform(
-        lambda x: x.interpolate(method='linear', limit_direction='both')
+    # --- 步骤 1: 从 Pandas 转换为 Polars ---
+    # 保存原始索引，以便最后恢复
+    original_index = train_df.index
+    pl_df = pl.from_pandas(train_df)
+
+    cols_to_process = [c for c in pl_df.columns if c.startswith('acc_') or c.startswith('rot_')]
+
+    # --- 步骤 2: 使用 Polars 表达式进行高性能计算 ---
+    # 初始 NaN 处理和四元数修正
+    pl_df = pl_df.with_columns(
+        pl.col(cols_to_process).interpolate().over('sequence_id').fill_null(0.0)
+    ).with_columns(
+        pl.when((pl.col('rot_x') == 0) & (pl.col('rot_y') == 0) & (pl.col('rot_z') == 0) & (pl.col('rot_w') == 0))
+          .then(1.0)
+          .otherwise(pl.col('rot_w'))
+          .alias('rot_w')
     )
-    train_df[cols_to_process] = train_df[cols_to_process].fillna(0.0)
-    rot_cols = ['rot_x', 'rot_y', 'rot_z', 'rot_w']
-    zero_norm_mask = (train_df[rot_cols] == 0).all(axis=1)
-    if zero_norm_mask.any():
-        train_df.loc[zero_norm_mask, 'rot_w'] = 1.0
-    
-    # --- Feature Calculation (this will create new NaNs from .diff()) ---
+
     print("Calculating engineered features...")
-    train_df['acc_mag'] = np.sqrt(train_df['acc_x']**2 + train_df['acc_y']**2 + train_df['acc_z']**2)
-    train_df['rot_angle'] = 2 * np.arccos(train_df['rot_w'].clip(-1, 1))
-    train_df['acc_mag_jerk'] = train_df.groupby('sequence_id')['acc_mag'].diff()
-    train_df['rot_angle_vel'] = train_df.groupby('sequence_id')['rot_angle'].diff()
-    
-    linear_accel_df = train_df.groupby('sequence_id').apply(
-        lambda df: pd.DataFrame(remove_gravity_from_acc(df[['acc_x', 'acc_y', 'acc_z']], df[rot_cols]), 
-                                columns=['linear_acc_x', 'linear_acc_y', 'linear_acc_z'], index=df.index), 
-        include_groups=False
-    ).droplevel(0)
-    train_df = train_df.join(linear_accel_df)
-
-    train_df['linear_acc_mag'] = np.sqrt(train_df['linear_acc_x']**2 + train_df['linear_acc_y']**2 + train_df['linear_acc_z']**2)
-    train_df['linear_acc_mag_jerk'] = train_df.groupby('sequence_id')['linear_acc_mag'].diff()
-
-    angular_velocity_df = train_df.groupby('sequence_id').apply(
-        lambda df: pd.DataFrame(calculate_angular_velocity_from_quat(df[rot_cols]), 
-                                columns=['angular_vel_x', 'angular_vel_y', 'angular_vel_z'], index=df.index), 
-        include_groups=False
-    ).droplevel(0)
-    train_df = train_df.join(angular_velocity_df)
-    
-    train_df[['angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z']] = train_df.groupby('sequence_id')[['angular_vel_x', 'angular_vel_y', 'angular_vel_z']].diff()
-    train_df[['angular_snap_x', 'angular_snap_y', 'angular_snap_z']] = train_df.groupby('sequence_id')[['angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z']].diff()
-
-    angular_distance_df = train_df.groupby('sequence_id').apply(
-        lambda df: pd.DataFrame(calculate_angular_distance(df[rot_cols]), 
-                                columns=['angular_distance'], index=df.index), 
-        include_groups=False
-    ).droplevel(0)
-    train_df = train_df.join(angular_distance_df)
-
-    # --- Define the final list of all features created ---
-    final_feature_cols = [
-        'acc_x', 'acc_y', 'acc_z', 'rot_w', 'rot_x', 'rot_y', 'rot_z', 
-        'acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel', 
-        'linear_acc_x', 'linear_acc_y', 'linear_acc_z', 
-        'linear_acc_mag', 'linear_acc_mag_jerk', 
-        'angular_vel_x', 'angular_vel_y', 'angular_vel_z', 
-        'angular_distance', 'angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z',
-        'angular_snap_x', 'angular_snap_y', 'angular_snap_z'
-    ]
-    tof_thm_cols = [c for c in train_df.columns if c.startswith('tof_') or c.startswith('thm_')]
-    final_feature_cols.extend(tof_thm_cols)
-    final_feature_cols = [c for c in final_feature_cols if c in train_df.columns]
-
-    # --- Final, comprehensive NaN cleanup ---
-    print(f"Cleaning up all NaNs generated during feature engineering...")
-    train_df[final_feature_cols] = train_df.groupby('sequence_id')[final_feature_cols].transform(
-        lambda x: x.interpolate(method='linear', limit_direction='both')
+    # 计算基础特征及其导数
+    pl_df = pl_df.with_columns(
+        (pl.col('acc_x')**2 + pl.col('acc_y')**2 + pl.col('acc_z')**2).sqrt().alias('acc_mag'),
+        (2 * pl.col('rot_w').clip(-1, 1).arccos()).alias('rot_angle'),
+    ).with_columns(
+        pl.col('acc_mag').diff().over('sequence_id').alias('acc_mag_jerk'),
+        pl.col('rot_angle').diff().over('sequence_id').alias('rot_angle_vel'),
     )
-    train_df[final_feature_cols] = train_df[final_feature_cols].fillna(0.0)
+
+    # --- 步骤 3: 使用 map_groups 高效调用新的 Polars 辅助函数 ---
+    
+    # 计算线性加速度
+    linear_accel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_remove_gravity_from_acc_polars)
+    pl_df = pl.concat([pl_df, linear_accel_results], how='horizontal')
+    
+    pl_df = pl_df.with_columns(
+        (pl.col('linear_acc_x')**2 + pl.col('linear_acc_y')**2 + pl.col('linear_acc_z')**2).sqrt().alias('linear_acc_mag')
+    ).with_columns(
+        pl.col('linear_acc_mag').diff().over('sequence_id').alias('linear_acc_mag_jerk')
+    )
+
+    # 计算角速度
+    angular_vel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_velocity_from_quat_polars)
+    pl_df = pl.concat([pl_df, angular_vel_results], how='horizontal')
+    
+    # 计算角速度的导数 (Jerk, Snap)
+    pl_df = pl_df.with_columns(
+        pl.col(['angular_vel_x', 'angular_vel_y', 'angular_vel_z']).diff().over('sequence_id').name.suffix('_jerk')
+    ).rename({
+        "angular_vel_x_jerk": "angular_jerk_x", "angular_vel_y_jerk": "angular_jerk_y", "angular_vel_z_jerk": "angular_jerk_z"
+    })
+    pl_df = pl_df.with_columns(
+        pl.col(['angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z']).diff().over('sequence_id').name.suffix('_snap')
+    ).rename({
+        "angular_jerk_x_snap": "angular_snap_x", "angular_jerk_y_snap": "angular_snap_y", "angular_jerk_z_snap": "angular_snap_z"
+    })
+
+    # 计算角距离
+    angular_dist_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_distance_polars)
+    pl_df = pl.concat([pl_df, angular_dist_results], how='horizontal')
+    
+    # --- 步骤 4: 定义最终特征列并进行最终清理 ---
+    final_feature_cols = [ 
+        'acc_x', 'acc_y', 'acc_z', 'rot_w', 'rot_x', 'rot_y', 'rot_z',  
+        'acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel',  
+        'linear_acc_x', 'linear_acc_y', 'linear_acc_z',  
+        'linear_acc_mag', 'linear_acc_mag_jerk',  
+        'angular_vel_x', 'angular_vel_y', 'angular_vel_z',  
+        'angular_distance', 'angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z', 
+        'angular_snap_x', 'angular_snap_y', 'angular_snap_z' 
+    ] 
+    tof_thm_cols = [c for c in pl_df.columns if c.startswith('tof_') or c.startswith('thm_')] 
+    final_feature_cols.extend(tof_thm_cols) 
+    final_feature_cols = [c for c in final_feature_cols if c in pl_df.columns] 
+
+    print("Cleaning up all NaNs generated during feature engineering...")
+    pl_df = pl_df.with_columns(
+        pl.col(final_feature_cols).interpolate().over('sequence_id').fill_null(0.0)
+    )
     
     print(f"Generated {len(final_feature_cols)} features after engineering.")
-    
-    # Restore pandas options
-    pd.options.mode.chained_assignment = 'warn'
-    
-    return train_df, final_feature_cols
+
+    # --- 步骤 5: 从 Polars 转换回 Pandas，恢复原始接口 ---
+    final_pandas_df = pl_df.to_pandas()
+    final_pandas_df.index = original_index # 恢复原始索引，确保DataFrame结构完全一致
+
+    return final_pandas_df, final_feature_cols
 
 # Static feature columns (shared between training and inference)
 STATIC_FEATURE_COLS = [
@@ -329,38 +347,44 @@ def load_and_preprocess_data(variant: str = "full"):
 
 def pad_sequences(sequences, max_length=None):
     """
-    Pad sequences to same length, keeping the END of each sequence (most critical part)
+    Pad sequences to same length and generate a corresponding attention mask.
     
     Strategy:
-    - Keep the LAST max_length timesteps of each sequence
-    - Pad with zeros at the BEGINNING if sequence is shorter
-    - Truncate from the BEGINNING if sequence is longer
-    
-    This preserves the end of gestures which contains the most discriminative information.
+    - Keep the LAST max_length timesteps of each sequence.
+    - Pad with zeros at the BEGINNING if sequence is shorter.
+    - Truncate from the BEGINNING if sequence is longer.
+    - Generate a mask where 1s indicate real data and 0s indicate padding.
     """
     if not sequences:
-        return np.array([])
+        return np.array([]), np.array([])
     if max_length is None:
         max_length = max(len(seq) for seq in sequences)
     
     print(f"Padding sequences to length: {max_length}")
-    print("Strategy: Keep END of sequences, pad zeros at BEGINNING")
+    print("Strategy: Keep END of sequences, pad zeros at BEGINNING, generate mask")
     
     num_features = sequences[0].shape[1]
     padded_sequences = np.zeros((len(sequences), max_length, num_features))
+    # ✨ 新增: 创建一个mask矩阵，初始全为0 (padding)
+    masks = np.zeros((len(sequences), max_length), dtype=np.float32) 
     
     for i, seq in enumerate(sequences):
         seq_length = len(seq)
         
         if seq_length >= max_length:
-            # Take the LAST max_length timesteps (truncate from beginning)
+            # 取最后 max_length 个时间步
             padded_sequences[i, :, :] = seq[-max_length:, :]
+            # mask全为1，因为没有padding
+            masks[i, :] = 1.0
         else:
-            # Pad with zeros at the BEGINNING, keep original sequence at the END
+            # 在序列前端补零
             start_idx = max_length - seq_length
             padded_sequences[i, start_idx:, :] = seq
-    
-    return padded_sequences
+            # 在mask的对应位置标记为1 (真实数据)
+            masks[i, start_idx:] = 1.0
+            
+    # ✨ 返回padding后的序列和对应的mask
+    return padded_sequences, masks
 
 class TofScaler(BaseEstimator, TransformerMixin):
     """
@@ -435,7 +459,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
         
     final_tof_cols = [c for c in tof_cols if c in X_train.columns]
     if final_tof_cols:
-        transformer_list.append(('tof_scaler', TofScaler(), final_tof_cols))
+        transformer_list.append(('minmax', MinMaxScaler(), final_tof_cols))
 
     scaler = ColumnTransformer(
         transformers=transformer_list,
@@ -478,7 +502,10 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
     thm_cols = [c for c in thm_cols if c in all_feature_cols]  # Only keep engineered features
     tof_cols = [c for c in tof_cols if c in all_feature_cols]
     
-    imu_cols = [c for c in all_feature_cols if c not in static_cols and c not in tof_cols and c not in thm_cols]
+    # Non-TOF feature union (IMU + THM).  This is what the new pipeline expects.
+    non_tof_cols = [c for c in all_feature_cols if c not in static_cols and c not in tof_cols]
+    # Keep IMU-only list too (currently unused) in case of future need.
+    imu_cols = [c for c in non_tof_cols if c not in thm_cols]
 
     # 3. Prepare stratified group k-fold
     labels_map_df    = all_data_df[["sequence_id", "gesture_encoded", "subject"]].drop_duplicates().reset_index(drop=True)
@@ -507,43 +534,63 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
         X_train_norm["sequence_id"] = train_df["sequence_id"]
         X_val_norm["sequence_id"]   = val_df["sequence_id"]
 
-        # 5. Split into modalities + pad to fixed seq_len
-        max_len = 100
+        # Create DataFrame aliases expected by the downstream (non-TOF) branch code
+        X_train_norm_df = X_train_norm
+        X_val_norm_df   = X_val_norm
 
-        def _split_pad(df_norm, sids):
-            static_list, imu_list, thm_list, tof_list = [], [], [], []
-            for sid in sids:
-                grp = df_norm[df_norm["sequence_id"] == sid]
-                static_list.append(grp[static_cols].iloc[0].values)
-                imu_list.append(grp[imu_cols].values)
-                thm_list.append(grp[thm_cols].values)
-                tof_list.append(grp[tof_cols].values)
-            X_static = np.array(static_list)
-            X_imu    = pad_sequences(imu_list, max_length=max_len)
-            X_thm    = pad_sequences(thm_list, max_length=max_len)
-            X_tof    = pad_sequences(tof_list, max_length=max_len)
-            return X_imu, X_thm, X_tof, X_static
+        # 5. ✨ 在标准化之后，分离多模态数据并进行 Padding
+        max_length = 100
+        
+        # 处理训练集
+        train_static_list, train_imu_list, train_thm_list, train_tof_list = [], [], [], []
+        for sid in train_sids:
+            group = X_train_norm_df.loc[X_train_norm_df['sequence_id'] == sid]
+            train_static_list.append(group[static_cols].iloc[0].values)
+            train_imu_list.append(group[imu_cols].values)
+            train_thm_list.append(group[thm_cols].values)
+            train_tof_list.append(group[tof_cols].values)
 
-        X_train_imu, X_train_thm, X_train_tof, X_train_static = _split_pad(X_train_norm, train_sids)
-        X_val_imu,   X_val_thm,   X_val_tof,   X_val_static   = _split_pad(X_val_norm,   val_sids)
+        X_train_static = np.array(train_static_list)
+        X_train_imu, train_imu_mask = pad_sequences(train_imu_list, max_length=max_length)
+        X_train_thm, train_thm_mask = pad_sequences(train_thm_list, max_length=max_length)
+        X_train_tof, train_tof_mask = pad_sequences(train_tof_list, max_length=max_length)
+        # Use IMU mask as the primary mask (all should be same since same sequence lengths)
+        train_mask = train_imu_mask
 
-        print(f"  Train samples: {len(train_sids)} | Val samples: {len(val_sids)}")
-        print(f"  IMU shape: {X_train_imu.shape}, THM shape: {X_train_thm.shape}, TOF shape: {X_train_tof.shape}")
+        # 处理验证集
+        val_static_list, val_imu_list, val_thm_list, val_tof_list = [], [], [], []
+        for sid in val_sids:
+            group = X_val_norm_df.loc[X_val_norm_df['sequence_id'] == sid]
+            val_static_list.append(group[static_cols].iloc[0].values)
+            val_imu_list.append(group[imu_cols].values)
+            val_thm_list.append(group[thm_cols].values)
+            val_tof_list.append(group[tof_cols].values)
 
+        X_val_static = np.array(val_static_list)
+        X_val_imu, val_imu_mask = pad_sequences(val_imu_list, max_length=max_length)
+        X_val_thm, val_thm_mask = pad_sequences(val_thm_list, max_length=max_length)
+        X_val_tof, val_tof_mask = pad_sequences(val_tof_list, max_length=max_length)
+        val_mask = val_imu_mask
+
+        print(f"Train shapes: IMU={X_train_imu.shape}, THM={X_train_thm.shape}, TOF={X_train_tof.shape}, Static={X_train_static.shape}")
+        print(f"Val shapes:   IMU={X_val_imu.shape}, THM={X_val_thm.shape}, TOF={X_val_tof.shape}, Static={X_val_static.shape}")
+
+        # 7. 存储该折的所有数据和 scaler
         fold_data.append({
-            "fold_idx": fold_idx,
-            "X_train_imu": X_train_imu,
-            "X_train_thm": X_train_thm,
-            "X_train_tof": X_train_tof,
-            "X_train_static": X_train_static,
-            "y_train": y_train,
-            "X_val_imu": X_val_imu,
-            "X_val_thm": X_val_thm,
-            "X_val_tof": X_val_tof,
-            "X_val_static": X_val_static,
-            "y_val": y_val,
-            "scaler": scaler_fold,
-            "val_idx": val_idx,
+            'X_train_imu': X_train_imu,
+            'X_train_thm': X_train_thm,
+            'X_train_tof': X_train_tof,
+            'X_train_static': X_train_static,
+            'y_train': y_train,
+            'train_mask': train_mask,
+            'X_val_imu': X_val_imu,
+            'X_val_thm': X_val_thm,
+            'X_val_tof': X_val_tof,
+            'X_val_static': X_val_static,
+            'y_val': y_val,
+            'val_mask': val_mask,
+            'scaler': scaler_fold,
+            'val_idx': val_idx,
         })
 
     print("\n✅ K-fold preparation done. Returning data …")
