@@ -34,6 +34,7 @@ class CNN1D(nn.Module):
             self.bn_layers.append(nn.BatchNorm1d(out_c))
             in_channels = out_c
         self.conv_layers = nn.ModuleList(layers)
+        self.activation = nn.ReLU()
 
         self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
         
@@ -62,7 +63,7 @@ class CNN1D(nn.Module):
             
             x = conv(x)
             x = self.bn_layers[i](x)
-            x = torch.relu(x)
+            x = self.activation(x)
             
             # ✨ 核心步骤 2: 在激活后，再次应用mask，消除卷积在padding区域产生的任何边缘效应
             x = x * mask.unsqueeze(1)

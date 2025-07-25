@@ -316,17 +316,20 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             non_tof_arr_unpadded = X_scaled_unpadded[:, non_tof_indices]
 
             # 5. ✨ Padding (在标准化和拆分之后)
-            X_non_tof_padded = pad_sequences([non_tof_arr_unpadded], max_length=SEQ_LEN)
-            X_tof_padded = pad_sequences([tof_arr_unpadded], max_length=SEQ_LEN)
+            X_non_tof_padded, mask = pad_sequences([non_tof_arr_unpadded], max_length=SEQ_LEN)
+            #    TOF序列的mask是相同的，所以我们可以忽略它的返回值
+            X_tof_padded, _ = pad_sequences([tof_arr_unpadded], max_length=SEQ_LEN)
             X_static = static_arr_unpadded[0:1, :] # 静态特征取第一行即可
 
             # 6. 转换为Tensor并预测
             xb_non_tof = torch.from_numpy(X_non_tof_padded.astype(np.float32)).to(DEVICE)
             xb_tof = torch.from_numpy(X_tof_padded.astype(np.float32)).to(DEVICE)
             xb_static = torch.from_numpy(X_static.astype(np.float32)).to(DEVICE)
+
+            xb_mask = torch.from_numpy(mask.astype(np.float32)).to(DEVICE)
             
-            # Forward pass through multimodal model
-            probs = torch.softmax(model(xb_non_tof, xb_tof, xb_static), dim=1).cpu().numpy()
+            # 将mask传递给模型
+            probs = torch.softmax(model(xb_non_tof, xb_tof, xb_static, mask=xb_mask), dim=1).cpu().numpy()
             probs_sum += probs
 
         # Average the probabilities for the ensemble
