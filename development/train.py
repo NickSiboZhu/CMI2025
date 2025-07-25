@@ -230,14 +230,15 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
     all_preds = []
     all_targets = []
     
-    for (non_tof_data, tof_data, static_data), target in dataloader:
-        non_tof_data = non_tof_data.to(device)
+    for (imu_data, tof_data, static_data, thm_data), target in dataloader:
+        imu_data = imu_data.to(device)
+        thm_data = thm_data.to(device)
         tof_data = tof_data.to(device)
         static_data = static_data.to(device)
         target = target.to(device)
         
         optimizer.zero_grad() # reset gradients
-        output = model(non_tof_data, tof_data, static_data) # forward pass
+        output = model(imu_data, tof_data, static_data, thm_data) # forward pass
         loss = criterion(output, target) # compute loss
         loss.backward() #  compute new gradients for each parameter
         optimizer.step() # update weights
@@ -276,12 +277,13 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_enco
     all_targets = []
     
     with torch.no_grad():
-        for (non_tof_data, tof_data, static_data), target in dataloader:
-            non_tof_data = non_tof_data.to(device)
+        for (imu_data, tof_data, static_data, thm_data), target in dataloader:
+            imu_data = imu_data.to(device)
+            thm_data = thm_data.to(device)
             tof_data = tof_data.to(device)
             static_data = static_data.to(device)
             target = target.to(device)
-            output = model(non_tof_data, tof_data, static_data)
+            output = model(imu_data, tof_data, static_data, thm_data)
             loss = criterion(output, target)
             
             total_loss += loss.item()
@@ -301,7 +303,7 @@ def validate_and_evaluate_epoch(model, dataloader, criterion, device, label_enco
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start_lr=0.001, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -323,7 +325,6 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start
     }
     
     best_val_score = 0
-    patience = 15
     patience_counter = 0
     
     print(f"Training on device: {device}")
@@ -384,7 +385,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, start
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
+def train_kfold_models(epochs=50, patience=15, batch_size=32, start_lr=0.001, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -401,18 +402,36 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
     oof_targets = y_all.copy()
     
     # Dynamically inject feature dimensions from actual data
-    sample_non_tof = fold_data[0]['X_train_non_tof']
+    sample_imu = fold_data[0]['X_train_imu']
+    sample_thm = fold_data[0]['X_train_thm']
+    sample_tof = fold_data[0]['X_train_tof']                                            
     sample_static = fold_data[0]['X_train_static']
-    
-    non_tof_channels = sample_non_tof.shape[2]
+
+    imu_channels  = sample_imu.shape[2]
+    thm_channels  = sample_thm.shape[2]
+    tof_channels  = sample_tof.shape[2]
     static_features = sample_static.shape[1]
-    
-    print(f"Auto-detected dimensions:")
-    print(f"  Non-TOF sequential channels: {non_tof_channels}")
+
+    print("Auto-detected dimensions:")
+    print(f"  IMU channels: {imu_channels}")
+    print(f"  THM channels: {thm_channels}")
+    print(f"  TOF channels: {tof_channels} (flattened: {tof_channels // 64} sensors × 64 pixels)")
     print(f"  Static features: {static_features}")
+
+    # Set IMU branch input channels (config structure defined in config file)
+    model_cfg['imu_branch_cfg']['input_channels'] = imu_channels
     
-    # Inject into model config
-    model_cfg['cnn_branch_cfg']['input_channels'] = non_tof_channels
+    # Set THM branch input channels (config structure defined in config file)
+    if 'thm_branch_cfg' in model_cfg:
+        model_cfg['thm_branch_cfg']['input_channels'] = thm_channels
+    
+    # Set TOF branch input channels (config structure defined in config file)
+    if 'tof_branch_cfg' in model_cfg:
+        # TOF data is flattened as (num_sensors * 64), so we need to calculate num_sensors
+        num_tof_sensors = tof_channels // 64  # 320 // 64 = 5 sensors
+        model_cfg['tof_branch_cfg']['input_channels'] = num_tof_sensors
+    
+    # Set static features for MLP branch
     model_cfg['mlp_branch_cfg']['input_features'] = static_features
     
     # Model parameters (same for all folds)
@@ -449,20 +468,22 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         # Create multimodal datasets and dataloaders
         train_dataset = MultimodalDataset(
-            fold['X_train_non_tof'], 
-            fold['X_train_tof'], 
-            fold['X_train_static'], 
+            fold['X_train_imu'],
+            fold['X_train_thm'],
+            fold['X_train_tof'],
+            fold['X_train_static'],
             fold['y_train']
         )
         val_dataset = MultimodalDataset(
-            fold['X_val_non_tof'], 
-            fold['X_val_tof'], 
-            fold['X_val_static'], 
+            fold['X_val_imu'],
+            fold['X_val_thm'],
+            fold['X_val_tof'],
+            fold['X_val_static'],
             fold['y_val']
         )
         
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -478,7 +499,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         
         model = model.to(device)
         # 编译模型加速训练，需要torch2.x版本
-        model = torch.compile(model)
+        # model = torch.compile(model)
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
         
@@ -490,6 +511,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
             val_loader=val_loader,
             label_encoder=label_encoder,
             epochs=epochs,
+            patience=patience,
             start_lr=start_lr,
             device=device,
             variant=variant,
@@ -515,6 +537,13 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         }
         torch.save(checkpoint, model_filename)
         print(f"Model saved as '{model_filename}'")
+
+        # ------------------ NEW: Save scaler for this fold ------------------
+        scaler_fold = fold['scaler']
+        scaler_filename = os.path.join(WEIGHT_DIR, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(scaler_filename, 'wb') as sf:
+            pickle.dump(scaler_fold, sf)
+        print(f"Scaler saved as '{scaler_filename}'")
         
         # Store results
         fold_results.append({
@@ -527,6 +556,12 @@ def train_kfold_models(epochs=50, start_lr=0.001, show_stratification=False, dev
         fold_histories.append(history)
         
         print(f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
+    
+    # ------------------ NEW: Save global label encoder ------------------
+    le_filename = os.path.join(WEIGHT_DIR, f'label_encoder_{variant}.pkl')
+    with open(le_filename, 'wb') as lf:
+        pickle.dump(label_encoder, lf)
+    print(f"Label encoder saved as '{le_filename}'")
     
     # Summary of all folds
     print(f"\n" + "="*60)
@@ -593,7 +628,9 @@ def main():
     
     # Extract parameters from config
     epochs = cfg.training.get('epochs', 50)
+    patience = cfg.training.get('patience', 15)
     start_lr = cfg.training.get('start_lr', 0.001)
+    batch_size = cfg.data.get('batch_size', 32)
     variant = cfg.data.get('variant', 'full')
     loss_function = 'focal' if cfg.training.get('loss', {}).get('type') == 'FocalLoss' else 'ce'
     focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
@@ -602,6 +639,7 @@ def main():
     
     print(f"\nTraining Configuration from {args.config}:")
     print(f"  Epochs: {epochs}")
+    print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {start_lr}")
     print(f"  Variant: {variant}")
     print(f"  Loss Function: {loss_function}")
@@ -616,6 +654,8 @@ def main():
     # Train models using config
     fold_models, fold_histories, fold_results = train_kfold_models(
         epochs=epochs,
+        patience=patience,
+        batch_size=batch_size,
         start_lr=start_lr,
         show_stratification=args.stratification,
         device=device,

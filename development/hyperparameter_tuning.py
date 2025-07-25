@@ -113,7 +113,7 @@ model = dict(
     type='MultimodalityModel',
     num_classes=18,
     
-    cnn_branch_cfg=dict(
+    imu_branch_cfg=dict(
         type='CNN1D',
         input_channels=data['seq_input_channels'],
         sequence_length=data['max_length'],
@@ -131,7 +131,7 @@ model = dict(
     
     tof_branch_cfg=dict(
         type='TemporalTOF2DCNN',
-        num_tof_sensors=5,
+        input_channels=5,  # Number of TOF sensors
         seq_len=data['max_length'],
         out_features={trial_config['tof_output']},
         conv_channels={architecture['tof_channels']},

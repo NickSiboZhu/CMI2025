@@ -18,8 +18,8 @@ model = dict(
     type='MultimodalityModel',
     num_classes=18,
 
-    # 1-D CNN branch (IMU / THM)
-    cnn_branch_cfg=dict(
+    # IMU branch (inertial measurement unit)
+    imu_branch_cfg=dict(
         type='CNN1D',
         input_channels=None,  # filled dynamically at runtime
         sequence_length=data['max_length'],
@@ -39,7 +39,7 @@ model = dict(
     # TOF 2-D CNN branch
     tof_branch_cfg=dict(
         type='TemporalTOF2DCNN',
-        num_tof_sensors=5,
+        input_channels=5,  # Number of TOF sensors
         seq_len=data['max_length'],
         out_features=192,         # bigger than cnn_output_size
         conv_channels=[32, 64, 128],

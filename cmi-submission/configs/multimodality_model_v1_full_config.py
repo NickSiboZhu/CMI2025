@@ -14,8 +14,8 @@ model = dict(
     type='MultimodalityModel',
     num_classes=18,
 
-    # CNN branch blueprint (can switch to LSTM etc. just by changing type)
-    cnn_branch_cfg=dict(
+    # IMU branch (inertial measurement unit)
+    imu_branch_cfg=dict(
         type='CNN1D',
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
@@ -35,7 +35,7 @@ model = dict(
     # -------- 2-D CNN (TOF grids) ------
     tof_branch_cfg=dict(
         type='TemporalTOF2DCNN',
-        num_tof_sensors=5,
+        input_channels=5,  # Number of TOF sensors
         seq_len=data['max_length'],
         out_features=128,
         conv_channels=[32, 64, 128],

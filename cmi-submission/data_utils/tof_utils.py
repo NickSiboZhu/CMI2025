@@ -8,14 +8,36 @@ import pandas as pd
 from scipy.interpolate import griddata
 from scipy.spatial import QhullError
 
-_TOF_SENSORS = [1, 2, 3, 4, 5]
+# Import sensor configuration defaults
+try:
+    from .data_preprocessing import DEFAULT_NUM_TOF_SENSORS, DEFAULT_TOF_PIXELS_PER_SENSOR
+except ImportError:
+    # Fallback if import fails
+    DEFAULT_NUM_TOF_SENSORS = 5
+    DEFAULT_TOF_PIXELS_PER_SENSOR = 64
 
 
-def get_tof_columns() -> dict:
-    """Return a mapping: sensor_id -> list of 64 column names (tof_X_v0 … v63)."""
+def get_tof_columns(df_columns=None) -> dict:
+    """
+    Return a mapping: sensor_id -> list of column names (tof_X_v0 … v63).
+    
+    If df_columns is provided, dynamically detect TOF configuration from actual data.
+    Otherwise, use default configuration.
+    """
+    if df_columns is not None:
+        # Dynamically detect from actual columns
+        from .data_preprocessing import get_sensor_config
+        config = get_sensor_config(df_columns)
+        sensor_ids = config['tof_sensor_ids']
+        pixels_per_sensor = config['tof_pixels_per_sensor']
+    else:
+        # Use defaults
+        sensor_ids = list(range(1, DEFAULT_NUM_TOF_SENSORS + 1))
+        pixels_per_sensor = DEFAULT_TOF_PIXELS_PER_SENSOR
+    
     mapping = {}
-    for sid in _TOF_SENSORS:
-        mapping[sid] = [f"tof_{sid}_v{i}" for i in range(64)]
+    for sid in sensor_ids:
+        mapping[sid] = [f"tof_{sid}_v{i}" for i in range(pixels_per_sensor)]
     return mapping
 
 def _interpolate_block(values: np.ndarray, replacement_value: int = 255) -> np.ndarray:
@@ -74,8 +96,8 @@ def interpolate_tof(df: pd.DataFrame, replacement_value: int = 255) -> pd.DataFr
     print("\nStarting robust ToF interpolation...")
     df_processed = df.copy()
     
-    # 假设 get_tof_columns() 存在且能正常工作
-    tof_mapping = get_tof_columns() 
+    # Dynamically detect TOF columns from the dataframe
+    tof_mapping = get_tof_columns(df.columns) 
     all_tof_cols = [col for sensor_cols in tof_mapping.values() for col in sensor_cols]
 
     # STAGE 1: Temporal Filling for large gaps (all-NaN blocks)

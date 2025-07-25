@@ -175,8 +175,68 @@ STATIC_FEATURE_COLS = [
     'shoulder_to_wrist_cm', 'elbow_to_wrist_cm'
 ]
 
-# TOF feature columns (5 sensors × 64 pixels each)
-TOF_FEATURE_COLS = [f"tof_{sensor}_v{pixel}" for sensor in range(1, 6) for pixel in range(64)]
+# Function to dynamically detect sensor configuration from data columns
+def get_sensor_config(df_columns):
+    """
+    Dynamically detect sensor configuration from dataframe columns.
+    
+    Returns:
+        dict: Configuration with num_thm_sensors, num_tof_sensors, tof_pixels_per_sensor
+    """
+    thm_sensors = set()
+    tof_sensors = set()
+    tof_pixels = set()
+    
+    for col in df_columns:
+        # Detect THM sensors (pattern: thm_X)
+        if col.startswith('thm_') and len(col.split('_')) == 2:
+            try:
+                sensor_id = int(col.split('_')[1])
+                thm_sensors.add(sensor_id)
+            except ValueError:
+                pass
+        
+        # Detect TOF sensors and pixels (pattern: tof_X_vY)
+        elif col.startswith('tof_') and '_v' in col:
+            parts = col.split('_')
+            if len(parts) == 3:
+                try:
+                    sensor_id = int(parts[1])
+                    pixel_id = int(parts[2][1:])  # Remove 'v' prefix
+                    tof_sensors.add(sensor_id)
+                    tof_pixels.add(pixel_id)
+                except ValueError:
+                    pass
+    
+    return {
+        'num_thm_sensors': len(thm_sensors),
+        'num_tof_sensors': len(tof_sensors),
+        'tof_pixels_per_sensor': len(tof_pixels),
+        'thm_sensor_ids': sorted(thm_sensors),
+        'tof_sensor_ids': sorted(tof_sensors)
+    }
+
+# Generate feature columns dynamically based on actual data
+def generate_feature_columns(df_columns):
+    """Generate THM and TOF feature column lists based on actual data columns."""
+    config = get_sensor_config(df_columns)
+    
+    # Generate THM columns based on detected sensors
+    thm_cols = []
+    for sensor_id in config['thm_sensor_ids']:
+        col = f"thm_{sensor_id}"
+        if col in df_columns:
+            thm_cols.append(col)
+    
+    # Generate TOF columns based on detected sensors and pixels
+    tof_cols = []
+    for sensor_id in config['tof_sensor_ids']:
+        for pixel in range(config['tof_pixels_per_sensor']):
+            col = f"tof_{sensor_id}_v{pixel}"
+            if col in df_columns:
+                tof_cols.append(col)
+    
+    return thm_cols, tof_cols
 
 # Helper to locate shared weights directory inside cmi-submission
 def _get_weights_dir():
@@ -401,109 +461,93 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     return X_train_normalized, X_val_normalized, scaler
 
 
-def prepare_data_kfold_multimodal(show_stratification=False,variant: str = "full", n_splits: int = 5):
+def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str="full", n_splits: int=5):
     """
-    为多模态模型准备 K-Fold 交叉验证数据。
-    遵循正确的数据处理流程: Split -> Normalize -> Pad。
+    Prepare K-Fold data for multimodal architecture *with THM separated by default*.
+    The pipeline: Split → Normalize → Pad, and returns numpy arrays ready for the
+    `MultimodalDataset` (IMU + THM + TOF + STATIC).
     """
-    # 1. 加载并进行特征工程，得到完整的DataFrame
+    # 1. Load and preprocess full data
     all_data_df, label_encoder, all_feature_cols = load_and_preprocess_data(variant)
-    
-    # 准备用于拆分和多模态分离的列
+
+    # 2. Identify columns for each modality dynamically
     static_cols = [c for c in STATIC_FEATURE_COLS if c in all_data_df.columns]
-    tof_cols = [c for c in all_feature_cols if c.startswith('tof_')]
-    non_tof_cols = [c for c in all_feature_cols if c not in tof_cols and c not in static_cols]
-
-    # 2. 创建用于分折的映射表
-    labels_map_df = all_data_df[['sequence_id', 'gesture_encoded', 'subject']].drop_duplicates().reset_index(drop=True)
-    y = labels_map_df['gesture_encoded'].values
-    subjects = labels_map_df['subject'].values
-    unique_sequence_ids = labels_map_df['sequence_id'].values
-
-    # 3. K-Fold 设置
-    print(f"\nPreparing {n_splits}-fold cross-validation splits for multimodal architecture...")
-    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    fold_data = []
     
-    for fold_idx, (train_seq_indices, val_seq_indices) in enumerate(sgkf.split(np.zeros(len(unique_sequence_ids)), y, groups=subjects)):
-        print(f"\n--- Fold {fold_idx + 1}/{n_splits} ---")
-        
-        train_sids = unique_sequence_ids[train_seq_indices]
-        val_sids = unique_sequence_ids[val_seq_indices]
+    # Dynamically detect THM and TOF columns from actual data
+    thm_cols, tof_cols = generate_feature_columns(all_data_df.columns)
+    thm_cols = [c for c in thm_cols if c in all_feature_cols]  # Only keep engineered features
+    tof_cols = [c for c in tof_cols if c in all_feature_cols]
+    
+    imu_cols = [c for c in all_feature_cols if c not in static_cols and c not in tof_cols and c not in thm_cols]
 
-        # 4. 根据拆分出的 sequence ID 创建该折的训练集和验证集 DataFrame
-        X_train_fold_df = all_data_df[all_data_df['sequence_id'].isin(train_sids)].copy()
-        X_val_fold_df = all_data_df[all_data_df['sequence_id'].isin(val_sids)].copy()
-        
-        y_train_fold = labels_map_df[labels_map_df['sequence_id'].isin(train_sids)]['gesture_encoded'].values
-        y_val_fold = labels_map_df[labels_map_df['sequence_id'].isin(val_sids)]['gesture_encoded'].values
+    # 3. Prepare stratified group k-fold
+    labels_map_df    = all_data_df[["sequence_id", "gesture_encoded", "subject"]].drop_duplicates().reset_index(drop=True)
+    y                = labels_map_df["gesture_encoded"].values
+    subjects         = labels_map_df["subject"].values
+    unique_seq_ids   = labels_map_df["sequence_id"].values
 
-        # 5. ✨ 在分折后、Padding前，对DataFrame进行标准化
-        X_train_norm_df, X_val_norm_df, scaler_fold = normalize_features(
-            X_train_fold_df[all_feature_cols], 
-            X_val_fold_df[all_feature_cols]
-        )
-        
-        X_train_norm_df['sequence_id'] = X_train_fold_df['sequence_id']
-        X_val_norm_df['sequence_id'] = X_val_fold_df['sequence_id']
+    sgkf        = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    fold_data   = []
 
-        # 6. ✨ 在标准化之后，分离多模态数据并进行 Padding
-        max_length = 100
-        
-        # 处理训练集
-        train_static_list, train_non_tof_list, train_tof_list = [], [], []
-        for sid in train_sids:
-            group = X_train_norm_df.loc[X_train_norm_df['sequence_id'] == sid]
-            train_static_list.append(group[static_cols].iloc[0].values)
-            train_non_tof_list.append(group[non_tof_cols].values)
-            train_tof_list.append(group[tof_cols].values)
+    print(f"\nPreparing {n_splits}-fold splits with THM branch separated …")
 
-        X_train_static = np.array(train_static_list)
-        X_train_non_tof = pad_sequences(train_non_tof_list, max_length=max_length)
-        X_train_tof = pad_sequences(train_tof_list, max_length=max_length)
+    for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(np.zeros(len(unique_seq_ids)), y, groups=subjects)):
+        print(f"\n--- Fold {fold_idx+1}/{n_splits} ---")
+        train_sids = unique_seq_ids[train_idx]
+        val_sids   = unique_seq_ids[val_idx]
 
-        # 处理验证集
-        val_static_list, val_non_tof_list, val_tof_list = [], [], []
-        for sid in val_sids:
-            group = X_val_norm_df.loc[X_val_norm_df['sequence_id'] == sid]
-            val_static_list.append(group[static_cols].iloc[0].values)
-            val_non_tof_list.append(group[non_tof_cols].values)
-            val_tof_list.append(group[tof_cols].values)
+        train_df = all_data_df[all_data_df["sequence_id"].isin(train_sids)].copy()
+        val_df   = all_data_df[all_data_df["sequence_id"].isin(val_sids)].copy()
 
-        X_val_static = np.array(val_static_list)
-        X_val_non_tof = pad_sequences(val_non_tof_list, max_length=max_length)
-        X_val_tof = pad_sequences(val_tof_list, max_length=max_length)
+        y_train = labels_map_df[labels_map_df["sequence_id"].isin(train_sids)]["gesture_encoded"].values
+        y_val   = labels_map_df[labels_map_df["sequence_id"].isin(val_sids)]["gesture_encoded"].values
 
-        print(f"Train shapes: Non-TOF={X_train_non_tof.shape}, TOF={X_train_tof.shape}, Static={X_train_static.shape}")
-        print(f"Val shapes:   Non-TOF={X_val_non_tof.shape}, TOF={X_val_tof.shape}, Static={X_val_static.shape}")
+        # 4. Normalization (ColumnTransformer) BEFORE padding
+        X_train_norm, X_val_norm, scaler_fold = normalize_features(train_df[all_feature_cols], val_df[all_feature_cols])
+        X_train_norm["sequence_id"] = train_df["sequence_id"]
+        X_val_norm["sequence_id"]   = val_df["sequence_id"]
 
-        # 7. 存储该折的所有数据和 scaler
+        # 5. Split into modalities + pad to fixed seq_len
+        max_len = 100
+
+        def _split_pad(df_norm, sids):
+            static_list, imu_list, thm_list, tof_list = [], [], [], []
+            for sid in sids:
+                grp = df_norm[df_norm["sequence_id"] == sid]
+                static_list.append(grp[static_cols].iloc[0].values)
+                imu_list.append(grp[imu_cols].values)
+                thm_list.append(grp[thm_cols].values)
+                tof_list.append(grp[tof_cols].values)
+            X_static = np.array(static_list)
+            X_imu    = pad_sequences(imu_list, max_length=max_len)
+            X_thm    = pad_sequences(thm_list, max_length=max_len)
+            X_tof    = pad_sequences(tof_list, max_length=max_len)
+            return X_imu, X_thm, X_tof, X_static
+
+        X_train_imu, X_train_thm, X_train_tof, X_train_static = _split_pad(X_train_norm, train_sids)
+        X_val_imu,   X_val_thm,   X_val_tof,   X_val_static   = _split_pad(X_val_norm,   val_sids)
+
+        print(f"  Train samples: {len(train_sids)} | Val samples: {len(val_sids)}")
+        print(f"  IMU shape: {X_train_imu.shape}, THM shape: {X_train_thm.shape}, TOF shape: {X_train_tof.shape}")
+
         fold_data.append({
-            'X_train_non_tof': X_train_non_tof,
-            'X_train_tof': X_train_tof,
-            'X_train_static': X_train_static,
-            'y_train': y_train_fold,
-            'X_val_non_tof': X_val_non_tof,
-            'X_val_tof': X_val_tof,
-            'X_val_static': X_val_static,
-            'y_val': y_val_fold,
-            'scaler': scaler_fold, # <--- 保存 ColumnTransformer scaler
-            'val_idx': val_seq_indices,
+            "fold_idx": fold_idx,
+            "X_train_imu": X_train_imu,
+            "X_train_thm": X_train_thm,
+            "X_train_tof": X_train_tof,
+            "X_train_static": X_train_static,
+            "y_train": y_train,
+            "X_val_imu": X_val_imu,
+            "X_val_thm": X_val_thm,
+            "X_val_tof": X_val_tof,
+            "X_val_static": X_val_static,
+            "y_val": y_val,
+            "scaler": scaler_fold,
+            "val_idx": val_idx,
         })
-        
-    # 保存 LabelEncoder 和每个 fold 的 scaler
-    weights_dir = _get_weights_dir()
-    le_path = os.path.join(weights_dir, f'label_encoder_{variant}.pkl')
-    with open(le_path, 'wb') as f:
-        pickle.dump(label_encoder, f)
-    
-    for i, fold in enumerate(fold_data):
-        scaler_path = os.path.join(weights_dir, f"scaler_fold_{i+1}_{variant}.pkl")
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(fold['scaler'], f)
-            
-    print(f"\n✅ Prepared {len(fold_data)} folds. Preprocessing objects saved to {weights_dir}")
-    return fold_data, label_encoder, y, unique_sequence_ids
+
+    print("\n✅ K-fold preparation done. Returning data …")
+    return fold_data, label_encoder, y, unique_seq_ids
 
 
 if __name__ == "__main__":

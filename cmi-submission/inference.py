@@ -304,29 +304,34 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 
             # 4. ✨ 拆分多模态数据 (在标准化之后)
             static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS]
-            tof_cols = [c for c in scaled_feature_names if c.startswith('tof_')]
-            non_tof_cols = [c for c in scaled_feature_names if c not in static_cols and not c.startswith('tof_')]
-            
-            static_indices = [list(scaled_feature_names).index(c) for c in static_cols]
-            tof_indices = [list(scaled_feature_names).index(c) for c in tof_cols]
-            non_tof_indices = [list(scaled_feature_names).index(c) for c in non_tof_cols]
-            
-            static_arr_unpadded = X_scaled_unpadded[:, static_indices]
-            tof_arr_unpadded = X_scaled_unpadded[:, tof_indices]
-            non_tof_arr_unpadded = X_scaled_unpadded[:, non_tof_indices]
+            tof_cols   = [c for c in scaled_feature_names if c.startswith('tof_')]
+            thm_cols   = [c for c in scaled_feature_names if c.startswith('thm_')]
+            imu_cols   = [c for c in scaled_feature_names if (c not in static_cols and not c.startswith('tof_') and not c.startswith('thm_'))]
 
-            # 5. ✨ Padding (在标准化和拆分之后)
-            X_non_tof_padded = pad_sequences([non_tof_arr_unpadded], max_length=SEQ_LEN)
-            X_tof_padded = pad_sequences([tof_arr_unpadded], max_length=SEQ_LEN)
-            X_static = static_arr_unpadded[0:1, :] # 静态特征取第一行即可
+            static_idx = [list(scaled_feature_names).index(c) for c in static_cols]
+            tof_idx    = [list(scaled_feature_names).index(c) for c in tof_cols]
+            thm_idx    = [list(scaled_feature_names).index(c) for c in thm_cols]
+            imu_idx    = [list(scaled_feature_names).index(c) for c in imu_cols]
+
+            static_arr = X_scaled_unpadded[:, static_idx]
+            tof_arr    = X_scaled_unpadded[:, tof_idx]
+            thm_arr    = X_scaled_unpadded[:, thm_idx]
+            imu_arr    = X_scaled_unpadded[:, imu_idx]
+
+            # 5. Padding
+            X_imu_pad = pad_sequences([imu_arr], max_length=SEQ_LEN)
+            X_thm_pad = pad_sequences([thm_arr], max_length=SEQ_LEN)
+            X_tof_pad = pad_sequences([tof_arr], max_length=SEQ_LEN)
+            X_static  = static_arr[0:1, :]
 
             # 6. 转换为Tensor并预测
-            xb_non_tof = torch.from_numpy(X_non_tof_padded.astype(np.float32)).to(DEVICE)
-            xb_tof = torch.from_numpy(X_tof_padded.astype(np.float32)).to(DEVICE)
+            xb_imu   = torch.from_numpy(X_imu_pad.astype(np.float32)).to(DEVICE)
+            xb_thm   = torch.from_numpy(X_thm_pad.astype(np.float32)).to(DEVICE)
+            xb_tof  = torch.from_numpy(X_tof_pad.astype(np.float32)).to(DEVICE)
             xb_static = torch.from_numpy(X_static.astype(np.float32)).to(DEVICE)
             
             # Forward pass through multimodal model
-            probs = torch.softmax(model(xb_non_tof, xb_tof, xb_static), dim=1).cpu().numpy()
+            probs = torch.softmax(model(xb_imu, xb_tof, xb_static, xb_thm), dim=1).cpu().numpy()
             probs_sum += probs
 
         # Average the probabilities for the ensemble

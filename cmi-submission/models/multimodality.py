@@ -9,15 +9,17 @@ from . import MODELS  # Import registry
 from utils.registry import build_from_cfg
 from . import fusion_head  # Import fusion head module
 
+
 @MODELS.register_module()
 class MultimodalityModel(nn.Module):
     """
     A multimodal fusion model for gesture recognition.
 
     This model combines:
-    1. A 1D CNN branch for processing sequential sensor data (IMU, THM, etc.)
-    2. A 2D CNN branch for processing TOF sensor grids (spatial depth information)
-    3. An MLP branch for processing static demographic data
+    1. A 1D CNN branch for processing IMU sequential sensor data
+    2. A 1D CNN branch for processing THM (thermopile) sequential data
+    3. A 2D CNN branch for processing TOF sensor grids (spatial depth information)
+    4. An MLP branch for processing static demographic data
     
     The features from all branches are fused and passed to a final classifier head.
     """
@@ -26,72 +28,84 @@ class MultimodalityModel(nn.Module):
                  num_classes: int = 18,
                  sequence_length: int = 100,
                  # --- branch configs ---
-                 cnn_branch_cfg: dict = None,
+                 imu_branch_cfg: dict = None,
                  mlp_branch_cfg: dict = None,
                  fusion_head_cfg: dict = None,
                  tof_branch_cfg: dict = None,
+                 thm_branch_cfg: dict = None,
                  # --- modality toggles ---
                  use_tof: bool = True,
+                 use_thm: bool = True,
                  ):
         """
         MultimodalityModel constructor. All configuration is provided via config dicts.
-        Each branch (CNN1D, MLP, TOF2D) has its own config dict for maximum flexibility.
+        Each branch (CNN1D for IMU, CNN1D for THM, MLP, TOF2D) has its own config dict for maximum flexibility.
         """
         super(MultimodalityModel, self).__init__()
 
         # Store modality flags
         self.use_tof = use_tof
+        self.use_thm = use_thm
 
         # ------------------------------------------------------------------
-        # 1. Build 1-D CNN branch
+        # 1. Build 1-D CNN branch for IMU
         # ------------------------------------------------------------------
-        if cnn_branch_cfg is None:
-            raise ValueError("cnn_branch_cfg is required")
-        
-        cnn_branch_cfg = cnn_branch_cfg.copy()
+        imu_branch_cfg = imu_branch_cfg.copy()
 
-        self.cnn_1d_branch = build_from_cfg(cnn_branch_cfg, MODELS)
-        self.cnn_1d_output_size = getattr(self.cnn_1d_branch, 'cnn_output_size', None)
-        if self.cnn_1d_output_size is None:
+        self.imu_branch = build_from_cfg(imu_branch_cfg, MODELS)
+        self.imu_output_size = getattr(self.imu_branch, 'cnn_output_size', None)
+        if self.imu_output_size is None:
             raise AttributeError("CNN1D model must have attribute 'cnn_output_size'")
 
         # ------------------------------------------------------------------
-        # 2. Build 2-D CNN branch for TOF (optional)
+        # 2. Build 1-D CNN branch for THM (thermopile) (optional)
+        # ------------------------------------------------------------------
+        if self.use_thm:
+            thm_branch_cfg = thm_branch_cfg.copy()
+
+            # Ensure required parameters are set
+            thm_branch_cfg.setdefault('type', 'CNN1D')
+            thm_branch_cfg.setdefault('sequence_length', sequence_length)
+
+            self.thm_branch = build_from_cfg(thm_branch_cfg, MODELS)
+            self.thm_output_size = getattr(
+                self.thm_branch,
+                'cnn_output_size',
+                thm_branch_cfg.get('output_dim', 64)
+            )
+        else:
+            # THM disabled
+            self.thm_branch = None
+            self.thm_output_size = 0
+
+        # ------------------------------------------------------------------
+        # 3. Build 2-D CNN branch for TOF (optional)
         # ------------------------------------------------------------------
         if self.use_tof:
-            if tof_branch_cfg is None:
-                # Legacy fallback: use minimal TOF config
-                tof_branch_cfg = dict(type='TemporalTOF2DCNN',
-                                      num_tof_sensors=5,
-                                      seq_len=sequence_length,
-                                      out_features=128)
-
             tof_branch_cfg = tof_branch_cfg.copy()
-            self.cnn_2d_branch = build_from_cfg(tof_branch_cfg, MODELS)
+
+            self.tof_branch = build_from_cfg(tof_branch_cfg, MODELS)
             # Infer output size
-            self.tof_2d_output_size = tof_branch_cfg.get('out_features', getattr(self.cnn_2d_branch, 'out_features', 128))
+            self.tof_2d_output_size = tof_branch_cfg.get('out_features', getattr(self.tof_branch, 'out_features', 128))
         else:
             # TOF disabled → no branch, zero additional features
-            self.cnn_2d_branch = None
+            self.tof_branch = None
             self.tof_2d_output_size = 0
 
         # ------------------------------------------------------------------
-        # 3. Build MLP branch
+        # 4. Build MLP branch
         # ------------------------------------------------------------------
-        if mlp_branch_cfg is None:
-            raise ValueError("mlp_branch_cfg is required")
-        
         mlp_branch_cfg = mlp_branch_cfg.copy()
-        mlp_branch_cfg.setdefault('output_dim', 32)
 
         # build branch
         self.mlp_branch = build_from_cfg(mlp_branch_cfg, MODELS)
         self.mlp_output_size = getattr(self.mlp_branch, 'output_dim', mlp_branch_cfg.get('output_dim', 32))
 
         # ------------------------------------------------------------------
-        # 4. Fusion head (configurable)
+        # 5. Fusion head (configurable)
         # ------------------------------------------------------------------
-        combined_feature_size = self.cnn_1d_output_size + self.tof_2d_output_size + self.mlp_output_size
+        combined_feature_size = (self.imu_output_size + self.thm_output_size + 
+                               self.tof_2d_output_size + self.mlp_output_size)
 
         # Ensure required parameters are set
         fusion_head_cfg = fusion_head_cfg.copy()
@@ -102,34 +116,39 @@ class MultimodalityModel(nn.Module):
         # Build fusion head via registry
         self.classifier_head = build_from_cfg(fusion_head_cfg, MODELS)
 
-    def forward(self, seq_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, seq_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor, 
+                thm_input: torch.Tensor) -> torch.Tensor:
         """
         Defines the forward pass logic of the multimodal fusion model.
         
         Args:
-            seq_input: Sequential sensor data (batch_size, seq_len, seq_features)
+            seq_input: IMU sequential sensor data (batch_size, seq_len, imu_features)
             tof_input: TOF sensor data (batch_size, seq_len, 320) - 5 sensors × 64 pixels
             static_input: Static demographic data (batch_size, static_features)
+            thm_input: THM sequential sensor data (batch_size, seq_len, thm_features)
         """
-        # 1. Process sequential data through the 1D CNN branch
-        cnn_1d_features = self.cnn_1d_branch(seq_input)
+        # 1. Process IMU data through the 1D CNN branch
+        imu_features = self.imu_branch(seq_input)
         
-        # 2. Process TOF data (only if enabled)
-        if self.use_tof:
-            cnn_2d_features = self.cnn_2d_branch(tof_input)
-        else:
-            cnn_2d_features = None
+        # 2. Process THM data through its dedicated 1D CNN branch
+        thm_features = self.thm_branch(thm_input) if self.use_thm else None
         
-        # 3. Process static data through the MLP branch
+        # 3. Process TOF data (only if enabled)
+        tof_features = self.tof_branch(tof_input) if self.use_tof else None
+        
+        # 4. Process static data through the MLP branch
         mlp_features = self.mlp_branch(static_input)
         
-        # 4. Concatenate the features from all branches
-        if cnn_2d_features is not None:
-            combined_features = torch.cat((cnn_1d_features, cnn_2d_features, mlp_features), dim=1)
-        else:
-            combined_features = torch.cat((cnn_1d_features, mlp_features), dim=1)
+        # 5. Concatenate the features from all branches
+        features_to_concat = [imu_features, mlp_features]
+        if thm_features is not None:
+            features_to_concat.insert(1, thm_features)
+        if tof_features is not None:
+            features_to_concat.append(tof_features)
+            
+        combined_features = torch.cat(features_to_concat, dim=1)
         
-        # 5. Pass the fused features through the final classifier head
+        # 6. Pass the fused features through the final classifier head
         output = self.classifier_head(combined_features)
         
         return output
@@ -142,15 +161,17 @@ class MultimodalityModel(nn.Module):
         model_size_mb = total_params * 4 / (1024**2)  # Assuming float32 parameters
         
         # Get info from individual branches
-        cnn_1d_info = self.cnn_1d_branch.get_model_info()
-        cnn_2d_info = self.cnn_2d_branch.get_model_info() if self.use_tof and self.cnn_2d_branch is not None else {'total_params': 0}
+        imu_info = self.imu_branch.get_model_info()
+        thm_info = self.thm_branch.get_model_info() if self.thm_branch is not None else {'total_params': 0}
+        tof_info = self.tof_branch.get_model_info() if self.tof_branch is not None else {'total_params': 0}
         mlp_info = self.mlp_branch.get_model_info()
         
         return {
             'total_params': total_params, 
             'model_size_mb': model_size_mb,
-            'cnn_1d_params': cnn_1d_info['total_params'],
-            'cnn_2d_params': cnn_2d_info['total_params'],
+            'imu_params': imu_info['total_params'],
+            'thm_params': thm_info['total_params'],
+            'tof_params': tof_info['total_params'],
             'mlp_params': mlp_info['total_params'],
-            'fusion_head_params': total_params - cnn_1d_info['total_params'] - cnn_2d_info['total_params'] - mlp_info['total_params']
+            'fusion_head_params': total_params - imu_info['total_params'] - thm_info['total_params'] - tof_info['total_params'] - mlp_info['total_params']
         } 

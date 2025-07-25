@@ -11,11 +11,11 @@ class TOF2DCNN(nn.Module):
     This module processes multiple TOF sensors and extracts spatial features.
     """
     
-    def __init__(self, num_tof_sensors=5, out_features=128, 
+    def __init__(self, input_channels=5, out_features=128, 
                  conv_channels=None, kernel_sizes=None):
         super(TOF2DCNN, self).__init__()
         
-        self.num_tof_sensors = num_tof_sensors
+        self.input_channels = input_channels
         self.out_features = out_features
         
         # Dynamic 2D conv stack
@@ -26,7 +26,7 @@ class TOF2DCNN(nn.Module):
         assert len(conv_channels) == len(kernel_sizes), "conv_channels and kernel_sizes length mismatch"
 
         layers = []
-        in_channels = num_tof_sensors
+        in_channels = input_channels  # Initialize with input_channels parameter
         for i, (out_c, k) in enumerate(zip(conv_channels, kernel_sizes)):
             layers.append(nn.Conv2d(in_channels, out_c, kernel_size=k, padding=k//2 if k > 2 else 0))
             layers.append(nn.BatchNorm2d(out_c))
@@ -84,34 +84,6 @@ class TOF2DCNN(nn.Module):
         }
 
 
-def reshape_tof_features(tof_features, num_sensors=5):
-    """
-    Reshape flattened TOF features back to 8x8 grids.
-    
-    Args:
-        tof_features: Tensor of shape (batch_size, seq_len, num_sensors * 64)
-                     or (batch_size, num_sensors * 64)
-        num_sensors: Number of TOF sensors (default 5)
-    
-    Returns:
-        Tensor of shape (batch_size, seq_len, num_sensors, 8, 8)
-        or (batch_size, num_sensors, 8, 8) for single timestep
-    """
-    if tof_features.dim() == 3:
-        # Sequential data: (batch_size, seq_len, num_sensors * 64)
-        batch_size, seq_len, _ = tof_features.shape
-        # Reshape to (batch_size, seq_len, num_sensors, 8, 8)
-        tof_grids = tof_features.view(batch_size, seq_len, num_sensors, 8, 8)
-    elif tof_features.dim() == 2:
-        # Single timestep: (batch_size, num_sensors * 64)
-        batch_size, _ = tof_features.shape
-        # Reshape to (batch_size, num_sensors, 8, 8)
-        tof_grids = tof_features.view(batch_size, num_sensors, 8, 8)
-    else:
-        raise ValueError(f"Unexpected input shape: {tof_features.shape}")
-    
-    return tof_grids
-
 
 @MODELS.register_module()
 class TemporalTOF2DCNN(nn.Module):
@@ -130,17 +102,17 @@ class TemporalTOF2DCNN(nn.Module):
         bidirectional (bool): Use bidirectional LSTM if True.
     """
 
-    def __init__(self, num_tof_sensors=5, seq_len=100, out_features=128,
+    def __init__(self, input_channels=5, seq_len=100, out_features=128,
                  conv_channels=None, kernel_sizes=None,
                  lstm_hidden=None, lstm_layers=1, bidirectional=False):
         super(TemporalTOF2DCNN, self).__init__()
 
-        self.num_tof_sensors = num_tof_sensors
+        self.input_channels = input_channels
         self.seq_len = seq_len
         self.out_features = out_features
 
         # ------------- Spatial CNN applied per-frame -------------
-        self.spatial_cnn = TOF2DCNN(num_tof_sensors, out_features,
+        self.spatial_cnn = TOF2DCNN(input_channels, out_features,
                                     conv_channels, kernel_sizes)
 
         # ------------- Temporal model (LSTM) ---------------------
@@ -174,12 +146,8 @@ class TemporalTOF2DCNN(nn.Module):
         """
         batch_size, seq_len, _ = tof_sequence.shape
         
-        # Reshape to grids: (batch_size, seq_len, num_sensors, 8, 8)
-        tof_grids = reshape_tof_features(tof_sequence, self.num_tof_sensors)
-        
-        # Process each timestep through 2D CNN
-        # Reshape to (batch_size * seq_len, num_sensors, 8, 8)
-        tof_grids_flat = tof_grids.view(batch_size * seq_len, self.num_tof_sensors, 8, 8)
+        # Directly reshape to (batch_size * seq_len, num_sensors, 8, 8) for 2D CNN processing
+        tof_grids_flat = tof_sequence.view(batch_size * seq_len, self.input_channels, 8, 8)
         
         # Apply 2D CNN to all timesteps
         spatial_features = self.spatial_cnn(tof_grids_flat)  # (batch_size * seq_len, out_features)
