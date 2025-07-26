@@ -20,7 +20,7 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[7, 5, 3]
+        kernel_sizes=[5, 5, 3]
     ),
 
     # THM branch (thermopile sensors)
