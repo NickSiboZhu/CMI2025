@@ -38,6 +38,7 @@ import os
 import pickle
 import pandas as pd
 import importlib.util, runpy
+from torch import amp  
 
 # --- Helper to load python config file ---
 
@@ -263,7 +264,7 @@ def setup_device(gpu_id=None):
     return device
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler=None):
     """
     Train for one epoch.
     MODIFIED: Now handles sample weights for weighted loss calculation.
@@ -284,18 +285,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
         sample_weights = sample_weights.to(device)
         
         optimizer.zero_grad()
+        # MODIFIED: Use AMP for mixed precision training
+        with amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+            output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
+            per_sample_loss = criterion(output, target)
+            weighted_loss = per_sample_loss * sample_weights
+            loss = weighted_loss.mean()
         
-        # Pass the mask to the model
-        output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
-        
-        # Manual weighted loss calculation
-        # The criterion must be initialized with reduction='none'
-        per_sample_loss = criterion(output, target)
-        weighted_loss = per_sample_loss * sample_weights
-        loss = weighted_loss.mean() # Get the mean of weighted losses
-        
-        loss.backward()
-        optimizer.step()
+        # loss.backward()
+        # optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
         if scheduler is not None:
             scheduler.step()
@@ -338,11 +339,10 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
             mask = mask.to(device) # Move mask to device
             target = target.to(device)
             
-            # Pass the mask to the model
-            output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
-            
-            # Calculate loss using the local, unweighted criterion
-            loss = val_criterion(output, target)
+            with amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+                output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
+                 # Calculate loss using the local, unweighted criterion
+                loss = val_criterion(output, target)
             
             total_loss += loss.item()
             pred = output.argmax(dim=1)
@@ -361,12 +361,15 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=1e-2)
-    
+    optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
+
+    scaler = amp.GradScaler(device=device.type, enabled=(device.type == 'cuda'))
+    print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
+
     # Setup cosine schedule with warmup (10% warmup steps)
     total_training_steps = epochs * len(train_loader)
     warmup_steps = int(0.1 * total_training_steps)
@@ -391,7 +394,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         start_time = time.time()
         
         # Train and get predictions for score calculation
-        train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scheduler)
+        train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scaler, scheduler)
         train_score = competition_metric(train_targets, train_preds, label_encoder)
         
         # Validate
@@ -443,7 +446,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, batch_size=32, patience=15, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
+def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -574,36 +577,10 @@ def train_kfold_models(epochs=50, start_lr=0.001, batch_size=32, patience=15, sh
         
         # Compile model for faster training
         try:
-            # Configure torch.compile settings for better compatibility
-            torch._dynamo.config.suppress_errors = True
-            torch._dynamo.config.verbose = False  # Reduce verbose output
-            
-            # Try different compilation strategies (uncomment one that works best)
-            
-            # Strategy 1: reduce-overhead mode (matches inference)
-            model = torch.compile(model, mode="reduce-overhead")
-            
-            # Strategy 2: If reduce-overhead fails, try default mode
-            # model = torch.compile(model, mode="default")
-            
-            # Strategy 3: If both fail, try with specific backend
-            # model = torch.compile(model, mode="reduce-overhead", backend="aot_eager")
-            
-            # Strategy 4: Most conservative - only compile specific parts
-            # model = torch.compile(model, mode="default", disable=["flash_attention"])
-            
-            print("✅ Model compiled successfully for faster training")
-            
+            model = torch.compile(model)
         except Exception as e:
             print(f"⚠️  torch.compile failed: {str(e)}")
-            print("   Falling back to eager mode (training will still work)")
-            # Optionally, you can try a more conservative compilation
-            try:
-                print("   Trying conservative compilation...")
-                model = torch.compile(model, mode="default", backend="aot_eager")
-                print("✅ Conservative compilation successful")
-            except:
-                print("   Conservative compilation also failed, using eager mode")
+            print("   Falling back not to use torch.compile.")
         
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
@@ -618,6 +595,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, batch_size=32, patience=15, sh
             epochs=epochs,
             patience=patience,
             start_lr=start_lr,
+            weight_decay=weight_decay,
             device=device,
             variant=variant,
             fold_tag=f'_{fold_idx+1}',
@@ -729,6 +707,7 @@ def main():
     epochs = cfg.training.get('epochs', 50)
     patience = cfg.training.get('patience', 15)
     start_lr = cfg.training.get('start_lr', 0.001)
+    weight_decay = cfg.training.get('weight_decay', 1e-2)
     batch_size = cfg.data.get('batch_size', 32)
     variant = cfg.data.get('variant', 'full')
     loss_function = 'focal' if cfg.training.get('loss', {}).get('type') == 'FocalLoss' else 'ce'
@@ -740,6 +719,7 @@ def main():
     print(f"  Epochs: {epochs}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {start_lr}")
+    print(f"  Weight Decay: {weight_decay}")
     print(f"  Patience: {patience}")
     print(f"  Variant: {variant}")
     print(f"  Loss Function: {loss_function}")
@@ -757,6 +737,7 @@ def main():
         patience=patience,
         batch_size=batch_size,
         start_lr=start_lr,
+        weight_decay=weight_decay,
         show_stratification=args.stratification,
         device=device,
         variant=variant,

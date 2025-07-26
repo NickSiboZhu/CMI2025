@@ -37,7 +37,7 @@ def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
         'linear_acc_x': linear_accel[:, 0],
         'linear_acc_y': linear_accel[:, 1],
         'linear_acc_z': linear_accel[:, 2],
-    })
+    }).cast(pl.Float32)
 
 def _calculate_angular_velocity_from_quat_polars(group_df: pl.DataFrame, time_delta=1/10) -> pl.DataFrame:
     """
@@ -50,7 +50,7 @@ def _calculate_angular_velocity_from_quat_polars(group_df: pl.DataFrame, time_de
             'angular_vel_x': np.zeros(len(quat_values)),
             'angular_vel_y': np.zeros(len(quat_values)),
             'angular_vel_z': np.zeros(len(quat_values)),
-        }, schema={'angular_vel_x': pl.Float64, 'angular_vel_y': pl.Float64, 'angular_vel_z': pl.Float64})
+        }, schema={'angular_vel_x': pl.Float32, 'angular_vel_y': pl.Float32, 'angular_vel_z': pl.Float32})
 
     q_t_plus_dt = R.from_quat(quat_values)
     q_t = R.from_quat(np.roll(quat_values, 1, axis=0))
@@ -67,7 +67,7 @@ def _calculate_angular_velocity_from_quat_polars(group_df: pl.DataFrame, time_de
         'angular_vel_x': angular_vel[:, 0],
         'angular_vel_y': angular_vel[:, 1],
         'angular_vel_z': angular_vel[:, 2],
-    })
+    }).cast(pl.Float32)
     
 def _calculate_angular_distance_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -89,7 +89,7 @@ def _calculate_angular_distance_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     angular_dist = np.linalg.norm(dR.as_rotvec(), axis=1)
     angular_dist[0] = 0
     
-    return pl.DataFrame({'angular_distance': angular_dist})
+    return pl.DataFrame({'angular_distance': angular_dist}).cast(pl.Float32)
 
 
 def feature_engineering(train_df: pd.DataFrame): 
@@ -348,15 +348,10 @@ def load_and_preprocess_data(variant: str = "full"):
 def pad_sequences(sequences, max_length=None):
     """
     Pad sequences to same length and generate a corresponding attention mask.
-    
-    Strategy:
-    - Keep the LAST max_length timesteps of each sequence.
-    - Pad with zeros at the BEGINNING if sequence is shorter.
-    - Truncate from the BEGINNING if sequence is longer.
-    - Generate a mask where 1s indicate real data and 0s indicate padding.
+    MODIFIED: Creates float32 arrays to save memory.
     """
     if not sequences:
-        return np.array([]), np.array([])
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32) # CHANGED
     if max_length is None:
         max_length = max(len(seq) for seq in sequences)
     
@@ -364,26 +359,23 @@ def pad_sequences(sequences, max_length=None):
     print("Strategy: Keep END of sequences, pad zeros at BEGINNING, generate mask")
     
     num_features = sequences[0].shape[1]
-    padded_sequences = np.zeros((len(sequences), max_length, num_features))
-    # ✨ 新增: 创建一个mask矩阵，初始全为0 (padding)
+    # CHANGED: Specify dtype=np.float32 for both arrays
+    padded_sequences = np.zeros((len(sequences), max_length, num_features), dtype=np.float32)
     masks = np.zeros((len(sequences), max_length), dtype=np.float32) 
     
     for i, seq in enumerate(sequences):
-        seq_length = len(seq)
+        # Ensure the sequence being placed is also float32
+        seq_as_float32 = np.asarray(seq, dtype=np.float32) # ADDED this line
+        seq_length = len(seq_as_float32)
         
         if seq_length >= max_length:
-            # 取最后 max_length 个时间步
-            padded_sequences[i, :, :] = seq[-max_length:, :]
-            # mask全为1，因为没有padding
+            padded_sequences[i, :, :] = seq_as_float32[-max_length:, :]
             masks[i, :] = 1.0
         else:
-            # 在序列前端补零
             start_idx = max_length - seq_length
-            padded_sequences[i, start_idx:, :] = seq
-            # 在mask的对应位置标记为1 (真实数据)
+            padded_sequences[i, start_idx:, :] = seq_as_float32
             masks[i, start_idx:] = 1.0
             
-    # ✨ 返回padding后的序列和对应的mask
     return padded_sequences, masks
 
 class TofScaler(BaseEstimator, TransformerMixin):
@@ -474,8 +466,8 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     scaler.fit(X_train)
 
     # 5. 使用已拟合的scaler转换训练集和验证集
-    X_train_transformed_np = scaler.transform(X_train)
-    X_val_transformed_np = scaler.transform(X_val)
+    X_train_transformed_np = scaler.transform(X_train).astype(np.float32)
+    X_val_transformed_np = scaler.transform(X_val).astype(np.float32)
 
     # 6. 获取新顺序的列名并重建DataFrame
     feature_names = scaler.get_feature_names_out()
@@ -550,7 +542,7 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
             train_thm_list.append(group[thm_cols].values)
             train_tof_list.append(group[tof_cols].values)
 
-        X_train_static = np.array(train_static_list)
+        X_train_static = np.array(train_static_list, dtype=np.float32)
         X_train_imu, train_imu_mask = pad_sequences(train_imu_list, max_length=max_length)
         X_train_thm, train_thm_mask = pad_sequences(train_thm_list, max_length=max_length)
         X_train_tof, train_tof_mask = pad_sequences(train_tof_list, max_length=max_length)
@@ -566,7 +558,7 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
             val_thm_list.append(group[thm_cols].values)
             val_tof_list.append(group[tof_cols].values)
 
-        X_val_static = np.array(val_static_list)
+        X_val_static = np.array(val_static_list, dtype=np.float32)
         X_val_imu, val_imu_mask = pad_sequences(val_imu_list, max_length=max_length)
         X_val_thm, val_thm_mask = pad_sequences(val_thm_list, max_length=max_length)
         X_val_tof, val_tof_mask = pad_sequences(val_tof_list, max_length=max_length)

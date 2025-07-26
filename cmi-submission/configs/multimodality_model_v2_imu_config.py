@@ -49,9 +49,7 @@ training = dict(
     epochs=100,
     patience=15,
     start_lr=1e-3,
-    optimizer=dict(type='AdamW', lr=0.001, weight_decay=1e-4),
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
-    scheduler=dict(type='CosineAnnealingWarmRestarts', warmup_ratio=0.1)
 )
 
 # -------------------------- Environment ------------------------------
