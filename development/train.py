@@ -26,6 +26,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch._dynamo
+
+# 加上这行，可以在支持的硬件上提升性能
+torch.set_float32_matmul_precision('high')
+
 import numpy as np
 from sklearn.metrics import classification_report, f1_score
 from sklearn.preprocessing import LabelEncoder
@@ -232,13 +236,17 @@ def setup_device(gpu_id=None):
         max_free = 0
         
         for i in range(torch.cuda.device_count()):
-            torch.cuda.set_device(i)
-            props = torch.cuda.get_device_properties(i)
-            allocated = torch.cuda.memory_allocated(i)
-            free = props.total_memory - allocated
-            
-            if free > max_free:
-                max_free = free
+            # Query global (system-wide) free memory on the GPU using cudaMemGetInfo
+            try:
+                free_mem, total_mem = torch.cuda.mem_get_info(i)
+            except AttributeError:
+                # Fallback for older PyTorch versions – use per-process reserved memory
+                torch.cuda.set_device(i)
+                total_mem = torch.cuda.get_device_properties(i).total_memory
+                free_mem = total_mem - torch.cuda.memory_reserved(i)
+
+            if free_mem > max_free:
+                max_free = free_mem
                 best_gpu = i
         
         selected_gpu = best_gpu
@@ -251,13 +259,20 @@ def setup_device(gpu_id=None):
     
     # Display memory info
     props = torch.cuda.get_device_properties(selected_gpu)
-    allocated = torch.cuda.memory_allocated(selected_gpu)
-    free = props.total_memory - allocated
-    
+
+    # Use global memory stats for the final report as well
+    try:
+        free, total_mem = torch.cuda.mem_get_info(selected_gpu)
+        used = total_mem - free
+    except AttributeError:
+        used = torch.cuda.memory_allocated(selected_gpu)
+        total_mem = props.total_memory
+        free = total_mem - used
+
     print(f"\n🎯 Using GPU {selected_gpu}: {torch.cuda.get_device_name(selected_gpu)}")
     print(f"GPU {selected_gpu} Memory:")
-    print(f"   Total: {props.total_memory // 1024**3} GB")
-    print(f"   Used: {allocated // 1024**2} MB")
+    print(f"   Total: {total_mem // 1024**3} GB")
+    print(f"   Used: {used // 1024**2} MB")
     print(f"   Free: {free // 1024**3} GB")
     
     return device
@@ -571,40 +586,6 @@ def train_kfold_models(epochs=50, start_lr=0.001, batch_size=32, patience=15, sh
             print(f"  Using Cross Entropy Loss (reduction='none')")
         
         model = model.to(device)
-        
-        # Compile model for faster training
-        try:
-            # Configure torch.compile settings for better compatibility
-            torch._dynamo.config.suppress_errors = True
-            torch._dynamo.config.verbose = False  # Reduce verbose output
-            
-            # Try different compilation strategies (uncomment one that works best)
-            
-            # Strategy 1: reduce-overhead mode (matches inference)
-            model = torch.compile(model, mode="reduce-overhead")
-            
-            # Strategy 2: If reduce-overhead fails, try default mode
-            # model = torch.compile(model, mode="default")
-            
-            # Strategy 3: If both fail, try with specific backend
-            # model = torch.compile(model, mode="reduce-overhead", backend="aot_eager")
-            
-            # Strategy 4: Most conservative - only compile specific parts
-            # model = torch.compile(model, mode="default", disable=["flash_attention"])
-            
-            print("✅ Model compiled successfully for faster training")
-            
-        except Exception as e:
-            print(f"⚠️  torch.compile failed: {str(e)}")
-            print("   Falling back to eager mode (training will still work)")
-            # Optionally, you can try a more conservative compilation
-            try:
-                print("   Trying conservative compilation...")
-                model = torch.compile(model, mode="default", backend="aot_eager")
-                print("✅ Conservative compilation successful")
-            except:
-                print("   Conservative compilation also failed, using eager mode")
-        
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
         

@@ -85,8 +85,10 @@ class MultimodalityModel(nn.Module):
             tof_branch_cfg = tof_branch_cfg.copy()
 
             self.tof_branch = build_from_cfg(tof_branch_cfg, MODELS)
-            # Infer output size
-            self.tof_2d_output_size = tof_branch_cfg.get('out_features', getattr(self.tof_branch, 'out_features', 128))
+            # Infer output size strictly from the instantiated branch first ― this captures
+            # dynamic situations (e.g., bidirectional LSTM doubling hidden size).
+            # Fall back to config only if the attribute is missing.
+            self.tof_2d_output_size = getattr(self.tof_branch, 'out_features', tof_branch_cfg.get('out_features', 128))
         else:
             # TOF disabled → no branch, zero additional features
             self.tof_branch = None
@@ -104,16 +106,26 @@ class MultimodalityModel(nn.Module):
         # ------------------------------------------------------------------
         # 5. Fusion head (configurable)
         # ------------------------------------------------------------------
+        # Dynamically calculate combined feature size from actual branch outputs
         combined_feature_size = (self.imu_output_size + self.thm_output_size + 
                                self.tof_2d_output_size + self.mlp_output_size)
 
         # Ensure required parameters are set
         fusion_head_cfg = fusion_head_cfg.copy()
         fusion_head_cfg.setdefault('type', 'FusionHead')
-        fusion_head_cfg.setdefault('input_dim', combined_feature_size)
-        fusion_head_cfg.setdefault('num_classes', num_classes)
+        fusion_head_cfg['num_classes'] = num_classes
+        fusion_head_cfg['input_dim'] = combined_feature_size  # FusionHead expects 'input_dim'
         
-        # Build fusion head via registry
+        # Print for visibility during model construction
+        print(f"\n[MultimodalityModel] Detected branch output dimensions:")
+        print(f"  IMU: {self.imu_output_size}")
+        if self.use_thm:
+            print(f"  THM: {self.thm_output_size}")
+        if self.use_tof:
+            print(f"  TOF: {self.tof_2d_output_size}")
+        print(f"  MLP: {self.mlp_output_size}")
+        print(f"  Total combined features: {combined_feature_size}")
+
         self.classifier_head = build_from_cfg(fusion_head_cfg, MODELS)
 
     def forward(self, imu_input: torch.Tensor, thm_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
