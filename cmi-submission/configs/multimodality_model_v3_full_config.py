@@ -6,7 +6,7 @@
 data = dict(
     variant='full',
     max_length=100,
-    batch_size=32,
+    batch_size=128,
 )
 
 # -------------------------- Model Architecture -----------------------
@@ -20,7 +20,7 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[7, 5, 3]
+        kernel_sizes=[5, 5, 3]
     ),
 
     # THM branch (thermopile sensors)
@@ -41,12 +41,10 @@ model = dict(
         conv_channels=[32, 64, 128],  # Stronger spatial feature extraction
         kernel_sizes=[3, 3, 2],       # Matching kernel sizes
         # Temporal encoder configuration
-        temporal_mode='transformer',  # Using transformer for temporal modeling
-        # Transformer parameters
-        num_heads=8,
-        num_layers=3,
-        ff_dim=512,
-        dropout=0.1
+        temporal_mode='lstm',  
+        lstm_hidden=128,
+        lstm_layers=1,
+        bidirectional=True,
     ),
 
     # MLP branch blueprint
@@ -75,6 +73,8 @@ training = dict(
     epochs=100,
     patience=15,
     start_lr=1e-3,
+    weight_decay=1e-2,
+    use_amp=False,  # Enable Automatic Mixed Precision
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 )
 

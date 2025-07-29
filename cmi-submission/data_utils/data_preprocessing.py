@@ -294,18 +294,30 @@ def load_and_preprocess_data(variant: str = "full"):
     print(f"Train data shape before FE: {train_df.shape}")
 
     if variant == "full":
-        print("\nFiltering out sequences with no valid ToF data...")
+        print("\nFiltering out sequences with no valid ToF or THM data...")
+        
+        # 找出所有以 'tof_' 或 'thm_' 开头的列
         tof_cols = [c for c in train_df.columns if c.startswith('tof_')]
-        if tof_cols:
-            sids_with_valid_tof = (
-                train_df.groupby('sequence_id')[tof_cols]
-                        .apply(lambda group_df: ((group_df != -1) & (group_df.notna())).any().any())
+        thm_cols = [c for c in train_df.columns if c.startswith('thm_')]
+        all_sensor_cols = tof_cols + thm_cols
+        
+        if all_sensor_cols:
+            # 对每个 sequence_id 分组，并应用“或”逻辑
+            # 只要所有传感列中存在任何一个有效值，就保留该序列
+            sids_with_valid_data = (
+                train_df.groupby('sequence_id')[all_sensor_cols]
+                        .apply(lambda group_df: group_df.notna().any().any())
             )
-            full_quality_sids = sids_with_valid_tof[sids_with_valid_tof].index
+            
+            # 获取筛选后结果为 True (即满足条件) 的 sequence_id
+            full_quality_sids = sids_with_valid_data[sids_with_valid_data].index
+            
             original_seq_count = train_df['sequence_id'].nunique()
+            # 使用筛选出的 sequence_id 过滤原始 DataFrame
             train_df = train_df[train_df['sequence_id'].isin(full_quality_sids)]
+            
             print(f"  {original_seq_count} total sequences found.")
-            print(f"  {len(full_quality_sids)} sequences have at least one valid ToF reading and will be used.")
+            print(f"  {len(full_quality_sids)} sequences have at least one valid ToF or THM reading and will be used.")
             print(f"  Filtered data shape: {train_df.shape}")
     
     # --- Label encoding ---
@@ -534,9 +546,15 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
         max_length = 100
         
         # 处理训练集
+        # 1. 一次性按 'sequence_id' 对 DataFrame 进行分组
+        grouped_train = X_train_norm_df.groupby('sequence_id')
+
         train_static_list, train_imu_list, train_thm_list, train_tof_list = [], [], [], []
+
+        # 2. 遍历 train_sids，并使用 .get_group() 快速提取数据
+        # .get_group() 是一个高效的哈希查找操作，速度非常快
         for sid in train_sids:
-            group = X_train_norm_df.loc[X_train_norm_df['sequence_id'] == sid]
+            group = grouped_train.get_group(sid)
             train_static_list.append(group[static_cols].iloc[0].values)
             train_imu_list.append(group[imu_cols].values)
             train_thm_list.append(group[thm_cols].values)

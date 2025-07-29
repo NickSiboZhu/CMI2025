@@ -279,7 +279,7 @@ def setup_device(gpu_id=None):
     return device
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, scheduler=None):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp=True, scheduler=None):
     """
     Train for one epoch.
     MODIFIED: Now handles sample weights for weighted loss calculation.
@@ -301,7 +301,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
         
         optimizer.zero_grad()
         # MODIFIED: Use AMP for mixed precision training
-        with amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+        with amp.autocast(device_type=device.type, enabled=use_amp):
             output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
             per_sample_loss = criterion(output, target)
             weighted_loss = per_sample_loss * sample_weights
@@ -330,7 +330,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, schedul
     return avg_loss, accuracy, all_preds, all_targets
 
 
-def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
+def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_amp=True):
     """
     Validate for one epoch and compute all relevant metrics.
     MODIFIED: Uses its own standard CrossEntropyLoss for validation loss to avoid
@@ -354,7 +354,7 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
             mask = mask.to(device) # Move mask to device
             target = target.to(device)
             
-            with amp.autocast(device_type=device.type, enabled=(device.type == 'cuda')):
+            with amp.autocast(device_type=device.type, enabled=use_amp):
                 output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
                  # Calculate loss using the local, unweighted criterion
                 loss = val_criterion(output, target)
@@ -376,13 +376,13 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder):
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', variant: str = 'full', fold_tag: str = '', criterion=None):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
 
-    scaler = amp.GradScaler(device=device.type, enabled=(device.type == 'cuda'))
+    scaler = amp.GradScaler(device=device.type, enabled=use_amp)
     print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
 
     # Setup cosine schedule with warmup (10% warmup steps)
@@ -409,12 +409,12 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         start_time = time.time()
         
         # Train and get predictions for score calculation
-        train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scaler, scheduler)
+        train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp, scheduler)
         train_score = competition_metric(train_targets, train_preds, label_encoder)
         
         # Validate
-        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder)
-        
+        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
+
         current_lr = optimizer.param_groups[0]['lr']
         
         # Save best model based on competition score
@@ -461,7 +461,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
+def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -573,8 +573,8 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             mask=fold['val_mask']    # Pass the validation mask
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,persistent_workers=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,persistent_workers=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -611,6 +611,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             patience=patience,
             start_lr=start_lr,
             weight_decay=weight_decay,
+            use_amp=use_amp,
             device=device,
             variant=variant,
             fold_tag=f'_{fold_idx+1}',
@@ -724,6 +725,7 @@ def main():
     start_lr = cfg.training.get('start_lr', 0.001)
     weight_decay = cfg.training.get('weight_decay', 1e-2)
     batch_size = cfg.data.get('batch_size', 32)
+    use_amp = cfg.training.get('use_amp', True)
     variant = cfg.data.get('variant', 'full')
     loss_function = 'focal' if cfg.training.get('loss', {}).get('type') == 'FocalLoss' else 'ce'
     focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
@@ -735,6 +737,7 @@ def main():
     print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {start_lr}")
     print(f"  Weight Decay: {weight_decay}")
+    print(f"  Use AMP: {use_amp}")
     print(f"  Patience: {patience}")
     print(f"  Variant: {variant}")
     print(f"  Loss Function: {loss_function}")
@@ -753,6 +756,7 @@ def main():
         batch_size=batch_size,
         start_lr=start_lr,
         weight_decay=weight_decay,
+        use_amp=use_amp,
         show_stratification=args.stratification,
         device=device,
         variant=variant,
