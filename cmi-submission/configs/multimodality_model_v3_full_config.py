@@ -46,8 +46,8 @@ model = dict(
     mlp_branch_cfg=dict(
         type='MLP',
         input_features=None,  # will be filled dynamically from data
-        hidden_dims=[64],
-        output_dim=32,
+        hidden_dims=[128, 64],
+        output_dim=64,
         dropout_rate=0.5
     ),
 
@@ -68,6 +68,7 @@ training = dict(
     epochs=100,
     patience=15,
     start_lr=1e-3,
+    weight_decay=1e-2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 )
 

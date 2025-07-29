@@ -49,7 +49,7 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 # 从zsb分支引入多模态模型
 from models.multimodality import MultimodalityModel 
 # 从你的分支(HEAD)引入核心预处理逻辑和常量
-from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS
+from data_utils.data_preprocessing import pad_sequences, feature_engineering, create_sequence_level_features, STATIC_FEATURE_COLS
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
@@ -227,12 +227,14 @@ def _decide_variant(seq_df: "pd.DataFrame") -> str:
 
 def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     """
-    通过应用完整的 ToF 和 IMU 特征工程流程来预处理单个序列，
-    确保它与训练过程完全匹配。
+    [修正版] 修复了最后返回的DataFrame被错误覆盖的问题。
     """
     seq_df = seq_pl.to_pandas()
     if not demog_pl.is_empty():
-        seq_df = seq_df.merge(demog_pl.to_pandas(), on="subject", how="left")
+        demog_pandas_df = demog_pl.to_pandas()
+        if 'subject_id' in demog_pandas_df.columns and 'subject' not in demog_pandas_df.columns:
+            demog_pandas_df = demog_pandas_df.rename(columns={'subject_id': 'subject'})
+        seq_df = seq_df.merge(demog_pandas_df, on="subject", how="left")
 
     variant = _decide_variant(seq_df)
     
@@ -243,37 +245,39 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     else:
         print(f"🧬 Preprocessing with variant: {variant}")
 
-    # 1. 首先，如果需要，处理所有 ToF 插值。
+    # 1. ToF 插值
     if variant != "imu":
         seq_df = interpolate_tof(seq_df)
 
-    # 2. 接下来，应用高级特征工程。
-    processed_df, feature_cols = feature_engineering(seq_df)
+    # 2. 生成时间点级别特征
+    processed_df, ts_feature_cols = feature_engineering(seq_df)
 
-    # --- ！！！关键修复：将静态特征列添加回总特征列表！！！ ---
-    # 找出数据中实际存在的静态列
-    existing_static_cols = [c for c in STATIC_FEATURE_COLS if c in processed_df.columns]
+    # 3. 生成序列级别聚合特征
+    agg_features_df = create_sequence_level_features(processed_df)
+
+    # 4. 合并所有特征，得到最终的完整DataFrame
+    merged_df = processed_df.merge(agg_features_df, on='sequence_id', how='left').fillna(0.0)
     
-    # 将它们添加到 feature_cols 列表中，并去重
-    for col in existing_static_cols:
-        if col not in feature_cols:
-            feature_cols.append(col)
-    # -----------------------------------------------------------------
-
-    # 3. 如果确定的变体是仅IMU，则再次确认过滤
+    # 5. 定义最终需要的所有特征列
+    all_feature_cols = ts_feature_cols + [c for c in agg_features_df.columns if c != 'sequence_id'] + STATIC_FEATURE_COLS
+    
     if variant == "imu":
-        imu_engineered_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
-        demographic_cols = [c for c in STATIC_FEATURE_COLS if c in processed_df.columns]
-        feature_cols = sorted(list(set(imu_engineered_cols + demographic_cols)))
+        # 如果是IMU模式，则过滤掉ToF/Thm特征
+        feature_cols = [c for c in all_feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
+    else:
+        feature_cols = all_feature_cols
 
-    # 4. 返回最终的特征DataFrame，它现在包含了所有scaler需要的列
-    #    并确保列的顺序与训练时一致（虽然ColumnTransformer不强求顺序，但这是个好习惯）
-    final_features_df = processed_df.sort_values("sequence_counter")
+    # 确保我们只保留实际存在的列
+    feature_cols = [c for c in feature_cols if c in merged_df.columns]
+
+    # ✨ 6. 核心修复：对合并后的 `merged_df` 进行排序和列选择
+    #    确保我们操作的是包含了所有特征的正确DataFrame
+    final_df_to_return = merged_df.sort_values("sequence_counter")
     
-    # 确保返回的DataFrame只包含feature_cols中的列，并按此顺序排列
-    final_features_df = final_features_df[[c for c in feature_cols if c in final_features_df.columns]]
+    # 返回一个只包含最终特征列，并且顺序正确的DataFrame
+    final_df_to_return = final_df_to_return[feature_cols]
 
-    return variant, final_features_df
+    return variant, final_df_to_return
 
 
 # ------------------ 预测逻辑 ------------------
@@ -303,7 +307,8 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             scaled_feature_names = scaler.get_feature_names_out()
 
             # 4. ✨ 拆分多模态数据 (在标准化之后)
-            static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS]
+            agg_freq_cols = [c for c in scaled_feature_names if c.startswith('agg_') or c.startswith('freq_')]
+            static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS] + agg_freq_cols
             tof_cols   = [c for c in scaled_feature_names if c.startswith('tof_')]
             thm_cols   = [c for c in scaled_feature_names if c.startswith('thm_')]
             imu_cols   = [c for c in scaled_feature_names if (c not in static_cols and not c.startswith('tof_') and not c.startswith('thm_'))]

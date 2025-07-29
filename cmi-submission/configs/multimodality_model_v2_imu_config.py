@@ -20,15 +20,15 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[5, 5, 3]
+        kernel_sizes=[7, 5, 3]
     ),
 
     # MLP branch blueprint (same as full)
     mlp_branch_cfg=dict(
         type='MLP',
         input_features=None,  # will be filled dynamically from data
-        hidden_dims=[64],           # simpler since less total data
-        output_dim=32,
+        hidden_dims=[128, 64], 
+        output_dim=64,
         dropout_rate=0.5
     ),
 
@@ -47,8 +47,9 @@ model = dict(
 # ----------------------- Training Strategy ---------------------------
 training = dict(
     epochs=100,
-    patience=15,
+    patience=20,
     start_lr=1e-3,
+    weight_decay=1e-2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 )
 

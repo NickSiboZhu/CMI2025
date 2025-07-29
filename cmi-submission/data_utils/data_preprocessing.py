@@ -9,7 +9,10 @@ from .tof_utils import interpolate_tof
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from scipy.spatial.transform import Rotation as R
+from scipy import fft
+from scipy.stats import entropy
 import warnings
+import time
 
 def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -143,6 +146,10 @@ def feature_engineering(train_df: pd.DataFrame):
     # 计算角速度
     angular_vel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_velocity_from_quat_polars)
     pl_df = pl.concat([pl_df, angular_vel_results], how='horizontal')
+
+    pl_df = pl_df.with_columns(
+        (pl.col('angular_vel_x')**2 + pl.col('angular_vel_y')**2 + pl.col('angular_vel_z')**2).sqrt().alias('angular_vel_mag')
+    )
     
     # 计算角速度的导数 (Jerk, Snap)
     pl_df = pl_df.with_columns(
@@ -186,6 +193,139 @@ def feature_engineering(train_df: pd.DataFrame):
     final_pandas_df.index = original_index # 恢复原始索引，确保DataFrame结构完全一致
 
     return final_pandas_df, final_feature_cols
+
+def _calculate_comprehensive_fft_features(signal: np.ndarray, fs: float = 10.0) -> dict:
+    """计算一套更丰富的频域特征。"""
+    N = len(signal)
+    
+    # 定义所有特征的键名后缀
+    feature_keys = [
+        'entropy', 'centroid', 'energy', 'dominant_freq', 'spread', 
+        'skew', 'kurtosis', 'energy_0_1Hz', 'energy_1_2Hz', 
+        'energy_2_3Hz', 'energy_3_4Hz', 'energy_4_5Hz'
+    ]
+    default_features = {key: 0.0 for key in feature_keys}
+
+    if N < 4: return default_features
+    
+    yf = fft.fft(signal)
+    power_spectrum = (np.abs(yf[0:N//2])**2) / N
+    xf = fft.fftfreq(N, fs)[:N//2]
+    total_energy = np.sum(power_spectrum)
+
+    if total_energy < 1e-9: return default_features
+        
+    prob_dist = power_spectrum / total_energy
+    
+    # 计算所有特征
+    features = {
+        'entropy': entropy(prob_dist, base=2),
+        'centroid': np.sum(xf * power_spectrum) / total_energy,
+        'energy': total_energy,
+        'dominant_freq': xf[np.argmax(power_spectrum)]
+    }
+    
+    spread = np.sqrt(np.sum(((xf - features['centroid'])**2) * power_spectrum) / total_energy)
+    features['spread'] = spread
+    
+    if spread > 1e-6:
+        features['skew'] = np.sum(((xf - features['centroid'])**3) * power_spectrum) / total_energy / (spread**3)
+        features['kurtosis'] = np.sum(((xf - features['centroid'])**4) * power_spectrum) / total_energy / (spread**4) - 3
+    else:
+        features['skew'], features['kurtosis'] = 0.0, 0.0
+        
+    bands = {'0_1Hz': (0, 1), '1_2Hz': (1, 2), '2_3Hz': (2, 3), '3_4Hz': (3, 4), '4_5Hz': (4, 5)}
+    for name, (low, high) in bands.items():
+        band_mask = (xf >= low) & (xf < high)
+        features[f'energy_{name}'] = np.sum(power_spectrum[band_mask])
+        
+    return features
+
+def create_sequence_level_features(df_with_ts_features: pd.DataFrame) -> pd.DataFrame:
+    """
+    创建序列级特征 DataFrame，包含高阶统计特征和频域特征。
+    """
+    print("Step 2: Creating DATA-DRIVEN sequence-level features (with UNIFIED naming)...")
+    pl_df_full = pl.from_pandas(df_with_ts_features)
+    
+    # --- 准备工作：分离出两个时间窗口的数据 ---
+    pl_df_last32 = pl_df_full.group_by('sequence_id', maintain_order=True).tail(32)
+
+    # --- 1. 高阶统计特征 (在last32上计算) ---
+    print("    - Aggregating higher-order statistics (IQR, Skew)...")
+    rot_cols = ['rot_x', 'rot_y', 'rot_z']
+    pl_df_last32 = pl_df_last32.with_columns(
+        [pl.col(c).diff().over('sequence_id').alias(f'{c}_diff') for c in rot_cols]
+    ).fill_null(0.0)
+
+    agg_exprs = []
+    # ✨ 旋转特征的IQR和Skew - 添加 'agg_' 前缀
+    for col in [f'{c}_diff' for c in rot_cols]:
+        agg_exprs.append((pl.col(col).quantile(0.75) - pl.col(col).quantile(0.25)).alias(f'agg_last32_{col}_iqr'))
+        agg_exprs.append(pl.col(col).skew().alias(f'agg_last32_{col}_skew'))
+    # ✨ 加速度特征的Skew和Kurtosis - 添加 'agg_' 前缀
+    for col in ['acc_x', 'acc_y', 'acc_z']:
+        agg_exprs.append(pl.col(col).skew().alias(f'agg_last32_{col}_skew'))
+        agg_exprs.append(pl.col(col).kurtosis().alias(f'agg_last32_{col}_kurtosis'))
+
+    agg_df = pl_df_last32.group_by('sequence_id', maintain_order=True).agg(agg_exprs)
+
+    # --- 2. 频域特征 (在 all 和 last32 上分别计算) ---
+    print("    - Aggregating frequency features on individual axes...")
+    
+    # ✨ 预定义频域特征的返回类型 (与之前版本一致)
+    fft_feature_keys = ['entropy', 'centroid', 'energy', 'dominant_freq', 'spread', 'skew', 'kurtosis', 'energy_0_1Hz', 'energy_1_2Hz', 'energy_2_3Hz', 'energy_3_4Hz', 'energy_4_5Hz']
+    fft_return_dtype = pl.Struct([pl.Field(key, pl.Float64) for key in fft_feature_keys])
+
+    fft_dfs = []
+    for window_name, window_df in [('all', pl_df_full), ('last32', pl_df_last32)]:
+        for axis in ['x', 'y', 'z']:
+            col_name = f'acc_{axis}'
+            fft_results_df = window_df.group_by('sequence_id', maintain_order=True).agg(
+                pl.col(col_name).implode()
+            ).select([
+                pl.col('sequence_id'),
+                pl.col(col_name).map_elements(
+                    lambda s: _calculate_comprehensive_fft_features(s.to_numpy()),
+                    return_dtype=fft_return_dtype
+                ).alias('fft_results')
+            ]).unnest('fft_results')
+
+            # 添加 'freq_' 前缀
+            new_feature_names = [c for c in fft_results_df.columns if c != 'sequence_id']
+            fft_df = fft_results_df.select([
+                pl.col('sequence_id'),
+                *[pl.col(c).alias(f'freq_{window_name}_{col_name}_{c}') for c in new_feature_names]
+            ])
+            fft_dfs.append(fft_df)
+
+    # --- 3. 合并所有特征 ---
+    final_agg_df = agg_df
+    for fft_df in fft_dfs:
+        final_agg_df = final_agg_df.join(fft_df, on='sequence_id', how='left')
+        
+    return final_agg_df.to_pandas().fillna(0.0)
+
+# def create_sequence_level_features(df_with_ts_features: pd.DataFrame) -> pd.DataFrame:
+#     """
+#     [对比实验专用版本]
+#     此函数返回一个“空”的聚合特征DataFrame。
+    
+#     它只包含 'sequence_id' 列，以确保后续的merge操作能够正常运行，
+#     但不会向模型中添加任何时域统计或频域特征。
+#     这允许我们建立一个没有这些聚合特征的基线模型。
+#     """
+#     print("Step 2: SKIPPING sequence-level feature creation (Control Experiment)...")
+    
+#     # 从输入的DataFrame中提取出所有唯一的sequence_id
+#     unique_sequence_ids = df_with_ts_features['sequence_id'].unique()
+    
+#     # 创建一个新的DataFrame，它只包含一列 'sequence_id'
+#     empty_agg_df = pd.DataFrame({
+#         'sequence_id': unique_sequence_ids
+#     })
+    
+#     return empty_agg_df
 
 # Static feature columns (shared between training and inference)
 STATIC_FEATURE_COLS = [
@@ -317,16 +457,17 @@ def load_and_preprocess_data(variant: str = "full"):
         train_df = interpolate_tof(train_df)
     
     # --- *** NEW: APPLY ADVANCED FEATURE ENGINEERING *** ---
-    train_df, feature_cols = feature_engineering(train_df)
-
-    #  将静态特征列添加回总特征列表
-    # 1. 找出数据中实际存在的静态列
-    existing_static_cols = [c for c in STATIC_FEATURE_COLS if c in train_df.columns]
+    train_df_with_ts_features, ts_feature_cols = feature_engineering(train_df)
     
-    # 2. 将它们添加到 feature_cols 列表中，并去重
-    for col in existing_static_cols:
-        if col not in feature_cols:
-            feature_cols.append(col)
+    # ✨ 步骤 3: 调用新增的函数生成序列级特征
+    agg_features_df = create_sequence_level_features(train_df_with_ts_features)
+
+    # ✨ 步骤 4: 将序列级特征合并回主表，创建统一的DataFrame
+    #    这会产生数据冗余，但完全遵循了您的原始数据流结构
+    train_df = train_df_with_ts_features.merge(agg_features_df, on='sequence_id', how='left')
+
+    feature_cols = ts_feature_cols + [c for c in agg_features_df.columns if c != 'sequence_id'] + STATIC_FEATURE_COLS
+    feature_cols = [c for c in feature_cols if c in train_df.columns]
     
     # --- Filter features based on variant if necessary ---
     if variant == "imu":
@@ -378,49 +519,6 @@ def pad_sequences(sequences, max_length=None):
             
     return padded_sequences, masks
 
-class TofScaler(BaseEstimator, TransformerMixin):
-    """
-    一个自定义的Scikit-learn转换器，用于处理ToF（Time-of-Flight）数据。
-    
-    它只对大于等于0的有效距离值进行Min-Max缩放，而忽略代表“无响应”的-1值。
-    """
-    def __init__(self, feature_range=(0, 1)):
-        self.feature_range = feature_range
-        self.scaler_ = None
-
-    def fit(self, X, y=None):
-        """
-        从输入数据X中学习缩放参数。
-        """
-        X_np = np.asarray(X)
-        values_to_fit = X_np[X_np != -1].reshape(-1, 1)
-        self.scaler_ = MinMaxScaler(feature_range=self.feature_range)
-        if len(values_to_fit) > 0:
-            self.scaler_.fit(values_to_fit)
-        return self
-
-    def transform(self, X):
-        """
-        使用学习到的参数转换数据X。
-        """
-        if self.scaler_ is None:
-            raise RuntimeError("This TofScaler instance is not fitted yet.")
-        
-        X_np = np.asarray(X)
-        X_transformed = X_np.copy().astype(float)
-        mask = (X_np != -1)
-        
-        if np.any(mask):
-            valid_data = X_np[mask].reshape(-1, 1)
-            X_transformed[mask] = self.scaler_.transform(valid_data).flatten()
-            
-        return X_transformed
-    
-    def get_feature_names_out(self, input_features=None):
-        if input_features is None:
-            raise ValueError("input_features is required for get_feature_names_out.")
-        return np.asarray(input_features, dtype=object)
-
 def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     """
     根据指定的接口，使用统一的预处理器对训练集和验证集进行标准化。
@@ -429,7 +527,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     - 返回标准化后的DataFrame以及一个单一、已拟合的scaler对象。
     """
     # 1. 识别需要Z-score标准化的特征
-    zscore_prefixes = ['acc_', 'rot_', 'thm_', 'linear_', 'angular_']
+    zscore_prefixes = ['acc_', 'rot_', 'thm_', 'linear_', 'angular_', 'agg_', 'freq_']
     zscore_cols = [col for col in X_train.columns if any(col.startswith(p) for p in zscore_prefixes)]
     
     demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm']
@@ -456,13 +554,13 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     scaler = ColumnTransformer(
         transformers=transformer_list,
         remainder='passthrough',
-        verbose_feature_names_out=False
+        verbose_feature_names_out=False,
     )
 
     # 4. 在训练数据上拟合scaler
     print(f"\nNormalizing features...")
     print(f"Applying Z-score to {len(final_zscore_cols)} columns.")
-    print(f"Applying custom ToF scale to {len(final_tof_cols)} columns.")
+    print(f"Applying minmax scale to {len(final_tof_cols)} columns.")
     scaler.fit(X_train)
 
     # 5. 使用已拟合的scaler转换训练集和验证集
@@ -473,7 +571,6 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     feature_names = scaler.get_feature_names_out()
     X_train_normalized = pd.DataFrame(X_train_transformed_np, index=X_train.index, columns=feature_names)
     X_val_normalized = pd.DataFrame(X_val_transformed_np, index=X_val.index, columns=feature_names)
-    
     return X_train_normalized, X_val_normalized, scaler
 
 
@@ -487,7 +584,8 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
     all_data_df, label_encoder, all_feature_cols = load_and_preprocess_data(variant)
 
     # 2. Identify columns for each modality dynamically
-    static_cols = [c for c in STATIC_FEATURE_COLS if c in all_data_df.columns]
+    agg_freq_cols = [c for c in all_feature_cols if c.startswith('agg_') or c.startswith('freq_')]
+    static_cols = STATIC_FEATURE_COLS + agg_freq_cols
     
     # Dynamically detect THM and TOF columns from actual data
     thm_cols, tof_cols = generate_feature_columns(all_data_df.columns)
@@ -534,9 +632,15 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
         max_length = 100
         
         # 处理训练集
+        # 1. 一次性按 'sequence_id' 对 DataFrame 进行分组
+        grouped_train = X_train_norm_df.groupby('sequence_id')
+
         train_static_list, train_imu_list, train_thm_list, train_tof_list = [], [], [], []
+
+        # 2. 遍历 train_sids，并使用 .get_group() 快速提取数据
+        # .get_group() 是一个高效的哈希查找操作，速度非常快
         for sid in train_sids:
-            group = X_train_norm_df.loc[X_train_norm_df['sequence_id'] == sid]
+            group = grouped_train.get_group(sid)
             train_static_list.append(group[static_cols].iloc[0].values)
             train_imu_list.append(group[imu_cols].values)
             train_thm_list.append(group[thm_cols].values)
