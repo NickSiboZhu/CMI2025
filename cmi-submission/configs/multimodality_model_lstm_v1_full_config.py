@@ -1,19 +1,18 @@
-# ===================================================================
-#   Configuration v3 – FULL Multimodal (IMU + THM + TOF + DEMO)
-# ===================================================================
+# Configuration for Multimodality Model with LSTM-based TOF processing
+# This variant uses LSTM for temporal modeling instead of Transformer
 
-# --------------------------- Data Settings ---------------------------
+# Data configuration
 data = dict(
-    variant='full',
+    num_classes=18,
     max_length=100,
-    batch_size=32,
 )
 
-# -------------------------- Model Architecture -----------------------
+# Model configuration
 model = dict(
     type='MultimodalityModel',
-    num_classes=18,
-
+    num_classes=data['num_classes'],
+    sequence_length=data['max_length'],
+    
     # IMU branch (inertial measurement unit)
     imu_branch_cfg=dict(
         type='CNN1D',
@@ -22,33 +21,33 @@ model = dict(
         filters=[64, 128, 256],
         kernel_sizes=[7, 5, 3]
     ),
-
+    
     # THM branch (thermopile sensors)
     thm_branch_cfg=dict(
         type='CNN1D',
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[32, 64, 128],           # different architecture for THM
-        kernel_sizes=[5, 5, 3]
+        kernel_sizes=[7, 5, 3]
     ),
-
-    # TOF 2D CNN branch config
+    
+    # TOF 2D CNN + LSTM branch config
     tof_branch_cfg=dict(
         type='TemporalTOF2DCNN',
-        input_channels=5,
-        seq_len=100,
-        out_features=128,  # Note: actual output = conv_channels[-1] = 128
-        conv_channels=[32, 64, 128],  # Stronger spatial feature extraction
-        kernel_sizes=[3, 3, 2],       # Matching kernel sizes
-        # Temporal encoder configuration
-        temporal_mode='transformer',  # Using transformer for temporal modeling
-        # Transformer parameters
-        num_heads=8,
-        num_layers=3,
-        ff_dim=512,
-        dropout=0.1
+        input_channels=5,  # 5 TOF sensors
+        seq_len=data['max_length'],
+        out_features=128,  # Note: ignored, actual output = lstm_hidden * 2 (if bidirectional) = 512
+        # Spatial CNN parameters
+        conv_channels=[32, 64, 128],
+        kernel_sizes=[3, 3, 2],
+        # Temporal encoder mode
+        temporal_mode='lstm',  # Using LSTM instead of transformer
+        # LSTM parameters
+        lstm_hidden=256,       # Hidden size for LSTM
+        lstm_layers=2,         # 2-layer LSTM
+        bidirectional=False,    # Bidirectional: output = 256*2 = 512
     ),
-
+    
     # MLP branch blueprint
     mlp_branch_cfg=dict(
         type='MLP',
@@ -57,17 +56,17 @@ model = dict(
         output_dim=32,
         dropout_rate=0.5
     ),
-
-    # Enable THM and TOF branch processing
-    use_thm=True,
-    use_tof=True,
-
+    
     # Fusion head blueprint
     fusion_head_cfg=dict(
         type='FusionHead',  # Use default LinearFusionHead
         hidden_dims=[256, 128],
         dropout_rates=[0.4, 0.3]
-    )
+    ),
+    
+    # Use all modalities
+    use_tof=True,
+    use_thm=True
 )
 
 # ----------------------- Training Strategy ---------------------------
@@ -75,7 +74,9 @@ training = dict(
     epochs=100,
     patience=15,
     start_lr=1e-3,
+    optimizer=dict(type='AdamW', lr=0.001, weight_decay=1e-4),
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
+    scheduler=dict(type='CosineAnnealingWarmRestarts', warmup_ratio=0.1)
 )
 
 # -------------------------- Environment ------------------------------

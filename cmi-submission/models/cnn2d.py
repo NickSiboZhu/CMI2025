@@ -4,6 +4,140 @@ import numpy as np
 from . import MODELS
 from torch.nn.utils.rnn import pack_padded_sequence
 
+
+class TemporalEncoder(nn.Module):
+    """
+    A unified temporal encoder that supports both LSTM and Transformer architectures.
+    
+    This module processes sequential features and outputs a fixed-size representation.
+    
+    Args:
+        mode (str): 'lstm' or 'transformer' - the temporal modeling approach
+        input_dim (int): Dimension of input features at each timestep
+        seq_len (int): Maximum sequence length
+        
+        # LSTM specific args:
+        lstm_hidden (int): Hidden size for LSTM
+        lstm_layers (int): Number of LSTM layers
+        bidirectional (bool): Whether to use bidirectional LSTM
+        
+        # Transformer specific args:
+        num_heads (int): Number of attention heads
+        num_layers (int): Number of transformer layers
+        ff_dim (int): Feedforward dimension in transformer
+        dropout (float): Dropout rate
+    """
+    
+    def __init__(self, mode='transformer', input_dim=128, seq_len=100,
+                 # LSTM args
+                 lstm_hidden=256, lstm_layers=2, bidirectional=True,
+                 # Transformer args  
+                 num_heads=8, num_layers=2, ff_dim=512, dropout=0.1):
+        super().__init__()
+        
+        self.mode = mode
+        self.input_dim = input_dim
+        self.seq_len = seq_len
+        
+        if mode == 'lstm':
+            self.bidirectional = bidirectional
+            self.lstm = nn.LSTM(
+                input_size=input_dim,
+                hidden_size=lstm_hidden,
+                num_layers=lstm_layers,
+                batch_first=True,
+                bidirectional=bidirectional,
+            )
+            self.output_dim = lstm_hidden * (2 if bidirectional else 1)
+            
+        elif mode == 'transformer':
+            # Learnable [CLS] token
+            self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim))
+            
+            # Positional encoding for seq_len + 1 (includes [CLS] token)
+            self.pos_encoding = nn.Parameter(torch.randn(1, seq_len + 1, input_dim))
+            
+            # Transformer encoder
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=input_dim,
+                nhead=num_heads,
+                dim_feedforward=ff_dim,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True  # Pre-LN for better stability
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+            self.output_dim = input_dim
+            
+        else:
+            raise ValueError(f"Unknown temporal encoder mode: {mode}")
+    
+    def forward(self, features, mask=None):
+        """
+        Process sequential features and return a fixed-size representation.
+        
+        Args:
+            features: (batch_size, seq_len, input_dim) 
+            mask: (batch_size, seq_len) - 1 for valid positions, 0 for padding
+            
+        Returns:
+            (batch_size, output_dim) - aggregated temporal representation
+        """
+        batch_size, seq_len, _ = features.shape
+        
+        if mask is None:
+            mask = torch.ones(batch_size, seq_len, device=features.device)
+            
+        if self.mode == 'lstm':
+            # LSTM processing with proper sequence packing
+            lengths = mask.sum(dim=1).to(torch.int64)
+            
+            # Align sequences (assuming padding at beginning)
+            aligned_features = torch.zeros_like(features)
+            for i in range(batch_size):
+                L = lengths[i]
+                if L > 0:
+                    aligned_features[i, :L] = features[i, -L:]
+            
+            # Pack sequences
+            packed_input = pack_padded_sequence(
+                aligned_features, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            
+            # LSTM forward
+            _, (h_n, _) = self.lstm(packed_input)
+            
+            # Extract final hidden state
+            if self.bidirectional:
+                output = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
+            else:
+                output = h_n[-1,:,:]
+                
+        elif self.mode == 'transformer':
+            # Transformer processing with [CLS] token
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+            transformer_input = torch.cat([cls_tokens, features], dim=1)
+            
+            # Add positional encoding
+            transformer_input = transformer_input + self.pos_encoding
+            
+            # Create attention mask
+            cls_mask = torch.ones(batch_size, 1, device=mask.device)
+            transformer_mask = torch.cat([cls_mask, mask], dim=1)
+            attention_mask = (transformer_mask == 0)
+            
+            # Apply transformer
+            transformer_output = self.transformer(
+                transformer_input, 
+                src_key_padding_mask=attention_mask
+            )
+            
+            # Extract [CLS] representation
+            output = transformer_output[:, 0]
+            
+        return output
+
+
 class TOF2DCNN(nn.Module):
     """
     2D CNN for processing Time-of-Flight (TOF) sensor grids.
@@ -17,7 +151,8 @@ class TOF2DCNN(nn.Module):
         super(TOF2DCNN, self).__init__()
         
         self.input_channels = input_channels
-        self.out_features = out_features
+        # Note: out_features parameter kept for compatibility, but actual output
+        # will be determined by the last conv channel
         
         # Dynamic 2D conv stack
         if conv_channels is None:
@@ -44,12 +179,17 @@ class TOF2DCNN(nn.Module):
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         
         # Final projection layer
-        self.projection = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(self.last_conv_channels, out_features),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
+        # COMMENTED OUT: Let the CNN features speak for themselves
+        # Linear projection can harm the spatial information extracted by convolutions
+        # self.projection = nn.Sequential(
+        #     nn.Flatten(),
+        #     nn.Linear(self.last_conv_channels, out_features),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.3)
+        # )
+        
+        # Store the actual output dimension
+        self.out_features = self.last_conv_channels  # Use last conv channel count as output
     
     def forward(self, tof_grids):
         """
@@ -60,16 +200,19 @@ class TOF2DCNN(nn.Module):
                       Each 8x8 grid represents one TOF sensor's depth map
         
         Returns:
-            Tensor of shape (batch_size, out_features)
+            Tensor of shape (batch_size, last_conv_channels)
         """
         # Process through 2D convolutions
-        x = self.conv_layers(tof_grids)  # (batch, 128, 1, 1) after conv layers
+        x = self.conv_layers(tof_grids)  # (batch, last_conv_channels, H, W)
         
-        # Global pooling (redundant here since we already have 1x1, but good practice)
-        x = self.global_pool(x)  # (batch, 128, 1, 1)
+        # Global pooling
+        x = self.global_pool(x)  # (batch, last_conv_channels, 1, 1)
         
-        # Project to final feature dimension
-        x = self.projection(x)  # (batch, out_features)
+        # Flatten to get feature vector
+        x = x.view(x.size(0), -1)  # (batch, last_conv_channels)
+        
+        # COMMENTED OUT: Direct CNN features without projection
+        # x = self.projection(x)  # (batch, out_features)
         
         return x
     
@@ -92,52 +235,85 @@ class TemporalTOF2DCNN(nn.Module):
     2-stage module for sequential TOF data.
 
     Stage 1: `TOF2DCNN` extracts spatial features for every timestep.
-    Stage 2: an optional **learnable** temporal model (default LSTM) replaces
-    the previous mean-pooling.  The LSTM's last hidden state is projected back
-    to `out_features`, so the branch interface towards the fusion head stays
-    unchanged.
+    Stage 2: Temporal encoder (LSTM or Transformer) for temporal modeling.
     
-    Args (new):
-        lstm_hidden (int|None): Hidden size of LSTM.  If None ⇒ `out_features`.
-        lstm_layers (int): Number of stacked LSTM layers.
-        bidirectional (bool): Use bidirectional LSTM if True.
+    Args:
+        temporal_mode (str): 'lstm' or 'transformer' - temporal modeling approach
+        
+        # Common temporal args:
+        input_channels (int): Number of TOF sensors
+        seq_len (int): Maximum sequence length
+        out_features (int): Desired output dimension (ignored, uses conv_channels[-1])
+        conv_channels (list): Channel sizes for spatial CNN
+        kernel_sizes (list): Kernel sizes for spatial CNN
+        
+        # LSTM specific (used when temporal_mode='lstm'):
+        lstm_hidden (int): Hidden size for LSTM
+        lstm_layers (int): Number of LSTM layers
+        bidirectional (bool): Whether to use bidirectional LSTM
+        
+        # Transformer specific (used when temporal_mode='transformer'):
+        num_heads (int): Number of attention heads
+        num_layers (int): Number of transformer encoder layers
+        ff_dim (int): Dimension of feedforward network
+        dropout (float): Dropout rate
     """
 
     def __init__(self, input_channels=5, seq_len=100, out_features=128,
                  conv_channels=None, kernel_sizes=None,
-                 lstm_hidden=None, lstm_layers=1, bidirectional=False):
+                 # Temporal encoder selection
+                 temporal_mode='transformer',
+                 # LSTM parameters
+                 lstm_hidden=256, lstm_layers=2, bidirectional=True,
+                 # Transformer parameters
+                 num_heads=8, num_layers=2, ff_dim=512, dropout=0.1):
         super(TemporalTOF2DCNN, self).__init__()
 
         self.input_channels = input_channels
         self.seq_len = seq_len
-        self.out_features = out_features
+        self.temporal_mode = temporal_mode
+        # Note: out_features parameter is kept for config compatibility,
+        # but actual output is determined by spatial CNN's last conv channel
+        self.out_features = conv_channels[-1] if conv_channels else 128
 
         # ------------- Spatial CNN applied per-frame -------------
         self.spatial_cnn = TOF2DCNN(input_channels, out_features,
                                     conv_channels, kernel_sizes)
-
-        # ------------- Temporal model (LSTM) ---------------------
-        lstm_hidden = lstm_hidden or out_features
-        self.bidirectional = bidirectional
-
-        self.lstm = nn.LSTM(
-            input_size=out_features,
-            hidden_size=lstm_hidden,
-            num_layers=lstm_layers,
-            batch_first=True,
+        
+        # Get the actual output dimension from spatial CNN
+        self.spatial_out_dim = self.spatial_cnn.out_features
+        
+        # ------------- Temporal Encoder ---------------------
+        self.temporal_encoder = TemporalEncoder(
+            mode=temporal_mode,
+            input_dim=self.spatial_out_dim,
+            seq_len=seq_len,
+            # LSTM params
+            lstm_hidden=lstm_hidden,
+            lstm_layers=lstm_layers,
             bidirectional=bidirectional,
+            # Transformer params
+            num_heads=num_heads,
+            num_layers=num_layers,
+            ff_dim=ff_dim,
+            dropout=dropout,
         )
-
-        proj_in_dim = lstm_hidden * (2 if bidirectional else 1)
-        self.projection = nn.Sequential(
-            nn.Linear(proj_in_dim, out_features),
-            nn.ReLU(),
-            nn.Dropout(0.3)
-        )
+        
+        # Update output features to match temporal encoder output
+        self.out_features = self.temporal_encoder.output_dim
+        
+        # Note: No projection layer - direct temporal encoder output is used
     
     def forward(self, tof_sequence, mask=None):
         """
-        Forward pass with BATCH-WISE alignment for sequences padded at the BEGINNING.
+        Forward pass with unified temporal encoder.
+        
+        Args:
+            tof_sequence: (batch_size, seq_len, features) - flattened TOF data
+            mask: (batch_size, seq_len) - 1 for valid positions, 0 for padding
+            
+        Returns:
+            (batch_size, output_dim) - temporal aggregation of spatial features
         """
         batch_size, seq_len, _ = tof_sequence.shape
 
@@ -146,52 +322,18 @@ class TemporalTOF2DCNN(nn.Module):
 
         # --- Spatial feature extraction ---
         # Reshape to (batch_size * seq_len, num_sensors, 8, 8) for 2D CNN processing
-        # `input_channels` here represents the number of TOF sensors.
         tof_grids_flat = tof_sequence.view(batch_size * seq_len, self.input_channels, 8, 8)
         
         # Apply 2D CNN to all timesteps
         spatial_features = self.spatial_cnn(tof_grids_flat)  # (batch_size * seq_len, out_features)
         
         # Reshape back to sequential format
-        spatial_features = spatial_features.view(batch_size, seq_len, self.out_features)  # (B, L, C)
+        spatial_features = spatial_features.view(batch_size, seq_len, self.spatial_out_dim)  # (B, L, C)
 
-        # --- Data alignment and temporal processing (Core change) ---
-
-        # 1. Calculate true lengths
-        lengths = mask.sum(dim=1).to(torch.int64)
-
-        # 2. Create a new empty tensor for aligned data
-        aligned_features = torch.zeros_like(spatial_features)
-
-        # 3. Align data for each sequence in the batch
-        # This loop is on the GPU and is more efficient than CPU-side processing.
-        for i in range(batch_size):
-            L = lengths[i]
-            if L > 0:
-                # Copy the true data from the end of the original sequence
-                # to the beginning of the new sequence.
-                aligned_features[i, :L] = spatial_features[i, -L:]
-
-        # 4. Pack the aligned data
-        # Move lengths to CPU as required by pack_padded_sequence
-        packed_input = pack_padded_sequence(
-            aligned_features, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )
-
-        # 5. Feed packed data into LSTM
-        _, (h_n, _) = self.lstm(packed_input)
-
-        # --- Feature projection ---
-        if self.bidirectional:
-            # Concatenate final forward and backward hidden states
-            temporal_features = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
-        else:
-            # Use the final hidden state of the last layer
-            temporal_features = h_n[-1,:,:]
-
-        output = self.projection(temporal_features)
-
-        return output
+        # --- Temporal feature aggregation ---
+        temporal_features = self.temporal_encoder(spatial_features, mask)  # (B, output_dim)
+        
+        return temporal_features
     
     def get_model_info(self):
         """Get model parameter information"""

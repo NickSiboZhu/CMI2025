@@ -40,9 +40,16 @@ model = dict(
         type='TemporalTOF2DCNN',
         input_channels=5,  # Number of TOF sensors
         seq_len=data['max_length'],
-        out_features=192,            # between 128 and 256 so TOF > CNN1D
+        out_features=192,            # Note: ignored, actual output = conv_channels[-1] = 128 
         conv_channels=[32, 64, 128],    # <-- user setting
-        kernel_sizes=[3, 3, 2]
+        kernel_sizes=[3, 3, 2],
+        # Temporal encoder configuration
+        temporal_mode='transformer',  # Using transformer for temporal modeling
+        # Transformer parameters for temporal modeling
+        num_heads=8,
+        num_layers=2,
+        ff_dim=768,  # Larger ff_dim for richer representations
+        dropout=0.1
     ),
 
     # MLP branch (demographics)
