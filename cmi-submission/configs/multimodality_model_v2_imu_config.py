@@ -48,9 +48,11 @@ model = dict(
 training = dict(
     epochs=100,
     patience=15,
-    start_lr=1e-3,
+    start_lr=4e-3,
     weight_decay=1e-2,
     use_amp=False,
+    mixup_enabled=False,
+    mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 )
 

@@ -279,17 +279,16 @@ def setup_device(gpu_id=None):
     return device
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp=True, scheduler=None):
+def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp=True, scheduler=None, mixup_enabled=False, mixup_alpha=0.4):
     """
     Train for one epoch.
-    MODIFIED: Now handles sample weights for weighted loss calculation.
+    MODIFIED: Added Mixup augmentation controlled by mixup_enabled and mixup_alpha.
     """
     model.train() 
     total_loss = 0
     all_preds = []
     all_targets = []
     
-    # MODIFIED: Unpack sample_weights and mask from the dataloader
     for (imu_data, thm_data, tof_data, static_data, mask), target, sample_weights in dataloader:
         imu_data = imu_data.to(device)
         thm_data = thm_data.to(device)
@@ -300,15 +299,41 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
         sample_weights = sample_weights.to(device)
         
         optimizer.zero_grad()
-        # MODIFIED: Use AMP for mixed precision training
+
         with amp.autocast(device_type=device.type, enabled=use_amp):
-            output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
-            per_sample_loss = criterion(output, target)
-            weighted_loss = per_sample_loss * sample_weights
-            loss = weighted_loss.mean()
+            # --- Mixup Logic ---
+            if mixup_enabled and mixup_alpha > 0.0:
+                # 1. Get mixup coefficient from Beta distribution
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                # 2. Get shuffled indices for mixing
+                rand_index = torch.randperm(imu_data.size(0)).to(device)
+
+                # 3. Mix inputs
+                imu_data = lam * imu_data + (1 - lam) * imu_data[rand_index, :]
+                thm_data = lam * thm_data + (1 - lam) * thm_data[rand_index, :]
+                tof_data = lam * tof_data + (1 - lam) * tof_data[rand_index, :]
+                static_data = lam * static_data + (1 - lam) * static_data[rand_index, :]
+                # Combine masks: if either original sample has data, the mixed one does too
+                mask = torch.max(mask, mask[rand_index, :])
+
+                # 4. Get targets and weights for mixed loss calculation
+                target_a, target_b = target, target[rand_index]
+                weights_a, weights_b = sample_weights, sample_weights[rand_index]
+
+                # 5. Forward pass with mixed data
+                output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
+                
+                # 6. Calculate mixed loss (weighted)
+                loss_a = criterion(output, target_a) * weights_a
+                loss_b = criterion(output, target_b) * weights_b
+                loss = (lam * loss_a + (1 - lam) * loss_b).mean()
+
+            else: # Original logic (no Mixup)
+                output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
+                per_sample_loss = criterion(output, target)
+                weighted_loss = per_sample_loss * sample_weights
+                loss = weighted_loss.mean()
         
-        # loss.backward()
-        # optimizer.step()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -319,6 +344,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
         total_loss += loss.item()
         pred = output.argmax(dim=1)
         
+        # For metrics, we compare against the original (un-mixed) targets
         all_preds.extend(pred.cpu().numpy())
         all_targets.extend(target.cpu().numpy())
     
@@ -328,7 +354,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
     accuracy = 100. * (all_preds == all_targets).sum() / len(all_targets)
     
     return avg_loss, accuracy, all_preds, all_targets
-
 
 def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_amp=True):
     """
@@ -376,7 +401,7 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -409,7 +434,11 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         start_time = time.time()
         
         # Train and get predictions for score calculation
-        train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp, scheduler)
+        # MODIFIED: Pass mixup parameters to train_epoch
+        train_loss, train_acc, train_preds, train_targets = train_epoch(
+            model, train_loader, criterion, optimizer, device, scaler, use_amp, scheduler,
+            mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha
+        )
         train_score = competition_metric(train_targets, train_preds, label_encoder)
         
         # Validate
@@ -461,7 +490,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None):
+def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -480,7 +509,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
     # Dynamically inject feature dimensions from actual data
     sample_imu = fold_data[0]['X_train_imu']
     sample_thm = fold_data[0]['X_train_thm']
-    sample_tof = fold_data[0]['X_train_tof']                                            
+    sample_tof = fold_data[0]['X_train_tof']                                     
     sample_static = fold_data[0]['X_train_static']
 
     imu_channels  = sample_imu.shape[2]
@@ -519,14 +548,17 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
 
     # Configure loss function and normalization
     print(f"\nTraining Configuration:")
+    # MODIFIED: Display Mixup status
+    if mixup_enabled:
+        print(f"  Data Augmentation: Mixup (alpha={mixup_alpha})")
     if loss_function == 'focal':
         print(f"  Loss Function: Focal Loss (gamma={focal_gamma}, alpha={focal_alpha})")
     else:
         print(f"  Loss Function: Cross Entropy Loss")
     print(f"  Normalization: LayerNorm (better for sequential sensor data)")
-    print(f"    - 1D CNN: LayerNorm for temporal features")
-    print(f"    - 2D CNN: BatchNorm for spatial features") 
-    print(f"    - Fusion Head: LayerNorm for combined features")
+    print(f"   - 1D CNN: LayerNorm for temporal features")
+    print(f"   - 2D CNN: BatchNorm for spatial features") 
+    print(f"   - Fusion Head: LayerNorm for combined features")
     
     # Store results for all folds
     fold_results = []
@@ -554,7 +586,6 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
         print("Sample weights calculated.")
         
         # Create multimodal datasets and dataloaders
-        # MODIFIED: Pass the class_weight_dict to the training dataset
         train_dataset = MultimodalDataset(
             fold['X_train_imu'],
             fold['X_train_thm'],
@@ -573,8 +604,8 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             mask=fold['val_mask']    # Pass the validation mask
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,persistent_workers=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,persistent_workers=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=6, pin_memory=True,persistent_workers=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=6, pin_memory=True,persistent_workers=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -616,6 +647,9 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             variant=variant,
             fold_tag=f'_{fold_idx+1}',
             criterion=criterion,
+            # MODIFIED: Pass mixup parameters down
+            mixup_enabled=mixup_enabled,
+            mixup_alpha=mixup_alpha
         )
         
         # Evaluate model and capture predictions for OOF
@@ -731,6 +765,9 @@ def main():
     focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
     focal_alpha = cfg.training.get('loss', {}).get('alpha', 1.0)
     gpu_id = cfg.environment.get('gpu_id')
+    mixup_enabled = cfg.training.get('mixup', True)
+    mixup_alpha = cfg.training.get('mixup_alpha', 0.4)
+
     
     print(f"\nTraining Configuration from {args.config}:")
     print(f"  Epochs: {epochs}")
@@ -740,6 +777,9 @@ def main():
     print(f"  Use AMP: {use_amp}")
     print(f"  Patience: {patience}")
     print(f"  Variant: {variant}")
+    print(f"  Mixup Enabled: {mixup_enabled}")
+    if mixup_enabled:
+        print(f"  Mixup Alpha: {mixup_alpha}")
     print(f"  Loss Function: {loss_function}")
     if loss_function == 'focal':
         print(f"  Focal Gamma: {focal_gamma}")
@@ -764,6 +804,8 @@ def main():
         focal_gamma=focal_gamma,
         focal_alpha=focal_alpha,
         model_cfg=cfg.model,
+        mixup_enabled=mixup_enabled,
+        mixup_alpha=mixup_alpha
     )
     
     print("✅ Config-driven training completed!")
