@@ -296,26 +296,25 @@ def load_and_preprocess_data(variant: str = "full"):
     if variant == "full":
         print("\nFiltering out sequences with no valid ToF or THM data...")
         
-        # 找出所有以 'tof_' 或 'thm_' 开头的列
+        # 找出所有以 'tof_' 或 'thm_' 开头的列 (这部分逻辑不变)
         tof_cols = [c for c in train_df.columns if c.startswith('tof_')]
         thm_cols = [c for c in train_df.columns if c.startswith('thm_')]
         all_sensor_cols = tof_cols + thm_cols
         
         if all_sensor_cols:
-            # 对每个 sequence_id 分组，并应用“或”逻辑
-            # 只要所有传感列中存在任何一个有效值，就保留该序列
-            sids_with_valid_data = (
-                train_df.groupby('sequence_id')[all_sensor_cols]
-                        .apply(lambda group_df: group_df.notna().any().any())
-            )
-            
-            # 获取筛选后结果为 True (即满足条件) 的 sequence_id
-            full_quality_sids = sids_with_valid_data[sids_with_valid_data].index
-            
             original_seq_count = train_df['sequence_id'].nunique()
-            # 使用筛选出的 sequence_id 过滤原始 DataFrame
-            train_df = train_df[train_df['sequence_id'].isin(full_quality_sids)]
+            # 1. 对所有传感器列创建一个布尔 DataFrame (True 代表非空值)
+            #    然后使用 .any(axis=1) 横向检查每一行，只要行内有一个 True，结果就为 True。
+            #    这一步会生成一个布尔 Series，长度与 train_df 的行数相同。
+            has_valid_row = train_df[all_sensor_cols].notna().any(axis=1)
             
+            # 2. 使用 .loc 基于上面的布尔 Series 快速定位到所有包含有效数据的行，
+            #    并提取这些行的 'sequence_id'，最后用 .unique() 获取不重复的ID列表。
+            #    这比逐个分组应用函数快几个数量级。
+            full_quality_sids = train_df.loc[has_valid_row, 'sequence_id'].unique()
+            
+            # 3. 使用 .isin() 高效过滤。这是基于列表筛选行的最快方法。
+            train_df = train_df[train_df['sequence_id'].isin(full_quality_sids)]
             print(f"  {original_seq_count} total sequences found.")
             print(f"  {len(full_quality_sids)} sequences have at least one valid ToF or THM reading and will be used.")
             print(f"  Filtered data shape: {train_df.shape}")
