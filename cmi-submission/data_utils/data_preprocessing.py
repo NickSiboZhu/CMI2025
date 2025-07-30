@@ -441,7 +441,10 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     """
     # 1. 识别需要Z-score标准化的特征
     zscore_prefixes = ['acc_', 'rot_', 'thm_', 'linear_', 'angular_']
-    zscore_cols = [col for col in X_train.columns if any(col.startswith(p) for p in zscore_prefixes)]
+    zscore_cols = [
+        col for col in X_train.columns 
+        if any(col.startswith(p) for p in zscore_prefixes) and not col.endswith('_failed')
+    ]
     
     demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm']
     existing_demographic_cols = [col for col in demographic_cols if col in X_train.columns]

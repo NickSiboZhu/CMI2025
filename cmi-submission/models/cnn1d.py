@@ -72,7 +72,11 @@ class CNN1D(nn.Module):
             if i < len(self.conv_layers) - 1:
                 x = self.pool(x)
                 # ✨ 核心步骤 3: MaxPool后，mask的长度也必须相应缩减
-                mask = mask[:, ::2]
+                mask_for_pooling = mask.unsqueeze(1).float() 
+                # 2. 应用池化操作
+                pooled_mask = self.pool(mask_for_pooling)
+                # 3. 移除临时的通道维度 (B, 1, L_new) -> (B, L_new)
+                mask = pooled_mask.squeeze(1)
 
         # --- 正确实现的、带Mask的全局平均池化 ---
         # x shape: (batch, channels, reduced_seq_len)

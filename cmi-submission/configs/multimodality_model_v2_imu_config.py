@@ -6,7 +6,7 @@
 data = dict(
     variant='imu',  # Fixed: must match data preprocessing logic
     max_length=100,
-    batch_size=128,
+    batch_size=64,
 )
 
 # -------------------------- Model Architecture -----------------------
@@ -48,11 +48,11 @@ model = dict(
 training = dict(
     epochs=100,
     patience=15,
-    start_lr=4e-3,
+    start_lr=1e-3,
     weight_decay=1e-2,
     use_amp=False,
-    mixup_enabled=False,
-    mixup_alpha=0.2,
+    mixup_enabled=True,
+    mixup_alpha=0.3,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 )
 

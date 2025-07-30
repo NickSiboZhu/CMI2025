@@ -604,8 +604,8 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             mask=fold['val_mask']    # Pass the validation mask
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=6, pin_memory=True,persistent_workers=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=6, pin_memory=True,persistent_workers=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,persistent_workers=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,persistent_workers=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -738,7 +738,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
     oof_df.to_csv(oof_path, index=False)
     print(f"OOF predictions saved to '{oof_path}'")
     
-    return fold_models, fold_histories, fold_results
+    return oof_comp_score, fold_models, fold_histories, fold_results
 
 
 def main():
@@ -765,7 +765,7 @@ def main():
     focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
     focal_alpha = cfg.training.get('loss', {}).get('alpha', 1.0)
     gpu_id = cfg.environment.get('gpu_id')
-    mixup_enabled = cfg.training.get('mixup', True)
+    mixup_enabled = cfg.training.get('mixup_enabled', True)
     mixup_alpha = cfg.training.get('mixup_alpha', 0.4)
 
     
@@ -790,7 +790,7 @@ def main():
     device = setup_device(gpu_id)
     
     # Train models using config
-    fold_models, fold_histories, fold_results = train_kfold_models(
+    oof_score, fold_models, fold_histories, fold_results = train_kfold_models(
         epochs=epochs,
         patience=patience,
         batch_size=batch_size,
