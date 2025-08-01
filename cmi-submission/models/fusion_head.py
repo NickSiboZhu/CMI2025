@@ -50,6 +50,77 @@ class LinearFusionHead(nn.Module):
 
 
 @MODELS.register_module()
+class BilinearFusionHead(nn.Module):
+    """
+    Bilinear fusion head for capturing cross-modal interactions.
+    
+    This fusion strategy uses bilinear pooling to capture interactions
+    between different modalities before classification.
+    """
+    
+    def __init__(self, input_dim, num_classes, branch_dims, fusion_dim=128, hidden_dims=None, dropout_rates=None):
+        super(BilinearFusionHead, self).__init__()
+        
+        if hidden_dims is None:
+            hidden_dims = [256, 128]
+        if dropout_rates is None:
+            dropout_rates = [0.5] * len(hidden_dims)
+        
+        self.branch_dims = branch_dims
+        self.fusion_dim = fusion_dim
+        
+        # Bilinear layers for each pair of modalities
+        self.bilinear_layers = nn.ModuleList()
+        for i in range(len(branch_dims)):
+            for j in range(i + 1, len(branch_dims)):
+                self.bilinear_layers.append(
+                    nn.Bilinear(branch_dims[i], branch_dims[j], fusion_dim)
+                )
+        
+        # Final classification layers
+        total_fusion_dim = len(self.bilinear_layers) * fusion_dim + sum(branch_dims)
+        
+        layers = [nn.LayerNorm(total_fusion_dim)]
+        in_dim = total_fusion_dim
+        
+        for idx, out_dim in enumerate(hidden_dims):
+            layers.append(nn.Linear(in_dim, out_dim))
+            layers.append(nn.ReLU())
+            dr = dropout_rates[idx] if idx < len(dropout_rates) else 0.5
+            layers.append(nn.Dropout(dr))
+            in_dim = out_dim
+        
+        layers.append(nn.Linear(in_dim, num_classes))
+        self.classifier = nn.Sequential(*layers)
+    
+    def forward(self, combined_features):
+        """
+        Args:
+            combined_features: Concatenated features from all branches
+        """
+        # Split features back into branches
+        branch_features = []
+        start_idx = 0
+        for dim in self.branch_dims:
+            branch_features.append(combined_features[:, start_idx:start_idx + dim])
+            start_idx += dim
+        
+        # Compute bilinear interactions
+        bilinear_features = []
+        layer_idx = 0
+        for i in range(len(branch_features)):
+            for j in range(i + 1, len(branch_features)):
+                bilinear_out = self.bilinear_layers[layer_idx](branch_features[i], branch_features[j])
+                bilinear_features.append(bilinear_out)
+                layer_idx += 1
+        
+        # Concatenate original features and bilinear interactions
+        all_features = branch_features + bilinear_features
+        final_features = torch.cat(all_features, dim=1)
+        
+        return self.classifier(final_features)
+
+@MODELS.register_module()
 class AttentionFusionHead(nn.Module):
     """
     Attention-based fusion head that learns to weight different modalities.
@@ -121,79 +192,7 @@ class AttentionFusionHead(nn.Module):
         # Classify
         return self.classifier(fused_features)
 
-
-@MODELS.register_module()
-class BilinearFusionHead(nn.Module):
-    """
-    Bilinear fusion head for capturing cross-modal interactions.
-    
-    This fusion strategy uses bilinear pooling to capture interactions
-    between different modalities before classification.
-    """
-    
-    def __init__(self, input_dim, num_classes, branch_dims, fusion_dim=128, hidden_dims=None, dropout_rates=None):
-        super(BilinearFusionHead, self).__init__()
         
-        if hidden_dims is None:
-            hidden_dims = [256, 128]
-        if dropout_rates is None:
-            dropout_rates = [0.5] * len(hidden_dims)
-        
-        self.branch_dims = branch_dims
-        self.fusion_dim = fusion_dim
-        
-        # Bilinear layers for each pair of modalities
-        self.bilinear_layers = nn.ModuleList()
-        for i in range(len(branch_dims)):
-            for j in range(i + 1, len(branch_dims)):
-                self.bilinear_layers.append(
-                    nn.Bilinear(branch_dims[i], branch_dims[j], fusion_dim)
-                )
-        
-        # Final classification layers
-        total_fusion_dim = len(self.bilinear_layers) * fusion_dim + sum(branch_dims)
-        
-        layers = [nn.LayerNorm(total_fusion_dim)]
-        in_dim = total_fusion_dim
-        
-        for idx, out_dim in enumerate(hidden_dims):
-            layers.append(nn.Linear(in_dim, out_dim))
-            layers.append(nn.ReLU())
-            dr = dropout_rates[idx] if idx < len(dropout_rates) else 0.5
-            layers.append(nn.Dropout(dr))
-            in_dim = out_dim
-        
-        layers.append(nn.Linear(in_dim, num_classes))
-        self.classifier = nn.Sequential(*layers)
-    
-    def forward(self, combined_features):
-        """
-        Args:
-            combined_features: Concatenated features from all branches
-        """
-        # Split features back into branches
-        branch_features = []
-        start_idx = 0
-        for dim in self.branch_dims:
-            branch_features.append(combined_features[:, start_idx:start_idx + dim])
-            start_idx += dim
-        
-        # Compute bilinear interactions
-        bilinear_features = []
-        layer_idx = 0
-        for i in range(len(branch_features)):
-            for j in range(i + 1, len(branch_features)):
-                bilinear_out = self.bilinear_layers[layer_idx](branch_features[i], branch_features[j])
-                bilinear_features.append(bilinear_out)
-                layer_idx += 1
-        
-        # Concatenate original features and bilinear interactions
-        all_features = branch_features + bilinear_features
-        final_features = torch.cat(all_features, dim=1)
-        
-        return self.classifier(final_features)
-
-
 @MODELS.register_module()
 class TransformerFusionHead(nn.Module):
     """

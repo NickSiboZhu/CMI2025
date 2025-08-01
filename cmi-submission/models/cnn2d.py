@@ -232,31 +232,13 @@ class TOF2DCNN(nn.Module):
 @MODELS.register_module()
 class TemporalTOF2DCNN(nn.Module):
     """
-    2-stage module for sequential TOF data.
+    2-stage module for sequential TOF data, now with support for appended flags.
 
     Stage 1: `TOF2DCNN` extracts spatial features for every timestep.
     Stage 2: Temporal encoder (LSTM or Transformer) for temporal modeling.
     
-    Args:
-        temporal_mode (str): 'lstm' or 'transformer' - temporal modeling approach
-        
-        # Common temporal args:
-        input_channels (int): Number of TOF sensors
-        seq_len (int): Maximum sequence length
-        out_features (int): Desired output dimension (ignored, uses conv_channels[-1])
-        conv_channels (list): Channel sizes for spatial CNN
-        kernel_sizes (list): Kernel sizes for spatial CNN
-        
-        # LSTM specific (used when temporal_mode='lstm'):
-        lstm_hidden (int): Hidden size for LSTM
-        lstm_layers (int): Number of LSTM layers
-        bidirectional (bool): Whether to use bidirectional LSTM
-        
-        # Transformer specific (used when temporal_mode='transformer'):
-        num_heads (int): Number of attention heads
-        num_layers (int): Number of transformer encoder layers
-        ff_dim (int): Dimension of feedforward network
-        dropout (float): Dropout rate
+    The input `tof_sequence` can optionally contain appended flag features.
+    The model intelligently separates pixel data from flag data.
     """
 
     def __init__(self, input_channels=5, seq_len=100, out_features=128,
@@ -272,21 +254,25 @@ class TemporalTOF2DCNN(nn.Module):
         self.input_channels = input_channels
         self.seq_len = seq_len
         self.temporal_mode = temporal_mode
-        # Note: out_features parameter is kept for config compatibility,
-        # but actual output is determined by spatial CNN's last conv channel
-        self.out_features = conv_channels[-1] if conv_channels else 128
-
+        # Assume one flag per sensor
+        self.num_flags = self.input_channels
+        
         # ------------- Spatial CNN applied per-frame -------------
-        self.spatial_cnn = TOF2DCNN(input_channels, out_features,
+        # CNN will see pixel maps plus per-sensor flag maps as extra channels
+        total_in_channels = input_channels + self.num_flags
+        self.spatial_cnn = TOF2DCNN(total_in_channels, out_features,
                                     conv_channels, kernel_sizes)
         
         # Get the actual output dimension from spatial CNN
         self.spatial_out_dim = self.spatial_cnn.out_features
         
         # ------------- Temporal Encoder ---------------------
+        # The temporal encoder processes the concatenated spatial features and flags
+        temporal_input_dim = self.spatial_out_dim
+        
         self.temporal_encoder = TemporalEncoder(
             mode=temporal_mode,
-            input_dim=self.spatial_out_dim,
+            input_dim=temporal_input_dim,
             seq_len=seq_len,
             # LSTM params
             lstm_hidden=lstm_hidden,
@@ -302,36 +288,44 @@ class TemporalTOF2DCNN(nn.Module):
         # Update output features to match temporal encoder output
         self.out_features = self.temporal_encoder.output_dim
         
-        # Note: No projection layer - direct temporal encoder output is used
-    
     def forward(self, tof_sequence, mask=None):
         """
-        Forward pass with unified temporal encoder.
+        Forward pass with unified temporal encoder and flag handling.
         
         Args:
-            tof_sequence: (batch_size, seq_len, features) - flattened TOF data
-            mask: (batch_size, seq_len) - 1 for valid positions, 0 for padding
-            
-        Returns:
-            (batch_size, output_dim) - temporal aggregation of spatial features
+            tof_sequence: (batch, seq, features) - TOF data, may include flags
+            mask: (batch, seq) - 1 for valid positions, 0 for padding
         """
-        batch_size, seq_len, _ = tof_sequence.shape
+        batch_size, seq_len, total_features = tof_sequence.shape
 
         if mask is None:
             mask = torch.ones(batch_size, seq_len, device=tof_sequence.device)
 
-        # --- Spatial feature extraction ---
-        # Reshape to (batch_size * seq_len, num_sensors, 8, 8) for 2D CNN processing
-        tof_grids_flat = tof_sequence.view(batch_size * seq_len, self.input_channels, 8, 8)
+        # --- Split pixel data and flags ---
+        pixel_features = self.input_channels * 64
+        tof_pixels = tof_sequence[:, :, :pixel_features]
         
-        # Apply 2D CNN to all timesteps
-        spatial_features = self.spatial_cnn(tof_grids_flat)  # (batch_size * seq_len, out_features)
-        
-        # Reshape back to sequential format
-        spatial_features = spatial_features.view(batch_size, seq_len, self.spatial_out_dim)  # (B, L, C)
+        # Reshape pixels to images: (B*L, sensors, 8, 8)
+        pixel_img = tof_pixels.contiguous().view(batch_size * seq_len, self.input_channels, 8, 8)
 
+        # Broadcast flags into image channels and concatenate
+        if self.num_flags > 0:
+            tof_flags = tof_sequence[:, :, pixel_features:]
+            # (B,L, num_flags) -> (B*L, num_flags,1,1) -> expand to 8x8
+            flag_img = tof_flags.contiguous().view(batch_size * seq_len, self.num_flags, 1, 1).expand(-1, -1, 8, 8)
+            cnn_input = torch.cat([pixel_img, flag_img], dim=1)  # channels = sensors + flags
+        else:
+            cnn_input = pixel_img
+        
+        # --- Spatial feature extraction ---
+        spatial_features = self.spatial_cnn(cnn_input)  # (B*L, spatial_out_dim)
+        spatial_features = spatial_features.view(batch_size, seq_len, self.spatial_out_dim)
+
+        # No need to append flags again; they already influenced spatial features
+        temporal_input = spatial_features
+        
         # --- Temporal feature aggregation ---
-        temporal_features = self.temporal_encoder(spatial_features, mask)  # (B, output_dim)
+        temporal_features = self.temporal_encoder(temporal_input, mask)
         
         return temporal_features
     
@@ -343,5 +337,5 @@ class TemporalTOF2DCNN(nn.Module):
         return {
             'total_params': total_params,
             'trainable_params': trainable_params,
-            'model_size_mb': total_params * 4 / 1024 / 1024  # Assuming float32
+            'model_size_mb': total_params * 4 / 1024 / 1024
         }

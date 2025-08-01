@@ -107,7 +107,55 @@ def feature_engineering(train_df: pd.DataFrame):
 
     cols_to_process = [c for c in pl_df.columns if c.startswith('acc_') or c.startswith('rot_')]
 
-    # --- 步骤 2: 使用 Polars 表达式进行高性能计算 ---
+    # --- 步骤 2: 识别有问题的序列并创建flag ---
+    # A. Rotation sensor flag
+    bad_rot_sids = pl_df.filter(pl.col("rot_x").is_null())["sequence_id"].unique()
+    pl_df = pl_df.with_columns(
+        pl.when(pl.col("sequence_id").is_in(bad_rot_sids))
+          .then(pl.lit(1.0, dtype=pl.Float32))
+          .otherwise(pl.lit(0.0, dtype=pl.Float32))
+          .alias("rotation_sensor_issue_flag")
+    )
+    print(f"Identified {len(bad_rot_sids)} sequences with rotation data issues. 'rotation_sensor_issue_flag' created.")
+
+    # B. Per-sensor THM/TOF flags
+    sensor_config = get_sensor_config(pl_df.columns)
+    new_flag_cols = ["rotation_sensor_issue_flag"]
+
+    # THM flags
+    for i in sensor_config['thm_sensor_ids']:
+        col_name = f"thm_{i}"
+        flag_name = f"thm_{i}_issue_flag"
+        bad_sids = pl_df.filter(pl.col(col_name).is_null())["sequence_id"].unique()
+        if flag_name not in pl_df.columns:
+            pl_df = pl_df.with_columns(
+                pl.when(pl.col("sequence_id").is_in(bad_sids))
+                  .then(pl.lit(1.0, dtype=pl.Float32))
+                  .otherwise(pl.lit(0.0, dtype=pl.Float32))
+                  .alias(flag_name)
+            )
+        new_flag_cols.append(flag_name)
+    print(f"Created {len(sensor_config['thm_sensor_ids'])} THM issue flags.")
+
+    # TOF flags
+    for i in sensor_config['tof_sensor_ids']:
+        pixel_cols = [f"tof_{i}_v{p}" for p in range(sensor_config['tof_pixels_per_sensor'])]
+        # Check for nulls in any of the sensor's pixel columns (row-wise OR)
+        null_exprs = [pl.col(col_name).is_null() for col_name in pixel_cols]
+        has_null_any = pl.fold(acc=pl.lit(False), function=lambda acc, x: acc | x, exprs=null_exprs)
+        bad_sids = pl_df.filter(has_null_any)["sequence_id"].unique()
+        flag_name = f"tof_{i}_issue_flag"
+        if flag_name not in pl_df.columns:
+            pl_df = pl_df.with_columns(
+                pl.when(pl.col("sequence_id").is_in(bad_sids))
+                  .then(pl.lit(1.0, dtype=pl.Float32))
+                  .otherwise(pl.lit(0.0, dtype=pl.Float32))
+                  .alias(flag_name)
+            )
+        new_flag_cols.append(flag_name)
+    print(f"Created {len(sensor_config['tof_sensor_ids'])} TOF issue flags.")
+
+    # --- 步骤 3: 使用 Polars 表达式进行高性能计算 ---
     # 初始 NaN 处理和四元数修正
     pl_df = pl_df.with_columns(
         pl.col(cols_to_process).interpolate().over('sequence_id').fill_null(0.0)
@@ -170,13 +218,17 @@ def feature_engineering(train_df: pd.DataFrame):
         'angular_distance', 'angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z', 
         'angular_snap_x', 'angular_snap_y', 'angular_snap_z' 
     ] 
+    # Add all new flags to the feature list
+    final_feature_cols.extend(new_flag_cols)
+
     tof_thm_cols = [c for c in pl_df.columns if c.startswith('tof_') or c.startswith('thm_')] 
     final_feature_cols.extend(tof_thm_cols) 
+    final_feature_cols = sorted(list(set(final_feature_cols)))
     final_feature_cols = [c for c in final_feature_cols if c in pl_df.columns] 
-
+    
     print("Cleaning up all NaNs generated during feature engineering...")
     pl_df = pl_df.with_columns(
-        pl.col(final_feature_cols).interpolate().over('sequence_id').fill_null(0.0)
+        pl.col(final_feature_cols).fill_null(0.0).over('sequence_id')
     )
     
     print(f"Generated {len(final_feature_cols)} features after engineering.")
@@ -441,7 +493,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     """
     # 1. 识别需要Z-score标准化的特征
     zscore_prefixes = ['acc_', 'rot_', 'thm_', 'linear_', 'angular_']
-    zscore_cols = [col for col in X_train.columns if any(col.startswith(p) for p in zscore_prefixes)]
+    zscore_cols = [col for col in X_train.columns if any(col.startswith(p) for p in zscore_prefixes) and not col.endswith('_issue_flag')]
     
     demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm']
     existing_demographic_cols = [col for col in demographic_cols if col in X_train.columns]
@@ -451,7 +503,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
             zscore_cols.append(col)
 
     # 2. 识别需要自定义ToF缩放的特征
-    tof_cols = [col for col in X_train.columns if col.startswith('tof_')]
+    tof_cols = [col for col in X_train.columns if col.startswith('tof_') and not col.endswith('_issue_flag')]
     
     # 3. 创建单一的、统一的预处理器 (ColumnTransformer)
     transformer_list = []
@@ -502,6 +554,14 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
     
     # Dynamically detect THM and TOF columns from actual data
     thm_cols, tof_cols = generate_feature_columns(all_data_df.columns)
+    
+    # Add issue flags to their respective data streams
+    thm_issue_flags = [c for c in all_feature_cols if c.startswith('thm_') and c.endswith('_issue_flag')]
+    tof_issue_flags = [c for c in all_feature_cols if c.startswith('tof_') and c.endswith('_issue_flag')]
+    
+    thm_cols.extend(thm_issue_flags)
+    tof_cols.extend(tof_issue_flags)
+
     thm_cols = [c for c in thm_cols if c in all_feature_cols]  # Only keep engineered features
     tof_cols = [c for c in tof_cols if c in all_feature_cols]
     

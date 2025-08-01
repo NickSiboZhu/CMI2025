@@ -115,6 +115,20 @@ class MultimodalityModel(nn.Module):
         fusion_head_cfg.setdefault('type', 'FusionHead')
         fusion_head_cfg['num_classes'] = num_classes
         fusion_head_cfg['input_dim'] = combined_feature_size  # FusionHead expects 'input_dim'
+
+        # Auto-configure branch_dims for fusion heads that require it
+        fusion_head_type = fusion_head_cfg.get('type', 'FusionHead')
+        if fusion_head_type in ('BilinearFusionHead', 'AttentionFusionHead', 'TransformerFusionHead', 'GatedFusionHead') and \
+           'branch_dims' not in fusion_head_cfg:
+            # Order must match concatenation order in forward()
+            branch_dims = [self.imu_output_size]
+            if self.use_thm:
+                branch_dims.append(self.thm_output_size)
+            # MLP features always present
+            branch_dims.append(self.mlp_output_size)
+            if self.use_tof:
+                branch_dims.append(self.tof_2d_output_size)
+            fusion_head_cfg['branch_dims'] = branch_dims
         
         # Print for visibility during model construction
         print(f"\n[MultimodalityModel] Detected branch output dimensions:")

@@ -3,15 +3,15 @@
 
 # Data configuration
 data = dict(
-    num_classes=18,
+    variant='full',
     max_length=100,
+    batch_size=64,
 )
 
 # Model configuration
 model = dict(
     type='MultimodalityModel',
-    num_classes=data['num_classes'],
-    sequence_length=data['max_length'],
+    num_classes=18,
     
     # IMU branch (inertial measurement unit)
     imu_branch_cfg=dict(
@@ -43,7 +43,7 @@ model = dict(
         # Temporal encoder mode
         temporal_mode='lstm',  # Using LSTM instead of transformer
         # LSTM parameters
-        lstm_hidden=256,       # Hidden size for LSTM
+        lstm_hidden=128,       # Hidden size for LSTM
         lstm_layers=2,         # 2-layer LSTM
         bidirectional=False,    # Bidirectional: output = 256*2 = 512
     ),
@@ -74,9 +74,11 @@ training = dict(
     epochs=100,
     patience=15,
     start_lr=1e-3,
-    optimizer=dict(type='AdamW', lr=0.001, weight_decay=1e-4),
+    weight_decay=1e-2,
+    use_amp=False,
+    mixup_enabled=False,
+    mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
-    scheduler=dict(type='CosineAnnealingWarmRestarts', warmup_ratio=0.1)
 )
 
 # -------------------------- Environment ------------------------------

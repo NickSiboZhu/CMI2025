@@ -10,10 +10,6 @@ data = dict(
 )
 
 # -------------------------- Model Architecture -----------------------
-# NOTE: branch_dims must match the output sizes of each branch.
-#       cnn_output_size    = filters[-1] (here 64)
-#       tof_out_features   = 192
-#       mlp_output_dim     = 32
 model = dict(
     type='MultimodalityModel',
     num_classes=18,
@@ -21,41 +17,60 @@ model = dict(
     # IMU branch (inertial measurement unit)
     imu_branch_cfg=dict(
         type='CNN1D',
-        input_channels=None,  # filled dynamically at runtime
+        input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
-        filters=[32, 64],       # cnn_output_size = 64
-        kernel_sizes=[5, 3]
+        filters=[64, 128, 256],
+        kernel_sizes=[7, 5, 3]
     ),
 
-    # MLP branch (static demographics)
-    mlp_branch_cfg=dict(
-        type='MLP',
-        input_features=None,   # filled dynamically
-        hidden_dims=[32],
-        output_dim=32,
-        dropout_rate=0.5,
+    
+    # THM branch (thermopile sensors)
+    thm_branch_cfg=dict(
+        type='CNN1D',
+        input_channels=None,  # will be filled dynamically from data
+        sequence_length=data['max_length'],
+        filters=[32, 64, 128],           # different architecture for THM
+        kernel_sizes=[7, 5, 3]
     ),
 
-    # TOF 2-D CNN branch
+    
+    # TOF 2D CNN + LSTM branch config
     tof_branch_cfg=dict(
         type='TemporalTOF2DCNN',
-        input_channels=5,  # Number of TOF sensors
+        input_channels=5,  # 5 TOF sensors
         seq_len=data['max_length'],
-        out_features=192,         # bigger than cnn_output_size
+        out_features=128,  # Note: ignored, actual output = lstm_hidden * 2 (if bidirectional) = 512
+        # Spatial CNN parameters
         conv_channels=[32, 64, 128],
         kernel_sizes=[3, 3, 2],
-        lstm_hidden=192,
-        lstm_layers=1,
-        bidirectional=False,
+        # Temporal encoder mode
+        temporal_mode='lstm',  # Using LSTM instead of transformer
+        # LSTM parameters
+        lstm_hidden=256,       # Hidden size for LSTM
+        lstm_layers=2,         # 2-layer LSTM
+        bidirectional=False,    # Bidirectional: output = 256*2 = 512
+    ),
+
+
+    # MLP branch blueprint
+    mlp_branch_cfg=dict(
+        type='MLP',
+        input_features=None,  # will be filled dynamically from data
+        hidden_dims=[64],
+        output_dim=32,
+        dropout_rate=0.5
     ),
 
     # Fusion head – attention based
     fusion_head_cfg=dict(
         type='AttentionFusionHead',
-        branch_dims=[64, 192, 32],   # [cnn_dim, tof_dim, mlp_dim]
-        hidden_dims=[256, 128],
-        dropout_rates=[0.5, 0.3]
+        hidden_dims=[256, 128, 64],
+        dropout_rates=[0.5, 0.3, 0.2]
     ),
+
+    # Use all modalities
+    use_tof=True,
+    use_thm=True
 )
 
 # ----------------------- Training Strategy ---------------------------
@@ -63,10 +78,11 @@ training = dict(
     epochs=100,
     patience=15,
     start_lr=1e-3,
-    optimizer=dict(type='AdamW', lr=0.001, weight_decay=0.01),
-    # Uncomment to use Focal Loss instead of CE
+    weight_decay=1e-2,
+    use_amp=False,
+    mixup_enabled=True,
+    mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
-    scheduler=dict(type='CosineAnnealingWarmRestarts', warmup_ratio=0.1),
 )
 
 # -------------------------- Environment ------------------------------

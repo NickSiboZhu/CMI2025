@@ -533,8 +533,10 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
     # Set TOF branch input channels (config structure defined in config file)
     if 'tof_branch_cfg' in model_cfg:
         # TOF data is flattened as (num_sensors * 64), so we need to calculate num_sensors
-        num_tof_sensors = tof_channels // 64  # 320 // 64 = 5 sensors
+        num_tof_sensors = tof_channels // 64 if tof_channels % 64 == 0 else (tof_channels - 5) // 64
         model_cfg['tof_branch_cfg']['input_channels'] = num_tof_sensors
+        # NEW: Pass the number of flag features to the model
+
     
     # Set static features for MLP branch
     model_cfg['mlp_branch_cfg']['input_features'] = static_features
@@ -621,12 +623,12 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
         
         model = model.to(device)
         
-        # Compile model for faster training
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            print(f"⚠️  torch.compile failed: {str(e)}")
-            print("   Falling back not to use torch.compile.")
+        # # Compile model for faster training
+        # try:
+        #     model = torch.compile(model)
+        # except Exception as e:
+        #     print(f"⚠️  torch.compile failed: {str(e)}")
+        #     print("   Falling back not to use torch.compile.")
         
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
@@ -765,7 +767,7 @@ def main():
     focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
     focal_alpha = cfg.training.get('loss', {}).get('alpha', 1.0)
     gpu_id = cfg.environment.get('gpu_id')
-    mixup_enabled = cfg.training.get('mixup', True)
+    mixup_enabled = cfg.training.get('mixup_enabled', False)
     mixup_alpha = cfg.training.get('mixup_alpha', 0.4)
 
     
