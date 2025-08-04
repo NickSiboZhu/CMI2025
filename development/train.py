@@ -338,7 +338,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
         scaler.step(optimizer)
         scaler.update()
         
-        if scheduler is not None:
+        if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             scheduler.step()
         
         total_loss += loss.item()
@@ -401,7 +401,7 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -410,14 +410,30 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
     print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
 
-    # Setup cosine schedule with warmup (10% warmup steps)
-    total_training_steps = epochs * len(train_loader)
-    warmup_steps = int(0.1 * total_training_steps)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_training_steps,
-    )
+    # --- NEW: Dynamic Scheduler Setup ---
+    if scheduler_cfg is None:
+        scheduler_cfg = {'type': 'cosine'} # Default to cosine
+
+    scheduler = None
+    if scheduler_cfg['type'] == 'cosine':
+        total_training_steps = epochs * len(train_loader)
+        warmup_steps = int(0.1 * total_training_steps)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_training_steps,
+        )
+        print("Using Cosine Annealing scheduler with warmup.")
+    elif scheduler_cfg['type'] == 'reduce_on_plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='max', # Step on max validation score
+            factor=scheduler_cfg.get('factor', 0.2),
+            patience=scheduler_cfg.get('patience', 10),
+            min_lr=scheduler_cfg.get('min_lr', 1e-6),
+            verbose=True
+        )
+        print(f"Using ReduceLROnPlateau scheduler (factor={scheduler_cfg.get('factor', 0.2)}, patience={scheduler_cfg.get('patience', 10)}, min_lr={scheduler_cfg.get('min_lr', 1e-6)}).")
     
     history = {
         'train_loss': [], 'train_accuracy': [], 'train_competition_score': [],
@@ -433,20 +449,20 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     for epoch in range(epochs):
         start_time = time.time()
         
-        # Train and get predictions for score calculation
-        # MODIFIED: Pass mixup parameters to train_epoch
         train_loss, train_acc, train_preds, train_targets = train_epoch(
             model, train_loader, criterion, optimizer, device, scaler, use_amp, scheduler,
             mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha
         )
         train_score = competition_metric(train_targets, train_preds, label_encoder)
         
-        # Validate
         val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
 
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Save best model based on competition score
+        # --- NEW: Handle ReduceLROnPlateau step ---
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_score)
+
         if val_score > best_val_score:
             best_val_score = val_score
             ckpt_name = os.path.join(WEIGHT_DIR, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
@@ -456,7 +472,6 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         else:
             patience_counter += 1
         
-        # Record metrics
         history['train_loss'].append(train_loss)
         history['train_accuracy'].append(train_acc)
         history['train_competition_score'].append(train_score)
@@ -472,25 +487,21 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
               f'Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | '
               f'LR: {current_lr:.6f}')
         
-        # Early stopping
         if patience_counter >= patience:
             print(f'Early stopping at epoch {epoch+1} as validation score did not improve for {patience} epochs.')
             break
     
-    # Load best model
     ckpt_name = os.path.join(WEIGHT_DIR, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
-    model.load_state_dict(torch.load(ckpt_name))
-
-    # delete temporary best model file
     if os.path.exists(ckpt_name):
+        model.load_state_dict(torch.load(ckpt_name))
         os.remove(ckpt_name)
-        print(f"Temporary best model file '{ckpt_name}' deleted.")
+        print(f"Loaded best model and deleted temporary file '{ckpt_name}'.")
     
     return history
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4):
+def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -622,11 +633,11 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
         model = model.to(device)
         
         # Compile model for faster training
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            print(f"⚠️  torch.compile failed: {str(e)}")
-            print("   Falling back not to use torch.compile.")
+        # try:
+        #     model = torch.compile(model)
+        # except Exception as e:
+        #     print(f"⚠️  torch.compile failed: {str(e)}")
+        #     print("   Falling back not to use torch.compile.")
         
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
@@ -649,7 +660,8 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             criterion=criterion,
             # MODIFIED: Pass mixup parameters down
             mixup_enabled=mixup_enabled,
-            mixup_alpha=mixup_alpha
+            mixup_alpha=mixup_alpha,
+            scheduler_cfg=scheduler_cfg
         )
         
         # Evaluate model and capture predictions for OOF
@@ -767,6 +779,8 @@ def main():
     gpu_id = cfg.environment.get('gpu_id')
     mixup_enabled = cfg.training.get('mixup_enabled', True)
     mixup_alpha = cfg.training.get('mixup_alpha', 0.4)
+    # --- NEW: Read scheduler config from file ---
+    scheduler_cfg = cfg.training.get('scheduler_cfg', {'type': 'cosine'})
 
     
     print(f"\nTraining Configuration from {args.config}:")
@@ -785,6 +799,8 @@ def main():
         print(f"  Focal Gamma: {focal_gamma}")
         print(f"  Focal Alpha: {focal_alpha}")
     print(f"  GPU ID: {gpu_id}")
+    # --- NEW: Print scheduler config ---
+    print(f"  Scheduler Config: {scheduler_cfg}")
     
     # Setup device
     device = setup_device(gpu_id)
@@ -805,7 +821,8 @@ def main():
         focal_alpha=focal_alpha,
         model_cfg=cfg.model,
         mixup_enabled=mixup_enabled,
-        mixup_alpha=mixup_alpha
+        mixup_alpha=mixup_alpha,
+        scheduler_cfg=scheduler_cfg
     )
     
     print("✅ Config-driven training completed!")

@@ -68,16 +68,14 @@ class AttentionFusionHead(nn.Module):
         
         self.branch_dims = branch_dims  # [cnn_dim, tof_dim, mlp_dim]
         
-        # Attention mechanism for each branch
-        self.attention_weights = nn.Sequential(
-            nn.Linear(input_dim, len(branch_dims)),
-            nn.Softmax(dim=1)
-        )
-        
-        # Feature projection for each branch
+        # Per-branch projection
         self.branch_projections = nn.ModuleList([
             nn.Linear(dim, hidden_dims[0]) for dim in branch_dims
         ])
+
+        # Shared gate network: produces one scalar score per branch
+        proj_dim = hidden_dims[0]
+        self.gate_fc = nn.Linear(proj_dim, 1)  # outputs (batch, 1)
         
         # Classification layers
         layers = []
@@ -105,18 +103,22 @@ class AttentionFusionHead(nn.Module):
             branch_features.append(combined_features[:, start_idx:start_idx + dim])
             start_idx += dim
         
-        # Compute attention weights
-        attention_weights = self.attention_weights(combined_features)  # (batch, num_branches)
-        
-        # Project each branch and apply attention
-        projected_features = []
-        for i, (features, projection) in enumerate(zip(branch_features, self.branch_projections)):
-            projected = projection(features)  # (batch, hidden_dim[0])
-            weighted = projected * attention_weights[:, i:i+1]  # Broadcast attention
-            projected_features.append(weighted)
-        
-        # Sum weighted features
-        fused_features = torch.sum(torch.stack(projected_features), dim=0)
+        # Project each branch and compute scalar gate
+        projected_feats = []  # list of (B, proj_dim)
+        scores = []           # list of (B,)
+        for features, projection in zip(branch_features, self.branch_projections):
+            proj_feat = projection(features)            # (B, proj_dim)
+            projected_feats.append(proj_feat)
+            score = self.gate_fc(proj_feat).squeeze(-1) # (B,)
+            scores.append(score)
+
+        scores = torch.stack(scores, dim=1)             # (B, n_branches)
+        alphas = torch.softmax(scores, dim=1)  # (B, n_branches)
+
+        # Apply gates and sum
+        fused_features = torch.zeros_like(projected_feats[0])  # (B, proj_dim)
+        for i, proj_feat in enumerate(projected_feats):
+            fused_features += proj_feat * alphas[:, i:i+1]
         
         # Classify
         return self.classifier(fused_features)
@@ -151,7 +153,7 @@ class BilinearFusionHead(nn.Module):
                 )
         
         # Final classification layers
-        total_fusion_dim = len(self.bilinear_layers) * fusion_dim + sum(branch_dims)
+        total_fusion_dim = len(self.bilinear_layers) * fusion_dim  # pure bilinear (exclude original features)
         
         layers = [nn.LayerNorm(total_fusion_dim)]
         in_dim = total_fusion_dim
@@ -187,9 +189,8 @@ class BilinearFusionHead(nn.Module):
                 bilinear_features.append(bilinear_out)
                 layer_idx += 1
         
-        # Concatenate original features and bilinear interactions
-        all_features = branch_features + bilinear_features
-        final_features = torch.cat(all_features, dim=1)
+        # Use only bilinear features (pure bilinear fusion)
+        final_features = torch.cat(bilinear_features, dim=1)
         
         return self.classifier(final_features)
 

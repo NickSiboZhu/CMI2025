@@ -5,7 +5,7 @@
 """
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
-CONFIG_FILE_PATH = r'cmi-submission\configs\multimodality_model_v2_imu_config.py'
+CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
 # 你想要运行的试验次数
 N_TRIALS = 100
 # 初始随机搜索的次数
@@ -104,9 +104,28 @@ def objective(trial: optuna.trial.Trial) -> float:
     # ===================================================================
 
     cfg.training['epochs'] = trial.suggest_int('epochs', 20, 150)
+    cfg.training['patience'] = trial.suggest_int('patience', 10, 30, step=5)
     cfg.training['start_lr'] = trial.suggest_float('start_lr', 1e-4, 1e-2, log=True)
     cfg.training['weight_decay'] = trial.suggest_float('weight_decay', 1e-6, 1e-1, log=True)
-    cfg.training['mixup_alpha'] = trial.suggest_float('mixup_alpha', 0.0, 0.4)
+    # --- Mixup Augmentation ---
+    cfg.training['mixup_enabled'] = trial.suggest_categorical('mixup_enabled', [True, False])
+    if cfg.training['mixup_enabled']:
+        # If mixup is on, search for a meaningful alpha
+        cfg.training['mixup_alpha'] = trial.suggest_float('mixup_alpha', 0.1, 0.5)
+    else:
+        # If mixup is off, alpha is irrelevant but should be 0
+        cfg.training['mixup_alpha'] = 0.0
+
+    # --- NEW: Scheduler Choice ---
+    scheduler_type = trial.suggest_categorical('scheduler_type', ['cosine', 'reduce_on_plateau'])
+    scheduler_cfg = {'type': scheduler_type}
+    if scheduler_type == 'reduce_on_plateau':
+        scheduler_cfg['factor'] = trial.suggest_float('lr_reduce_factor', 0.2, 0.8, step=0.1)
+        scheduler_cfg['patience'] = trial.suggest_int('lr_patience', 5, 15, step=2)
+        scheduler_cfg['min_lr'] = trial.suggest_float('min_lr', 1e-7, 1e-5, log=True)
+    cfg.training['scheduler_cfg'] = scheduler_cfg
+    # --- End of Scheduler Choice ---
+
 
     num_imu_layers = trial.suggest_int('num_imu_layers', 2, 4)
     imu_filters = []
@@ -141,14 +160,28 @@ def objective(trial: optuna.trial.Trial) -> float:
         tof_temporal_mode = trial.suggest_categorical('tof_temporal_mode', ['lstm', 'transformer'])
         cfg.model['tof_branch_cfg']['temporal_mode'] = tof_temporal_mode
         
-        num_tof_cnn_layers = trial.suggest_int('num_tof_cnn_layers', 2, 4)
+        # --- Safe TOF CNN architecture search ---
+        # Restrict to 2 or 3 layers. 4 layers is too deep for 8×8 input with hard-coded pooling.
+        num_tof_cnn_layers = trial.suggest_categorical('num_tof_cnn_layers', [2, 3])
+
+        if num_tof_cnn_layers == 2:
+            # Any kernel combination is safe for 2 layers.
+            tof_kernel_sizes = [
+                trial.suggest_categorical('tof_kernel_0', [2, 3]),
+                trial.suggest_categorical('tof_kernel_1', [2, 3]),
+            ]
+        else:  # 3 layers → use a verified safe progression 3→3→2 to avoid 1×1 before final conv
+            tof_kernel_sizes = [3, 3, 2]
+
+        # Channel width search (use lower max channels for deeper nets to save memory)
         tof_conv_channels = []
-        tof_kernel_sizes = []
+        max_ch = 256 if num_tof_cnn_layers == 2 else 128
         for i in range(num_tof_cnn_layers):
-            tof_conv_channels.append(trial.suggest_int(f'tof_conv_channel_{i}', 32, 412, step=32))
-            tof_kernel_sizes.append(trial.suggest_categorical(f'tof_kernel_{i}', [2, 3]))
+            tof_conv_channels.append(trial.suggest_int(f'tof_conv_channel_{i}', 32, max_ch, step=32))
+
         cfg.model['tof_branch_cfg']['conv_channels'] = tof_conv_channels
         cfg.model['tof_branch_cfg']['kernel_sizes'] = tof_kernel_sizes
+        # --- End safe TOF CNN search ---
         
         if tof_temporal_mode == 'transformer':
             cfg.model['tof_branch_cfg']['num_heads'] = trial.suggest_categorical('tof_num_heads', [4, 8])
@@ -209,6 +242,7 @@ def objective(trial: optuna.trial.Trial) -> float:
                 batch_size=cfg.data['batch_size'], use_amp=cfg.training['use_amp'],
                 variant=cfg.data['variant'], model_cfg=cfg.model,
                 mixup_enabled=cfg.training['mixup_enabled'], mixup_alpha=cfg.training['mixup_alpha'],
+                scheduler_cfg=cfg.training['scheduler_cfg'],
                 device=device, show_stratification=False, loss_function='ce',
             )
         

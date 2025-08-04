@@ -20,7 +20,7 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[5, 5, 3]
+        kernel_sizes=[7, 5, 3]
     ),
 
     # MLP branch blueprint (same as full)
@@ -50,10 +50,21 @@ training = dict(
     patience=15,
     start_lr=1e-3,
     weight_decay=1e-2,
-    use_amp=False,
-    mixup_enabled=True,
-    mixup_alpha=0.3,
+    use_amp=False, 
+    mixup_enabled=False,
+    mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
+
+    # --- NEW: Learning Rate Scheduler Configuration ---
+    # Choose 'cosine' or 'reduce_on_plateau'
+    scheduler_cfg=dict(
+        # type='cosine',  # Default is cosine annealing
+        type='reduce_on_plateau',
+        # --- Settings for 'reduce_on_plateau' ---
+        factor=0.2,   # Factor to reduce LR by (e.g., new_lr = lr * factor)
+        patience=5,   # Epochs to wait for improvement before reducing LR
+        min_lr=1e-6,  # Minimum learning rate
+    ),
 )
 
 # -------------------------- Environment ------------------------------

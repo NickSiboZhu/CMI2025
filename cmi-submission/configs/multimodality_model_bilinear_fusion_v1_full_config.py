@@ -1,12 +1,12 @@
 # ===================================================================
-#   Configuration v3 – FULL Multimodal (IMU + THM + TOF + DEMO)
+#   Configuration Bilinear v1 – FULL Multimodal (IMU + THM + TOF + DEMO)
 # ===================================================================
 
 # --------------------------- Data Settings ---------------------------
 data = dict(
     variant='full',
     max_length=100,
-    batch_size=64,
+    batch_size=32,
 )
 
 # -------------------------- Model Architecture -----------------------
@@ -44,7 +44,7 @@ model = dict(
         temporal_mode='lstm',  
         lstm_hidden=128,
         lstm_layers=1,
-        bidirectional=False,
+        bidirectional=True,
     ),
 
     # MLP branch blueprint
@@ -62,9 +62,10 @@ model = dict(
 
     # Fusion head blueprint
     fusion_head_cfg=dict(
-        type='FusionHead',  # Use default LinearFusionHead
-        hidden_dims=[256, 128],
-        dropout_rates=[0.4, 0.3]
+        type='BilinearFusionHead',
+        fusion_dim=32,  # Much smaller - this is per bilinear interaction
+        hidden_dims=[128, 64],  # Reduced to match reasonable total feature size
+        dropout_rates=[0.5, 0.4]
     )
 )
 
@@ -78,18 +79,7 @@ training = dict(
     mixup_enabled=False,
     mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
-
-    # --- NEW: Learning Rate Scheduler Configuration ---
-    # Choose 'cosine' or 'reduce_on_plateau'
-    scheduler_cfg=dict(
-        # type='cosine',  # Default is cosine annealing
-        type='reduce_on_plateau',
-        # --- Settings for 'reduce_on_plateau' ---
-        factor=0.2,   # Factor to reduce LR by (e.g., new_lr = lr * factor)
-        patience=5,   # Epochs to wait for improvement before reducing LR
-        min_lr=1e-6,  # Minimum learning rate
-    ),
 )
 
 # -------------------------- Environment ------------------------------
-environment = dict(gpu_id=None, seed=42) 
+environment = dict(gpu_id=None, seed=42)

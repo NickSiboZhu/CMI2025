@@ -1,5 +1,5 @@
 # ===================================================================
-#   Configuration v3 – FULL Multimodal (IMU + THM + TOF + DEMO)
+#   Configuration – FULL Multimodal with TransformerFusionHead (v2)
 # ===================================================================
 
 # --------------------------- Data Settings ---------------------------
@@ -10,9 +10,14 @@ data = dict(
 )
 
 # -------------------------- Model Architecture -----------------------
+# Branch output sizes must be reflected in `branch_dims`.
+#  * CNN1D last filter            → 64
+#  * TemporalTOF2DCNN out_features→ 192
+#  * MLP output_dim               → 32
 model = dict(
     type='MultimodalityModel',
     num_classes=18,
+
 
     # IMU branch (inertial measurement unit)
     imu_branch_cfg=dict(
@@ -60,11 +65,11 @@ model = dict(
     use_thm=True,
     use_tof=True,
 
-    # Fusion head blueprint
-    fusion_head_cfg=dict(
-        type='FusionHead',  # Use default LinearFusionHead
+    # Fusion head – attention based
+    fusion_head_cfg = dict(
+        type='AttentionFusionHead',
         hidden_dims=[256, 128],
-        dropout_rates=[0.4, 0.3]
+        dropout_rates=[0.5, 0.3]
     )
 )
 
@@ -75,20 +80,9 @@ training = dict(
     start_lr=1e-3,
     weight_decay=1e-2,
     use_amp=False, 
-    mixup_enabled=False,
+    mixup_enabled=True,
     mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
-
-    # --- NEW: Learning Rate Scheduler Configuration ---
-    # Choose 'cosine' or 'reduce_on_plateau'
-    scheduler_cfg=dict(
-        # type='cosine',  # Default is cosine annealing
-        type='reduce_on_plateau',
-        # --- Settings for 'reduce_on_plateau' ---
-        factor=0.2,   # Factor to reduce LR by (e.g., new_lr = lr * factor)
-        patience=5,   # Epochs to wait for improvement before reducing LR
-        min_lr=1e-6,  # Minimum learning rate
-    ),
 )
 
 # -------------------------- Environment ------------------------------

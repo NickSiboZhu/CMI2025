@@ -126,6 +126,19 @@ class MultimodalityModel(nn.Module):
         print(f"  MLP: {self.mlp_output_size}")
         print(f"  Total combined features: {combined_feature_size}")
 
+        # For advanced fusion heads, collect and pass branch dimensions
+        fusion_type = fusion_head_cfg.get('type', 'FusionHead')
+        if fusion_type in ['BilinearFusionHead', 'AttentionFusionHead', 'TransformerFusionHead']:
+            branch_dims = []
+            # The order must match the feature concatenation order in the forward pass
+            branch_dims.append(self.imu_output_size)
+            if self.use_thm:
+                branch_dims.append(self.thm_output_size)
+            branch_dims.append(self.mlp_output_size)
+            if self.use_tof:
+                branch_dims.append(self.tof_2d_output_size)
+            fusion_head_cfg['branch_dims'] = branch_dims
+
         self.classifier_head = build_from_cfg(fusion_head_cfg, MODELS)
 
     def forward(self, imu_input: torch.Tensor, thm_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
@@ -152,9 +165,10 @@ class MultimodalityModel(nn.Module):
         mlp_features = self.mlp_branch(static_input)
         
         # 5. Concatenate the features from all branches
-        features_to_concat = [imu_features, mlp_features]
+        features_to_concat = [imu_features]
         if thm_features is not None:
-            features_to_concat.insert(1, thm_features)
+            features_to_concat.append(thm_features)
+        features_to_concat.append(mlp_features)
         if tof_features is not None:
             features_to_concat.append(tof_features)
         

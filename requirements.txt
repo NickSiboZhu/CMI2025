@@ -4,3 +4,4 @@ numpy==1.26.4
 pandas==2.2.3
 polars==1.21.0
 pyarrow==19.0.1
+optuna==4.3.0
