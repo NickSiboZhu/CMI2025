@@ -51,7 +51,7 @@ training = dict(
     start_lr=1e-3,
     weight_decay=1e-2,
     use_amp=False, 
-    mixup_enabled=False,
+    mixup_enabled=True,
     mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 
@@ -64,6 +64,18 @@ training = dict(
         factor=0.2,   # Factor to reduce LR by (e.g., new_lr = lr * factor)
         patience=5,   # Epochs to wait for improvement before reducing LR
         min_lr=1e-6,  # Minimum learning rate
+        warmup_ratio=0.1, # Optional warmup for ReduceLROnPlateau
+
+        # --- Settings for 'cosine' (if you switch to it) ---
+        # warmup_ratio=0.1,  # Fraction of total steps for warmup (0.0-0.3 recommended)
+        
+        # --- Discriminative Learning Rates for IMU-Only Model ---
+        # Multipliers for different model parts. Only active branches are needed.
+        lr_multipliers=dict(
+            imu=1.0,     # IMU branch learning rate multiplier
+            mlp=2.0,     # MLP branch learning rate multiplier
+            fusion=1.0,  # Fusion head learning rate multiplier
+        )
     ),
 )
 

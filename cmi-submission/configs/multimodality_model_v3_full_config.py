@@ -75,7 +75,7 @@ training = dict(
     start_lr=1e-3,
     weight_decay=1e-2,
     use_amp=False, 
-    mixup_enabled=False,
+    mixup_enabled=True,
     mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 
@@ -88,6 +88,16 @@ training = dict(
         factor=0.2,   # Factor to reduce LR by (e.g., new_lr = lr * factor)
         patience=5,   # Epochs to wait for improvement before reducing LR
         min_lr=1e-6,  # Minimum learning rate
+        warmup_ratio=0.1, # 10% of total epochs for warmup before plateau scheduler takes over
+
+        # --- Discriminative Learning Rates ---
+        lr_multipliers=dict(
+            imu=1.0,
+            thm=1.0,
+            tof=0.5,
+            mlp=2.0,
+            fusion=0.5,
+        )
     ),
 )
 

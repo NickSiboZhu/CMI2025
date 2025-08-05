@@ -10,7 +10,7 @@ CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.p
 N_TRIALS = 100
 # 初始随机搜索的次数
 N_STARTUP_TRIALS = 30
-DB_PATH = 'sqlite:///imu-v2.db'
+DB_PATH = 'sqlite:///full-v1.db'
 # ----------------------------------------------------
 
 import optuna
@@ -24,26 +24,34 @@ import shutil
 import json
 import contextlib
 
-# --- 路径定义 ---
-WEIGHT_DIR = train.WEIGHT_DIR
-BEST_MODEL_DIR = os.path.join(WEIGHT_DIR, 'best_trial_models')
-os.makedirs(BEST_MODEL_DIR, exist_ok=True)
+# --- Path Definitions ---
+# The final best models will be saved directly in the main weights directory
+FINAL_WEIGHTS_DIR = train.WEIGHT_DIR
+# Intermediate artifacts for each trial will be stored here and cleaned up later
+TRIAL_ARTIFACTS_DIR = os.path.join(FINAL_WEIGHTS_DIR, 'trial_artifacts')
+LOG_DIR = os.path.join('logs')
+os.makedirs(TRIAL_ARTIFACTS_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
 
 @contextlib.contextmanager
-def suppress_output():
+def manage_output(log_path=None):
     """
-    一个上下文管理器，用于临时抑制所有的 stdout 和 stderr 输出。
+    A context manager to redirect stdout and stderr.
+    If log_path is provided, output is written to that file.
+    Otherwise, it is suppressed.
     """
-    with open(os.devnull, 'w', encoding='utf-8') as devnull:
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = devnull
-        sys.stderr = devnull
-        try:
-            yield
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+    if log_path:
+        target = open(log_path, 'w', encoding='utf-8')
+    else:
+        target = open(os.devnull, 'w', encoding='utf-8')
+    
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = target, target
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+        target.close()
 
 def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
     """
@@ -52,39 +60,40 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
     if study.best_trial.number == trial.number:
         print(f"\nNew best trial found: #{trial.number} with score {trial.value:.4f}. Saving models.")
         
-        # 从 trial 的用户属性中获取 variant，确保与当次试验的配置一致
-        variant = trial.user_attrs.get('variant', 'unknown')
-
-        # 确保最佳模型目录是特定于本次研究的
-        specific_best_model_dir = os.path.join(BEST_MODEL_DIR, study.study_name)
-        os.makedirs(specific_best_model_dir, exist_ok=True)
-
-        # 1. 复制 5 个 fold 的模型文件 (.pth)
+        # --- NEW LOGIC: Copy from trial artifacts to the final weights directory ---
+        # 1. Copy all 5 model folds
         for i in range(1, 6):
-            src_model_path = os.path.join(WEIGHT_DIR, f'model_fold_{i}_{variant}.pth')
-            dst_model_path = os.path.join(specific_best_model_dir, f'model_fold_{i}_{variant}.pth')
-            if os.path.exists(src_model_path):
-                shutil.copy(src_model_path, dst_model_path)
+            src_path = os.path.join(TRIAL_ARTIFACTS_DIR, f'model_fold_{i}_{variant}.pth')
+            dst_path = os.path.join(FINAL_WEIGHTS_DIR, f'model_fold_{i}_{variant}.pth')
+            if os.path.exists(src_path):
+                shutil.copy(src_path, dst_path)
 
-        # 2. 复制 5 个 fold 的 scaler 文件 (.pkl)
+        # 2. Copy all 5 scaler folds
         for i in range(1, 6):
-            src_scaler_path = os.path.join(WEIGHT_DIR, f'scaler_fold_{i}_{variant}.pkl')
-            dst_scaler_path = os.path.join(specific_best_model_dir, f'scaler_fold_{i}_{variant}.pkl')
-            if os.path.exists(src_scaler_path):
-                shutil.copy(src_scaler_path, dst_scaler_path)
-        
-        # 3. 复制全局 label encoder 文件 (.pkl)
-        src_le_path = os.path.join(WEIGHT_DIR, f'label_encoder_{variant}.pkl')
-        dst_le_path = os.path.join(specific_best_model_dir, f'label_encoder_{variant}.pkl')
-        if os.path.exists(src_le_path):
-            shutil.copy(src_le_path, dst_le_path)
-            
-        # 4. 将最佳参数保存到一个 JSON 文件中
-        best_params_path = os.path.join(specific_best_model_dir, 'best_params.json')
+            src_path = os.path.join(TRIAL_ARTIFACTS_DIR, f'scaler_fold_{i}_{variant}.pkl')
+            dst_path = os.path.join(FINAL_WEIGHTS_DIR, f'scaler_fold_{i}_{variant}.pkl')
+            if os.path.exists(src_path):
+                shutil.copy(src_path, dst_path)
+
+        # 3. Copy the global label encoder
+        src_path = os.path.join(TRIAL_ARTIFACTS_DIR, f'label_encoder_{variant}.pkl')
+        dst_path = os.path.join(FINAL_WEIGHTS_DIR, f'label_encoder_{variant}.pkl')
+        if os.path.exists(src_path):
+            shutil.copy(src_path, dst_path)
+
+        # 4. Save the best hyperparameters to a JSON file in the final directory
+        best_params_path = os.path.join(FINAL_WEIGHTS_DIR, 'best_params.json')
         with open(best_params_path, 'w', encoding='utf-8') as f:
             json.dump(trial.params, f, indent=4)
+            
+        # 5. Copy the best trial's log file to the final directory
+        log_dir = os.path.join(LOG_DIR, study.study_name)
+        src_log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
+        dst_log_path = os.path.join(FINAL_WEIGHTS_DIR, 'training_log.log')
+        if os.path.exists(src_log_path):
+            shutil.copy(src_log_path, dst_log_path)
         
-        print(f"Best models and parameters for trial #{trial.number} saved to {specific_best_model_dir}")
+        print(f"Best models and parameters for trial #{trial.number} saved to {FINAL_WEIGHTS_DIR}")
 
 
 def objective(trial: optuna.trial.Trial) -> float:
@@ -123,8 +132,21 @@ def objective(trial: optuna.trial.Trial) -> float:
         scheduler_cfg['factor'] = trial.suggest_float('lr_reduce_factor', 0.2, 0.8, step=0.1)
         scheduler_cfg['patience'] = trial.suggest_int('lr_patience', 5, 15, step=2)
         scheduler_cfg['min_lr'] = trial.suggest_float('min_lr', 1e-7, 1e-5, log=True)
+        scheduler_cfg['warmup_ratio'] = trial.suggest_float('warmup_ratio_plateau', 0.0, 0.2) # Warmup for plateau
+    elif scheduler_type == 'cosine':
+        scheduler_cfg['warmup_ratio'] = trial.suggest_float('warmup_ratio_cosine', 0.0, 0.2)
     cfg.training['scheduler_cfg'] = scheduler_cfg
     # --- End of Scheduler Choice ---
+
+    # --- Discriminative LR multipliers ---
+    lr_mult = {}
+    lr_mult['imu'] = trial.suggest_float('lr_mult_imu', 0.5, 1.5)  # Tune IMU LR multiplier
+    lr_mult['mlp'] = trial.suggest_float('lr_mult_mlp', 1.0, 3.0)
+    if variant == 'full':
+        lr_mult['thm'] = trial.suggest_float('lr_mult_thm', 0.5, 1.5)
+        lr_mult['tof'] = trial.suggest_float('lr_mult_tof', 0.1, 1.0)
+    lr_mult['fusion'] = trial.suggest_float('lr_mult_fusion', 0.1, 2.0)
+    scheduler_cfg['lr_multipliers'] = lr_mult
 
 
     num_imu_layers = trial.suggest_int('num_imu_layers', 2, 4)
@@ -193,48 +215,45 @@ def objective(trial: optuna.trial.Trial) -> float:
             cfg.model['tof_branch_cfg']['lstm_layers'] = trial.suggest_int('tof_lstm_layers', 1, 2)
             cfg.model['tof_branch_cfg']['bidirectional'] = trial.suggest_categorical('tof_bidirectional', [True, False])
 
+        # ===================================================================
+    #          3. 定义 Fusion Head 的搜索空间 (MLP-only)
     # ===================================================================
-    #          3. 定义 Fusion Head 的搜索空间 (支持 MLP 和 Transformer)
-    # ===================================================================
-    fusion_type = trial.suggest_categorical('fusion_type', ['mlp', 'transformer'])
+    # Force MLP fusion and remove Transformer from the search space
+    fusion_type = 'mlp'
     
     for key in ['hidden_dims', 'dropout_rates', 'branch_dims', 'embed_dim', 'num_heads', 'depth', 'dropout']:
         cfg.model['fusion_head_cfg'].pop(key, None)
 
-    if fusion_type == 'mlp':
-        cfg.model['fusion_head_cfg']['type'] = 'FusionHead'
-        num_fusion_layers = trial.suggest_int('mlp_fusion_layers', 1, 3)
-        fusion_hidden_dims = []
-        fusion_dropout_rates = []
-        for i in range(num_fusion_layers):
-            fusion_hidden_dims.append(trial.suggest_int(f'mlp_fusion_hidden_dim_{i}', 32, 512, step=16))
-            fusion_dropout_rates.append(trial.suggest_float(f'mlp_fusion_dropout_{i}', 0.1, 0.5))
-        cfg.model['fusion_head_cfg']['hidden_dims'] = fusion_hidden_dims
-        cfg.model['fusion_head_cfg']['dropout_rates'] = fusion_dropout_rates
+    cfg.model['fusion_head_cfg']['type'] = 'FusionHead'
+    num_fusion_layers = trial.suggest_int('mlp_fusion_layers', 1, 3)
+    fusion_hidden_dims = []
+    fusion_dropout_rates = []
+    for i in range(num_fusion_layers):
+        fusion_hidden_dims.append(trial.suggest_int(f'mlp_fusion_hidden_dim_{i}', 32, 512, step=16))
+        fusion_dropout_rates.append(trial.suggest_float(f'mlp_fusion_dropout_{i}', 0.1, 0.5))
+    cfg.model['fusion_head_cfg']['hidden_dims'] = fusion_hidden_dims
+    cfg.model['fusion_head_cfg']['dropout_rates'] = fusion_dropout_rates
     
-    elif fusion_type == 'transformer':
-        cfg.model['fusion_head_cfg']['type'] = 'TransformerFusionHead'
-        cfg.model['fusion_head_cfg']['embed_dim'] = trial.suggest_int('fusion_embed_dim', 128, 512, step=128)
-        cfg.model['fusion_head_cfg']['num_heads'] = trial.suggest_categorical('fusion_num_heads', [2, 4, 8])
-        cfg.model['fusion_head_cfg']['depth'] = trial.suggest_int('fusion_depth', 1, 3)
-        cfg.model['fusion_head_cfg']['dropout'] = trial.suggest_float('fusion_dropout', 0.1, 0.4)
-        
-        imu_dim = cfg.model['imu_branch_cfg']['filters'][-1]
-        mlp_dim = cfg.model['mlp_branch_cfg']['output_dim']
-        
-        if variant == 'full':
-            thm_dim = cfg.model['thm_branch_cfg']['filters'][-1]
-            tof_dim = cfg.model['tof_branch_cfg']['conv_channels'][-1]
-            branch_dims = [imu_dim, thm_dim, tof_dim, mlp_dim]
-        else: # imu-only
-            branch_dims = [imu_dim, mlp_dim]
-        cfg.model['fusion_head_cfg']['branch_dims'] = branch_dims
-
     try:
         # ===================================================================
         #                          4. 运行训练流程
         # ===================================================================
-        with suppress_output():
+        # Create log directory for the study
+        log_dir = os.path.join(LOG_DIR, study.study_name)
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
+
+        # Write hyperparameters to the top of the log file
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write("="*60 + "\n")
+            f.write(f"TRIAL {trial.number} PARAMETERS\n")
+            f.write("="*60 + "\n")
+            f.write(json.dumps(trial.params, indent=4))
+            f.write("\n\n" + "="*60 + "\n")
+            f.write("TRAINING LOG\n")
+            f.write("="*60 + "\n")
+
+        with manage_output(log_path):
             device = train.setup_device(cfg.environment.get('gpu_id'))
             oof_score, _, _, _ = train.train_kfold_models(
                 epochs=cfg.training['epochs'], patience=cfg.training['patience'],
@@ -244,6 +263,7 @@ def objective(trial: optuna.trial.Trial) -> float:
                 mixup_enabled=cfg.training['mixup_enabled'], mixup_alpha=cfg.training['mixup_alpha'],
                 scheduler_cfg=cfg.training['scheduler_cfg'],
                 device=device, show_stratification=False, loss_function='ce',
+                output_dir=TRIAL_ARTIFACTS_DIR  # IMPORTANT: Save to temp dir
             )
         
         torch.cuda.empty_cache()
@@ -315,5 +335,11 @@ if __name__ == "__main__":
             print(f"    {key}: {value}")
 
     finally:
+        # --- Final Cleanup ---
+        # Clean up the temporary trial artifacts directory after the search is complete
+        if os.path.exists(TRIAL_ARTIFACTS_DIR):
+            shutil.rmtree(TRIAL_ARTIFACTS_DIR)
+            print(f"\nCleaned up temporary artifacts directory: {TRIAL_ARTIFACTS_DIR}")
+
         train.prepare_data_kfold_multimodal = original_prepare_data_func
         print("\nMonkey patch restored. Original functions are back.")

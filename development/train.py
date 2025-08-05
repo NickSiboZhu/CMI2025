@@ -66,7 +66,7 @@ if SUBM_DIR not in sys.path:
     sys.path.insert(0, SUBM_DIR)
 
 # from transformers import get_cosine_schedule_with_warmup
-from utils.scheduler import get_cosine_schedule_with_warmup
+from utils.scheduler import get_cosine_schedule_with_warmup, WarmupAndReduceLROnPlateau
 from utils.focal_loss import FocalLoss
 from utils.registry import build_from_cfg
 from models import MODELS
@@ -338,7 +338,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
         scaler.step(optimizer)
         scaler.update()
         
-        if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+        if scheduler is not None and not isinstance(scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau, WarmupAndReduceLROnPlateau)):
             scheduler.step()
         
         total_loss += loss.item()
@@ -401,11 +401,33 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
+    # --- Discriminative learning rates ---
+    lr_mults = scheduler_cfg.get('lr_multipliers') if scheduler_cfg else None
+    if lr_mults is None:
+        optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
+    else:
+        # Create a list of parameter groups with names for clarity and robustness
+        param_groups = [
+            {'name': 'imu', 'params': model.imu_branch.parameters(), 'lr': start_lr * lr_mults.get('imu', 1.0)},
+        ]
+        
+        # Conditionally add optional branches, maintaining a consistent order
+        if hasattr(model, 'thm_branch') and model.thm_branch is not None:
+            param_groups.append({'name': 'thm', 'params': model.thm_branch.parameters(), 'lr': start_lr * lr_mults.get('thm', 1.0)})
+        
+        if hasattr(model, 'tof_branch') and model.tof_branch is not None:
+            param_groups.append({'name': 'tof', 'params': model.tof_branch.parameters(), 'lr': start_lr * lr_mults.get('tof', 1.0)})
+            
+        param_groups.extend([
+            {'name': 'mlp', 'params': model.mlp_branch.parameters(), 'lr': start_lr * lr_mults.get('mlp', 1.0)},
+            {'name': 'fusion', 'params': model.classifier_head.parameters(), 'lr': start_lr * lr_mults.get('fusion', 1.0)}
+        ])
+
+        optimizer = optim.AdamW(param_groups, lr=start_lr, weight_decay=weight_decay)
 
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
     print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
@@ -417,15 +439,17 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     scheduler = None
     if scheduler_cfg['type'] == 'cosine':
         total_training_steps = epochs * len(train_loader)
-        warmup_steps = int(0.1 * total_training_steps)
+        # Allow warmup_ratio to be configured from scheduler_cfg, default to 0.1
+        warmup_ratio = scheduler_cfg.get('warmup_ratio', 0.1)
+        warmup_steps = int(warmup_ratio * total_training_steps)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=total_training_steps,
         )
-        print("Using Cosine Annealing scheduler with warmup.")
+        print(f"Using Cosine Annealing scheduler with warmup ratio: {warmup_ratio} ({warmup_steps} steps).")
     elif scheduler_cfg['type'] == 'reduce_on_plateau':
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='max', # Step on max validation score
             factor=scheduler_cfg.get('factor', 0.2),
@@ -433,7 +457,15 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
             min_lr=scheduler_cfg.get('min_lr', 1e-6),
             verbose=True
         )
-        print(f"Using ReduceLROnPlateau scheduler (factor={scheduler_cfg.get('factor', 0.2)}, patience={scheduler_cfg.get('patience', 10)}, min_lr={scheduler_cfg.get('min_lr', 1e-6)}).")
+        warmup_ratio = scheduler_cfg.get('warmup_ratio', 0.0)
+        warmup_epochs = int(warmup_ratio * epochs) if warmup_ratio > 0 else 0
+        
+        if warmup_epochs > 0:
+            scheduler = WarmupAndReduceLROnPlateau(optimizer, warmup_epochs, plateau_scheduler)
+            print(f"Using ReduceLROnPlateau with a {warmup_epochs}-epoch linear warmup.")
+        else:
+            scheduler = plateau_scheduler # Use the original scheduler if no warmup
+            print(f"Using standard ReduceLROnPlateau scheduler.")
     
     history = {
         'train_loss': [], 'train_accuracy': [], 'train_competition_score': [],
@@ -457,15 +489,19 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         
         val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
 
-        current_lr = optimizer.param_groups[0]['lr']
+
         
-        # --- NEW: Handle ReduceLROnPlateau step ---
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(val_score)
+        # The new scheduler wrapper handles its own logic, so we just step it.
+        # For cosine scheduler, this is a no-op if no warmup is used.
+        if scheduler is not None:
+             if isinstance(scheduler, WarmupAndReduceLROnPlateau):
+                 scheduler.step(val_score)
+             elif isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                 scheduler.step(val_score)
 
         if val_score > best_val_score:
             best_val_score = val_score
-            ckpt_name = os.path.join(WEIGHT_DIR, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
+            ckpt_name = os.path.join(output_dir, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
             torch.save(model.state_dict(), ckpt_name)
             patience_counter = 0
             print(f"   🚀 New best val score: {best_val_score:.4f}. Model saved.")
@@ -478,20 +514,31 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         history['val_loss'].append(val_loss)
         history['val_accuracy'].append(val_acc)
         history['val_competition_score'].append(val_score)
-        history['learning_rate'].append(current_lr)
+        current_lrs = [g['lr'] for g in optimizer.param_groups]
+        history['learning_rate'].append(current_lrs)
         
         epoch_time = time.time() - start_time
+        
+        # --- Learning Rate Logging ---
+        # Check if discriminative LRs are used by inspecting the first param group for a 'name'
+        if 'name' not in optimizer.param_groups[0]:
+            lr_info = f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        else:
+            # Build LR string from named parameter groups for robustness
+            active_lrs = {group['name']: group['lr'] for group in optimizer.param_groups}
+            lr_info = "LRs: " + ", ".join([f"{k}={v:.2e}" for k, v in active_lrs.items()])
+
         
         print(f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): '
               f'Train Loss: {train_loss:.4f}, Train Score: {train_score:.4f} | '
               f'Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | '
-              f'LR: {current_lr:.6f}')
+              f'{lr_info}')
         
         if patience_counter >= patience:
             print(f'Early stopping at epoch {epoch+1} as validation score did not improve for {patience} epochs.')
             break
     
-    ckpt_name = os.path.join(WEIGHT_DIR, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
+    ckpt_name = os.path.join(output_dir, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
     if os.path.exists(ckpt_name):
         model.load_state_dict(torch.load(ckpt_name))
         os.remove(ckpt_name)
@@ -501,11 +548,14 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None):
+def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
     print("="*60)
+    
+    # Ensure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
     
     # Setup device
     if device is None:
@@ -661,7 +711,8 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             # MODIFIED: Pass mixup parameters down
             mixup_enabled=mixup_enabled,
             mixup_alpha=mixup_alpha,
-            scheduler_cfg=scheduler_cfg
+            scheduler_cfg=scheduler_cfg,
+            output_dir=output_dir  # Pass output_dir to train_model
         )
         
         # Evaluate model and capture predictions for OOF
@@ -675,7 +726,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
         best_val_score = max(history['val_competition_score'])
         
         # Save model for this fold
-        model_filename = os.path.join(WEIGHT_DIR, f'model_fold_{fold_idx + 1}_{variant}.pth')
+        model_filename = os.path.join(output_dir, f'model_fold_{fold_idx + 1}_{variant}.pth')
         checkpoint = {
             'state_dict': model.state_dict(),
             'model_cfg': model_cfg
@@ -685,7 +736,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
 
         # ------------------ NEW: Save scaler for this fold ------------------
         scaler_fold = fold['scaler']
-        scaler_filename = os.path.join(WEIGHT_DIR, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
+        scaler_filename = os.path.join(output_dir, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
         with open(scaler_filename, 'wb') as sf:
             pickle.dump(scaler_fold, sf)
         print(f"Scaler saved as '{scaler_filename}'")
@@ -703,7 +754,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
         print(f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
     
     # ------------------ NEW: Save global label encoder ------------------
-    le_filename = os.path.join(WEIGHT_DIR, f'label_encoder_{variant}.pkl')
+    le_filename = os.path.join(output_dir, f'label_encoder_{variant}.pkl')
     with open(le_filename, 'wb') as lf:
         pickle.dump(label_encoder, lf)
     print(f"Label encoder saved as '{le_filename}'")
@@ -732,9 +783,9 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
         'best_fold_score': float(best_scores[best_fold_idx])
     }
     
-    with open(os.path.join(WEIGHT_DIR, f'kfold_summary_{variant}.json'), 'w') as f:
+    with open(os.path.join(output_dir, f'kfold_summary_{variant}.json'), 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f"Summary saved to 'development/outputs/kfold_summary_{variant}.json'")
+    print(f"Summary saved to '{os.path.join(output_dir, f'kfold_summary_{variant}.json')}'")
     
     # Compute overall OOF competition score
     oof_comp_score = competition_metric(oof_targets, oof_preds, label_encoder)
@@ -746,7 +797,7 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
         'gesture_true': label_encoder.inverse_transform(oof_targets),
         'gesture_pred': label_encoder.inverse_transform(oof_preds),
     })
-    oof_path = os.path.join(WEIGHT_DIR, f'oof_predictions_{variant}.csv')
+    oof_path = os.path.join(output_dir, f'oof_predictions_{variant}.csv')
     oof_df.to_csv(oof_path, index=False)
     print(f"OOF predictions saved to '{oof_path}'")
     
@@ -802,10 +853,20 @@ def main():
     # --- NEW: Print scheduler config ---
     print(f"  Scheduler Config: {scheduler_cfg}")
     
+    # Print discriminative learning rates if configured
+    lr_mults = scheduler_cfg.get('lr_multipliers') if scheduler_cfg else None
+    if lr_mults is not None:
+        print(f"  Discriminative Learning Rates:")
+        print(f"    - IMU: {start_lr * lr_mults.get('imu', 1.0):.2e}")
+        print(f"    - THM: {start_lr * lr_mults.get('thm', 1.0):.2e}")
+        print(f"    - TOF: {start_lr * lr_mults.get('tof', 1.0):.2e}")
+        print(f"    - MLP: {start_lr * lr_mults.get('mlp', 1.0):.2e}")
+        print(f"    - Fusion: {start_lr * lr_mults.get('fusion', 1.0):.2e}")
+    
     # Setup device
     device = setup_device(gpu_id)
     
-    # Train models using config
+    # Train models using config, using the default output directory
     oof_score, fold_models, fold_histories, fold_results = train_kfold_models(
         epochs=epochs,
         patience=patience,
@@ -822,7 +883,8 @@ def main():
         model_cfg=cfg.model,
         mixup_enabled=mixup_enabled,
         mixup_alpha=mixup_alpha,
-        scheduler_cfg=scheduler_cfg
+        scheduler_cfg=scheduler_cfg,
+        output_dir=WEIGHT_DIR  # Explicitly pass the default
     )
     
     print("✅ Config-driven training completed!")
