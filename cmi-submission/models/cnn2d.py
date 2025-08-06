@@ -171,7 +171,7 @@ class TOF2DCNN(nn.Module):
         for i, (out_c, k) in enumerate(zip(conv_channels, kernel_sizes)):
             # Create conv block
             conv_block = nn.Sequential(
-                nn.Conv2d(in_channels, out_c, kernel_size=k, padding=k//2 if k > 2 else 0),
+                nn.Conv2d(in_channels, out_c, kernel_size=k, padding='same'),
                 nn.BatchNorm2d(out_c),
                 nn.ReLU()
             )
