@@ -147,10 +147,12 @@ class TOF2DCNN(nn.Module):
     """
     
     def __init__(self, input_channels=5, out_features=128, 
-                 conv_channels=None, kernel_sizes=None):
+                 conv_channels=None, kernel_sizes=None,
+                 use_residual=False):
         super(TOF2DCNN, self).__init__()
         
         self.input_channels = input_channels
+        self.use_residual = use_residual
         # Note: out_features parameter kept for compatibility, but actual output
         # will be determined by the last conv channel
         
@@ -161,18 +163,30 @@ class TOF2DCNN(nn.Module):
             kernel_sizes = [3, 3, 2]
         assert len(conv_channels) == len(kernel_sizes), "conv_channels and kernel_sizes length mismatch"
 
-        layers = []
-        in_channels = input_channels  # Initialize with input_channels parameter
+        # Build conv layers manually for residual connections
+        self.conv_blocks = nn.ModuleList()
+        self.residual_projections = nn.ModuleList()
+        
+        in_channels = input_channels
         for i, (out_c, k) in enumerate(zip(conv_channels, kernel_sizes)):
-            layers.append(nn.Conv2d(in_channels, out_c, kernel_size=k, padding=k//2 if k > 2 else 0))
-            layers.append(nn.BatchNorm2d(out_c))
-            layers.append(nn.ReLU())
-            # Only add MaxPool2d for first layers, avoid over-pooling small spatial dimensions
-            if i < len(conv_channels) - 1:  # Don't pool on the last layer
-                layers.append(nn.MaxPool2d(2)) # 2x2 max pool
+            # Create conv block
+            conv_block = nn.Sequential(
+                nn.Conv2d(in_channels, out_c, kernel_size=k, padding=k//2 if k > 2 else 0),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU()
+            )
+            self.conv_blocks.append(conv_block)
+            
+            # Add residual projection if needed
+            if use_residual and in_channels != out_c:
+                self.residual_projections.append(nn.Conv2d(in_channels, out_c, kernel_size=1))
+            else:
+                self.residual_projections.append(None)
+            
             in_channels = out_c
         
-        self.conv_layers = nn.Sequential(*layers)
+        self.conv_channels = conv_channels
+        self.pool = nn.MaxPool2d(2)
         self.last_conv_channels = conv_channels[-1]
         
         # Global average pooling to get fixed-size output
@@ -193,7 +207,7 @@ class TOF2DCNN(nn.Module):
     
     def forward(self, tof_grids):
         """
-        Forward pass for TOF 2D CNN.
+        Forward pass for TOF 2D CNN with optional residual connections.
         
         Args:
             tof_grids: Tensor of shape (batch_size, num_sensors, 8, 8)
@@ -202,17 +216,32 @@ class TOF2DCNN(nn.Module):
         Returns:
             Tensor of shape (batch_size, last_conv_channels)
         """
-        # Process through 2D convolutions
-        x = self.conv_layers(tof_grids)  # (batch, last_conv_channels, H, W)
+        x = tof_grids
+        
+        # Process through conv blocks with optional residual connections
+        for i, conv_block in enumerate(self.conv_blocks):
+            if self.use_residual:
+                residual = x
+            
+            # Apply conv block
+            x = conv_block(x)
+            
+            # Apply residual connection if enabled
+            if self.use_residual:
+                if self.residual_projections[i] is not None:
+                    # Project residual to match output dimensions
+                    residual = self.residual_projections[i](residual)
+                x = x + residual
+            
+            # Apply pooling (except for last layer)
+            if i < len(self.conv_blocks) - 1:
+                x = self.pool(x)
         
         # Global pooling
         x = self.global_pool(x)  # (batch, last_conv_channels, 1, 1)
         
         # Flatten to get feature vector
         x = x.view(x.size(0), -1)  # (batch, last_conv_channels)
-        
-        # COMMENTED OUT: Direct CNN features without projection
-        # x = self.projection(x)  # (batch, out_features)
         
         return x
     
@@ -266,7 +295,9 @@ class TemporalTOF2DCNN(nn.Module):
                  # LSTM parameters
                  lstm_hidden=256, lstm_layers=2, bidirectional=True,
                  # Transformer parameters
-                 num_heads=8, num_layers=2, ff_dim=512, dropout=0.1):
+                 num_heads=8, num_layers=2, ff_dim=512, dropout=0.1,
+                 # NEW: Residual connections
+                 use_residual=False):
         super(TemporalTOF2DCNN, self).__init__()
 
         self.input_channels = input_channels
@@ -278,7 +309,7 @@ class TemporalTOF2DCNN(nn.Module):
 
         # ------------- Spatial CNN applied per-frame -------------
         self.spatial_cnn = TOF2DCNN(input_channels, out_features,
-                                    conv_channels, kernel_sizes)
+                                    conv_channels, kernel_sizes, use_residual)
         
         # Get the actual output dimension from spatial CNN
         self.spatial_out_dim = self.spatial_cnn.out_features

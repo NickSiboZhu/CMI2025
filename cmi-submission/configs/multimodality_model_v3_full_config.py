@@ -20,7 +20,14 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[7, 5, 3]
+        kernel_sizes=[7, 5, 3],
+        # NEW: Temporal aggregation options
+        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
+        temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
+        lstm_hidden=128,
+        bidirectional=False,
+        # NEW: ResNet-style residual connections
+        use_residual=True
     ),
 
     # THM branch (thermopile sensors)
@@ -29,7 +36,14 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[32, 64, 128],           # different architecture for THM
-        kernel_sizes=[5, 5, 3]
+        kernel_sizes=[5, 5, 3],
+        # NEW: Temporal aggregation options
+        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
+        temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
+        lstm_hidden=128,
+        bidirectional=False,
+        # NEW: ResNet-style residual connections
+        use_residual=True
     ),
 
     # TOF 2D CNN branch config
@@ -45,6 +59,8 @@ model = dict(
         lstm_hidden=128,
         lstm_layers=1,
         bidirectional=False,
+        # NEW: ResNet-style residual connections for spatial CNN
+        use_residual=True
     ),
 
     # MLP branch blueprint
@@ -72,7 +88,7 @@ model = dict(
 training = dict(
     epochs=100,
     patience=15,
-    start_lr=1e-3,
+    # start_lr is no longer used; learning rates are defined per-layer below
     weight_decay=1e-2,
     use_amp=False, 
     mixup_enabled=True,
@@ -90,13 +106,13 @@ training = dict(
         min_lr=1e-6,  # Minimum learning rate
         warmup_ratio=0.1, # 10% of total epochs for warmup before plateau scheduler takes over
 
-        # --- Discriminative Learning Rates ---
-        lr_multipliers=dict(
-            imu=1.0,
-            thm=1.0,
-            tof=0.5,
-            mlp=2.0,
-            fusion=0.5,
+        # --- NEW: Specific Learning Rates per Branch ---
+        layer_lrs=dict(
+            imu=1e-3,
+            thm=1e-3,
+            tof=5e-4,
+            mlp=2e-3,
+            fusion=2e-3,
         )
     ),
 )

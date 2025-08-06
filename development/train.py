@@ -401,33 +401,50 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     return avg_loss, accuracy, comp_score, all_preds, all_targets
 
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, start_lr=0.001, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
-    # --- Discriminative learning rates ---
-    lr_mults = scheduler_cfg.get('lr_multipliers') if scheduler_cfg else None
-    if lr_mults is None:
-        optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
-    else:
-        # Create a list of parameter groups with names for clarity and robustness
-        param_groups = [
-            {'name': 'imu', 'params': model.imu_branch.parameters(), 'lr': start_lr * lr_mults.get('imu', 1.0)},
-        ]
-        
-        # Conditionally add optional branches, maintaining a consistent order
-        if hasattr(model, 'thm_branch') and model.thm_branch is not None:
-            param_groups.append({'name': 'thm', 'params': model.thm_branch.parameters(), 'lr': start_lr * lr_mults.get('thm', 1.0)})
-        
-        if hasattr(model, 'tof_branch') and model.tof_branch is not None:
-            param_groups.append({'name': 'tof', 'params': model.tof_branch.parameters(), 'lr': start_lr * lr_mults.get('tof', 1.0)})
-            
-        param_groups.extend([
-            {'name': 'mlp', 'params': model.mlp_branch.parameters(), 'lr': start_lr * lr_mults.get('mlp', 1.0)},
-            {'name': 'fusion', 'params': model.classifier_head.parameters(), 'lr': start_lr * lr_mults.get('fusion', 1.0)}
-        ])
 
-        optimizer = optim.AdamW(param_groups, lr=start_lr, weight_decay=weight_decay)
+    # --- NEW: Optimizer setup with specific layer learning rates ---
+    layer_lrs = scheduler_cfg.get('layer_lrs') if scheduler_cfg else None
+    
+    if layer_lrs:
+        print("Using discriminative learning rates per layer.")
+        param_groups = []
+        
+        # Define all possible branches and their LR keys
+        branch_map = {
+            'imu': model.imu_branch,
+            'thm': getattr(model, 'thm_branch', None),
+            'tof': getattr(model, 'tof_branch', None),
+            'mlp': model.mlp_branch,
+            'fusion': model.classifier_head
+        }
+        
+        # Create parameter groups for active branches
+        for name, branch in branch_map.items():
+            if branch is not None:
+                if name in layer_lrs:
+                    param_groups.append({
+                        'name': name,
+                        'params': branch.parameters(),
+                        'lr': layer_lrs[name]
+                    })
+                else:
+                    # This is a safeguard. If a branch exists but its LR is not specified, raise an error.
+                    raise ValueError(f"Learning rate for active branch '{name}' not specified in 'layer_lrs'.")
+        
+        # The base LR for AdamW can be anything, as each group has its own LR.
+        # It's good practice to set it to a reasonable default, though it won't be used for these groups.
+        optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+
+    else:
+        # Fallback for backward compatibility or simple training runs
+        print("Using a single learning rate for the entire model.")
+        # Attempt to get start_lr from training_cfg, with a default.
+        start_lr = scheduler_cfg.get('start_lr', 1e-3) if scheduler_cfg else 1e-3
+        optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
 
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
     print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
@@ -548,7 +565,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
 
-def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
+def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -701,7 +718,6 @@ def train_kfold_models(epochs=50, start_lr=0.001, weight_decay=1e-2, batch_size=
             label_encoder=label_encoder,
             epochs=epochs,
             patience=patience,
-            start_lr=start_lr,
             weight_decay=weight_decay,
             use_amp=use_amp,
             device=device,
@@ -819,7 +835,6 @@ def main():
     # Extract parameters from config
     epochs = cfg.training.get('epochs', 50)
     patience = cfg.training.get('patience', 15)
-    start_lr = cfg.training.get('start_lr', 0.001)
     weight_decay = cfg.training.get('weight_decay', 1e-2)
     batch_size = cfg.data.get('batch_size', 32)
     use_amp = cfg.training.get('use_amp', True)
@@ -837,7 +852,6 @@ def main():
     print(f"\nTraining Configuration from {args.config}:")
     print(f"  Epochs: {epochs}")
     print(f"  Batch Size: {batch_size}")
-    print(f"  Learning Rate: {start_lr}")
     print(f"  Weight Decay: {weight_decay}")
     print(f"  Use AMP: {use_amp}")
     print(f"  Patience: {patience}")
@@ -853,15 +867,12 @@ def main():
     # --- NEW: Print scheduler config ---
     print(f"  Scheduler Config: {scheduler_cfg}")
     
-    # Print discriminative learning rates if configured
-    lr_mults = scheduler_cfg.get('lr_multipliers') if scheduler_cfg else None
-    if lr_mults is not None:
-        print(f"  Discriminative Learning Rates:")
-        print(f"    - IMU: {start_lr * lr_mults.get('imu', 1.0):.2e}")
-        print(f"    - THM: {start_lr * lr_mults.get('thm', 1.0):.2e}")
-        print(f"    - TOF: {start_lr * lr_mults.get('tof', 1.0):.2e}")
-        print(f"    - MLP: {start_lr * lr_mults.get('mlp', 1.0):.2e}")
-        print(f"    - Fusion: {start_lr * lr_mults.get('fusion', 1.0):.2e}")
+    # Print layer-specific learning rates if configured
+    layer_lrs = scheduler_cfg.get('layer_lrs') if scheduler_cfg else None
+    if layer_lrs is not None:
+        print(f"  Layer-Specific Learning Rates:")
+        for layer_name, lr_value in layer_lrs.items():
+            print(f"    - {layer_name.upper()}: {lr_value:.2e}")
     
     # Setup device
     device = setup_device(gpu_id)
@@ -871,7 +882,6 @@ def main():
         epochs=epochs,
         patience=patience,
         batch_size=batch_size,
-        start_lr=start_lr,
         weight_decay=weight_decay,
         use_amp=use_amp,
         show_stratification=args.stratification,

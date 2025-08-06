@@ -20,7 +20,14 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[7, 5, 3]
+        kernel_sizes=[7, 5, 3],
+        # NEW: Temporal aggregation options
+        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
+        temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
+        lstm_hidden=128,
+        bidirectional=False,
+        # NEW: ResNet-style residual connections
+        use_residual=True
     ),
 
     # MLP branch blueprint (same as full)
@@ -48,7 +55,7 @@ model = dict(
 training = dict(
     epochs=100,
     patience=15,
-    start_lr=1e-3,
+    # start_lr is no longer used; learning rates are defined per-layer below
     weight_decay=1e-2,
     use_amp=False, 
     mixup_enabled=True,
@@ -65,16 +72,12 @@ training = dict(
         patience=5,   # Epochs to wait for improvement before reducing LR
         min_lr=1e-6,  # Minimum learning rate
         warmup_ratio=0.1, # Optional warmup for ReduceLROnPlateau
-
-        # --- Settings for 'cosine' (if you switch to it) ---
-        # warmup_ratio=0.1,  # Fraction of total steps for warmup (0.0-0.3 recommended)
         
-        # --- Discriminative Learning Rates for IMU-Only Model ---
-        # Multipliers for different model parts. Only active branches are needed.
-        lr_multipliers=dict(
-            imu=1.0,     # IMU branch learning rate multiplier
-            mlp=2.0,     # MLP branch learning rate multiplier
-            fusion=1.0,  # Fusion head learning rate multiplier
+        # --- NEW: Specific Learning Rates per Branch ---
+        layer_lrs=dict(
+            imu=1e-3,
+            mlp=2e-3,
+            fusion=2e-3,
         )
     ),
 )
