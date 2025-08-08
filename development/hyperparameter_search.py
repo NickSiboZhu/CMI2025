@@ -18,7 +18,7 @@ import train
 
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
-CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
+CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
 # 你想要运行的试验次数
 N_TRIALS = 100
 # 初始随机搜索的次数

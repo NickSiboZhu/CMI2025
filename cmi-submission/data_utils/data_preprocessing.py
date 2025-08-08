@@ -10,6 +10,48 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 from scipy.spatial.transform import Rotation as R
 import warnings
+from scipy import signal
+
+def generate_spectrogram(ts_data, fs=10.0, nperseg=16, noverlap=8, max_length=100):
+    """
+    从时序信号生成对数功率谱图。
+    MODIFIED: 动态计算输出形状，以支持可变的STFT参数。
+    """
+    # 确保参数有效，防止 STFT 报错
+    if noverlap >= nperseg:
+        # 如果重叠大于或等于窗口大小，这是无效的，将其设置为一个合理的值
+        noverlap = nperseg // 2
+
+    # --- 动态计算输出形状 ---
+    # 获取STFT输出维度的最可靠方法是，对一个期望长度的零向量运行一次虚拟变换。
+    # 由于您的预处理流程确保了输入信号长度总是 max_length，我们可以这样做：
+    _, t_dummy, _ = signal.stft(np.zeros(max_length), fs=fs, nperseg=nperseg, noverlap=noverlap)
+    
+    # 从虚拟变换的结果中获取正确的维度
+    expected_time_bins = t_dummy.shape[0]
+    freq_bins = nperseg // 2 + 1 # 这是STFT的固定输出
+
+    # --- 处理空信号 ---
+    if ts_data is None or len(ts_data) == 0:
+        # 返回一个具有正确动态形状的零矩阵
+        return np.zeros((freq_bins, expected_time_bins), dtype=np.float32)
+    
+    # --- 处理真实信号 ---
+    # 此时，ts_data 应该已经被填充或截断为 max_length
+    f, t, Zxx = signal.stft(ts_data, fs=fs, nperseg=nperseg, noverlap=noverlap)
+    
+    # （可选，但推荐）一个健全性检查，确保真实输出和预期输出的形状一致
+    if t.shape[0] != expected_time_bins:
+        # 如果由于某些边缘情况导致长度不匹配，可以通过插值或填充来强制统一
+        # 但在您的流程中，因为输入长度固定，通常不会发生这种情况。
+        # 这里我们只加一个断言来捕获潜在问题。
+        assert t.shape[0] == expected_time_bins, \
+            f"Time bins mismatch! Expected {expected_time_bins}, but got {t.shape[0]}. " \
+            f"Params: nperseg={nperseg}, noverlap={noverlap}, len={len(ts_data)}"
+
+    log_spectrogram = np.log1p(np.abs(Zxx))
+    
+    return log_spectrogram.astype(np.float32)
 
 def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -95,20 +137,16 @@ def _calculate_angular_distance_polars(group_df: pl.DataFrame) -> pl.DataFrame:
 def feature_engineering(train_df: pd.DataFrame): 
     """ 
     Applies the full feature engineering pipeline.
-    MODIFIED: Uses Polars internally with optimized helper functions for a massive speedup,
-    while keeping the public interface (input/output) unchanged (still pandas).
+    MODIFIED: Removed Jerk and Snap calculations as they are being replaced by spectrograms.
     """ 
     print("\nApplying advanced feature engineering (with Polars backend)...")
 
     # --- 步骤 1: 从 Pandas 转换为 Polars ---
-    # 保存原始索引，以便最后恢复
     original_index = train_df.index
     pl_df = pl.from_pandas(train_df)
-
     cols_to_process = [c for c in pl_df.columns if c.startswith('acc_') or c.startswith('rot_')]
 
     # --- 步骤 2: 使用 Polars 表达式进行高性能计算 ---
-    # 初始 NaN 处理和四元数修正
     pl_df = pl_df.with_columns(
         pl.col(cols_to_process).interpolate().over('sequence_id').fill_null(0.0)
     ).with_columns(
@@ -118,57 +156,35 @@ def feature_engineering(train_df: pd.DataFrame):
           .alias('rot_w')
     )
 
-    print("Calculating engineered features...")
-    # 计算基础特征及其导数
+    print("Calculating engineered features (excluding jerk/snap)...")
+    # 计算基础特征
     pl_df = pl_df.with_columns(
         (pl.col('acc_x')**2 + pl.col('acc_y')**2 + pl.col('acc_z')**2).sqrt().alias('acc_mag'),
         (2 * pl.col('rot_w').clip(-1, 1).arccos()).alias('rot_angle'),
-    ).with_columns(
-        pl.col('acc_mag').diff().over('sequence_id').alias('acc_mag_jerk'),
-        pl.col('rot_angle').diff().over('sequence_id').alias('rot_angle_vel'),
     )
 
     # --- 步骤 3: 使用 map_groups 高效调用新的 Polars 辅助函数 ---
-    
-    # 计算线性加速度
     linear_accel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_remove_gravity_from_acc_polars)
     pl_df = pl.concat([pl_df, linear_accel_results], how='horizontal')
-    
     pl_df = pl_df.with_columns(
         (pl.col('linear_acc_x')**2 + pl.col('linear_acc_y')**2 + pl.col('linear_acc_z')**2).sqrt().alias('linear_acc_mag')
-    ).with_columns(
-        pl.col('linear_acc_mag').diff().over('sequence_id').alias('linear_acc_mag_jerk')
     )
 
-    # 计算角速度
     angular_vel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_velocity_from_quat_polars)
     pl_df = pl.concat([pl_df, angular_vel_results], how='horizontal')
-    
-    # 计算角速度的导数 (Jerk, Snap)
-    pl_df = pl_df.with_columns(
-        pl.col(['angular_vel_x', 'angular_vel_y', 'angular_vel_z']).diff().over('sequence_id').name.suffix('_jerk')
-    ).rename({
-        "angular_vel_x_jerk": "angular_jerk_x", "angular_vel_y_jerk": "angular_jerk_y", "angular_vel_z_jerk": "angular_jerk_z"
-    })
-    pl_df = pl_df.with_columns(
-        pl.col(['angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z']).diff().over('sequence_id').name.suffix('_snap')
-    ).rename({
-        "angular_jerk_x_snap": "angular_snap_x", "angular_jerk_y_snap": "angular_snap_y", "angular_jerk_z_snap": "angular_snap_z"
-    })
 
-    # 计算角距离
     angular_dist_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_distance_polars)
     pl_df = pl.concat([pl_df, angular_dist_results], how='horizontal')
     
     # --- 步骤 4: 定义最终特征列并进行最终清理 ---
+    # --- MODIFIED: Removed jerk and snap features from the list ---
     final_feature_cols = [ 
-        'acc_x', 'acc_y', 'acc_z', 'rot_w', 'rot_x', 'rot_y', 'rot_z',  
-        'acc_mag', 'rot_angle', 'acc_mag_jerk', 'rot_angle_vel',  
+        'rot_w', 'rot_x', 'rot_y', 'rot_z',  
+        'acc_mag', 'rot_angle',
         'linear_acc_x', 'linear_acc_y', 'linear_acc_z',  
-        'linear_acc_mag', 'linear_acc_mag_jerk',  
+        'linear_acc_mag',
         'angular_vel_x', 'angular_vel_y', 'angular_vel_z',  
-        'angular_distance', 'angular_jerk_x', 'angular_jerk_y', 'angular_jerk_z', 
-        'angular_snap_x', 'angular_snap_y', 'angular_snap_z' 
+        'angular_distance'
     ] 
     tof_thm_cols = [c for c in pl_df.columns if c.startswith('tof_') or c.startswith('thm_')] 
     final_feature_cols.extend(tof_thm_cols) 
@@ -181,9 +197,9 @@ def feature_engineering(train_df: pd.DataFrame):
     
     print(f"Generated {len(final_feature_cols)} features after engineering.")
 
-    # --- 步骤 5: 从 Polars 转换回 Pandas，恢复原始接口 ---
+    # --- 步骤 5: 从 Polars 转换回 Pandas ---
     final_pandas_df = pl_df.to_pandas()
-    final_pandas_df.index = original_index # 恢复原始索引，确保DataFrame结构完全一致
+    final_pandas_df.index = original_index
 
     return final_pandas_df, final_feature_cols
 
@@ -493,27 +509,29 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
 
 def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str="full", n_splits: int=5):
     """
-    Prepare K-Fold data for multimodal architecture *with THM separated by default*.
-    The pipeline: Split → Normalize → Pad, and returns numpy arrays ready for the
-    `MultimodalDataset` (IMU + THM + TOF + STATIC).
+    为多模态架构准备K-Fold数据。
+
+    此版本包含的核心功能:
+    1.  为每个折叠的训练集计算全局频谱图统计量 (均值/标准差)。
+    2.  健壮地处理任意长度的序列 (过长则截断，过短则填充)。
+    3.  返回所有模态的数据，包括为2D CNN准备的频谱图。
     """
-    # 1. Load and preprocess full data
+    # 1. 加载并进行基础预处理 (包括特征工程)
     all_data_df, label_encoder, all_feature_cols = load_and_preprocess_data(variant)
 
-    # 2. Identify columns for each modality dynamically
+    # 2. 动态识别各模态的列名
     static_cols = [c for c in STATIC_FEATURE_COLS if c in all_data_df.columns]
-    
-    # Dynamically detect THM and TOF columns from actual data
     thm_cols, tof_cols = generate_feature_columns(all_data_df.columns)
-    thm_cols = [c for c in thm_cols if c in all_feature_cols]  # Only keep engineered features
+    thm_cols = [c for c in thm_cols if c in all_feature_cols]
     tof_cols = [c for c in tof_cols if c in all_feature_cols]
+    imu_cols = [c for c in all_feature_cols if c not in static_cols and c not in tof_cols and c not in thm_cols]
     
-    # Non-TOF feature union (IMU + THM).  This is what the new pipeline expects.
-    non_tof_cols = [c for c in all_feature_cols if c not in static_cols and c not in tof_cols]
-    # Keep IMU-only list too (currently unused) in case of future need.
-    imu_cols = [c for c in non_tof_cols if c not in thm_cols]
+    # 定义用于生成频谱图的源信号列
+    spec_source_cols = ['linear_acc_x', 'linear_acc_y', 'linear_acc_z', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z']
+    spec_source_cols = [c for c in spec_source_cols if c in all_data_df.columns]
+    print(f"Generating spectrograms from {len(spec_source_cols)} source signals.")
 
-    # 3. Prepare stratified group k-fold
+    # 3. 准备分层分组K折交叉验证
     labels_map_df    = all_data_df[["sequence_id", "gesture_encoded", "subject"]].drop_duplicates().reset_index(drop=True)
     y                = labels_map_df["gesture_encoded"].values
     subjects         = labels_map_df["subject"].values
@@ -522,7 +540,8 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
     sgkf        = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
     fold_data   = []
 
-    print(f"\nPreparing {n_splits}-fold splits with THM branch separated …")
+    print(f"\nPreparing {n_splits}-fold splits with Spectrogram branch...")
+    max_length = 100 # 定义所有序列处理的统一长度
 
     for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(np.zeros(len(unique_seq_ids)), y, groups=subjects)):
         print(f"\n--- Fold {fold_idx+1}/{n_splits} ---")
@@ -535,73 +554,106 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
         y_train = labels_map_df[labels_map_df["sequence_id"].isin(train_sids)]["gesture_encoded"].values
         y_val   = labels_map_df[labels_map_df["sequence_id"].isin(val_sids)]["gesture_encoded"].values
 
-        # 4. Normalization (ColumnTransformer) BEFORE padding
+        # 4. 标准化 (在padding和生成频谱图之前)
         X_train_norm, X_val_norm, scaler_fold = normalize_features(train_df[all_feature_cols], val_df[all_feature_cols])
         X_train_norm["sequence_id"] = train_df["sequence_id"]
         X_val_norm["sequence_id"]   = val_df["sequence_id"]
 
-        # Create DataFrame aliases expected by the downstream (non-TOF) branch code
-        X_train_norm_df = X_train_norm
-        X_val_norm_df   = X_val_norm
-
-        # 5. ✨ 在标准化之后，分离多模态数据并进行 Padding
-        max_length = 100
+        # 5. 计算该折叠训练集的全局频谱图统计量
+        print("Calculating global spectrogram statistics for this fold's training set...")
+        all_train_specs_for_fold = []
+        for sid in train_sids:
+            group = X_train_norm.loc[X_train_norm['sequence_id'] == sid]
+            for col in spec_source_cols:
+                # 使用健壮的逻辑处理序列长度
+                signal_1d = group[col].values
+                seq_len = len(signal_1d)
+                if seq_len >= max_length:
+                    padded_signal = signal_1d[-max_length:]
+                else:
+                    padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
+                
+                spec = generate_spectrogram(padded_signal)
+                all_train_specs_for_fold.append(spec)
         
-        # 处理训练集
-        # 1. 一次性按 'sequence_id' 对 DataFrame 进行分组
-        grouped_train = X_train_norm_df.groupby('sequence_id')
+        stacked_specs = np.stack(all_train_specs_for_fold, axis=0)
+        global_spec_mean = np.mean(stacked_specs)
+        global_spec_std = np.std(stacked_specs)
+        print(f"  Global Spec Mean: {global_spec_mean:.4f}, Global Spec Std: {global_spec_std:.4f}")
+        spec_stats = {'mean': global_spec_mean, 'std': global_spec_std}
 
-        train_static_list, train_imu_list, train_thm_list, train_tof_list = [], [], [], []
+        # 6. 分离多模态数据, padding时域数据, 并生成频谱图
+        # --- 处理训练集 ---
+        grouped_train = X_train_norm.groupby('sequence_id')
+        train_static_list, train_imu_list, train_thm_list, train_tof_list, train_spec_list = [], [], [], [], []
 
-        # 2. 遍历 train_sids，并使用 .get_group() 快速提取数据
-        # .get_group() 是一个高效的哈希查找操作，速度非常快
         for sid in train_sids:
             group = grouped_train.get_group(sid)
             train_static_list.append(group[static_cols].iloc[0].values)
             train_imu_list.append(group[imu_cols].values)
             train_thm_list.append(group[thm_cols].values)
             train_tof_list.append(group[tof_cols].values)
+            
+            sequence_spectrograms = []
+            for col in spec_source_cols:
+                signal_1d = group[col].values
+                seq_len = len(signal_1d)
+                if seq_len >= max_length:
+                    padded_signal = signal_1d[-max_length:]
+                else:
+                    padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
+                spec = generate_spectrogram(padded_signal)
+                sequence_spectrograms.append(spec)
+            train_spec_list.append(np.stack(sequence_spectrograms, axis=0))
 
         X_train_static = np.array(train_static_list, dtype=np.float32)
-        X_train_imu, train_imu_mask = pad_sequences(train_imu_list, max_length=max_length)
-        X_train_thm, train_thm_mask = pad_sequences(train_thm_list, max_length=max_length)
-        X_train_tof, train_tof_mask = pad_sequences(train_tof_list, max_length=max_length)
-        # Use IMU mask as the primary mask (all should be same since same sequence lengths)
-        train_mask = train_imu_mask
+        X_train_imu, train_mask = pad_sequences(train_imu_list, max_length=max_length)
+        X_train_thm, _ = pad_sequences(train_thm_list, max_length=max_length)
+        X_train_tof, _ = pad_sequences(train_tof_list, max_length=max_length)
+        X_train_spec = np.array(train_spec_list, dtype=np.float32)
 
-        # 处理验证集
-        val_static_list, val_imu_list, val_thm_list, val_tof_list = [], [], [], []
+        # --- 处理验证集 ---
+        grouped_val = X_val_norm.groupby('sequence_id')
+        val_static_list, val_imu_list, val_thm_list, val_tof_list, val_spec_list = [], [], [], [], []
+
         for sid in val_sids:
-            group = X_val_norm_df.loc[X_val_norm_df['sequence_id'] == sid]
+            group = grouped_val.get_group(sid)
             val_static_list.append(group[static_cols].iloc[0].values)
             val_imu_list.append(group[imu_cols].values)
             val_thm_list.append(group[thm_cols].values)
             val_tof_list.append(group[tof_cols].values)
 
+            sequence_spectrograms = []
+            for col in spec_source_cols:
+                signal_1d = group[col].values
+                seq_len = len(signal_1d)
+                if seq_len >= max_length:
+                    padded_signal = signal_1d[-max_length:]
+                else:
+                    padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
+                spec = generate_spectrogram(padded_signal)
+                sequence_spectrograms.append(spec)
+            val_spec_list.append(np.stack(sequence_spectrograms, axis=0))
+
         X_val_static = np.array(val_static_list, dtype=np.float32)
-        X_val_imu, val_imu_mask = pad_sequences(val_imu_list, max_length=max_length)
-        X_val_thm, val_thm_mask = pad_sequences(val_thm_list, max_length=max_length)
-        X_val_tof, val_tof_mask = pad_sequences(val_tof_list, max_length=max_length)
-        val_mask = val_imu_mask
+        X_val_imu, val_mask = pad_sequences(val_imu_list, max_length=max_length)
+        X_val_thm, _ = pad_sequences(val_thm_list, max_length=max_length)
+        X_val_tof, _ = pad_sequences(val_tof_list, max_length=max_length)
+        X_val_spec = np.array(val_spec_list, dtype=np.float32)
 
-        print(f"Train shapes: IMU={X_train_imu.shape}, THM={X_train_thm.shape}, TOF={X_train_tof.shape}, Static={X_train_static.shape}")
-        print(f"Val shapes:   IMU={X_val_imu.shape}, THM={X_val_thm.shape}, TOF={X_val_tof.shape}, Static={X_val_static.shape}")
+        print(f"Train shapes: IMU={X_train_imu.shape}, THM={X_train_thm.shape}, TOF={X_train_tof.shape}, SPEC={X_train_spec.shape}, Static={X_train_static.shape}")
+        print(f"Val shapes:   IMU={X_val_imu.shape}, THM={X_val_thm.shape}, TOF={X_val_tof.shape}, SPEC={X_val_spec.shape}, Static={X_val_static.shape}")
 
-        # 7. 存储该折的所有数据和 scaler
+        # 7. 存储该折的所有数据
         fold_data.append({
-            'X_train_imu': X_train_imu,
-            'X_train_thm': X_train_thm,
-            'X_train_tof': X_train_tof,
-            'X_train_static': X_train_static,
-            'y_train': y_train,
-            'train_mask': train_mask,
-            'X_val_imu': X_val_imu,
-            'X_val_thm': X_val_thm,
-            'X_val_tof': X_val_tof,
-            'X_val_static': X_val_static,
-            'y_val': y_val,
-            'val_mask': val_mask,
-            'scaler': scaler_fold,
+            'X_train_imu': X_train_imu, 'X_train_thm': X_train_thm, 'X_train_tof': X_train_tof,
+            'X_train_spec': X_train_spec, 'X_train_static': X_train_static,
+            'y_train': y_train, 'train_mask': train_mask,
+            'X_val_imu': X_val_imu, 'X_val_thm': X_val_thm, 'X_val_tof': X_val_tof,
+            'X_val_spec': X_val_spec, 'X_val_static': X_val_static,
+            'y_val': y_val, 'val_mask': val_mask,
+            'scaler': scaler_fold, 
+            'spec_stats': spec_stats,
             'val_idx': val_idx,
         })
 

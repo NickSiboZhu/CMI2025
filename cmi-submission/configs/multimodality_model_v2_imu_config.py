@@ -39,6 +39,14 @@ model = dict(
         dropout_rate=0.5
     ),
 
+    # spec_branch_cfg=dict(
+    #     type='SpectrogramCNN',
+    #     in_channels=6,
+    #     filters=[32, 64, 128],
+    #     kernel_sizes=[3, 3, 3],
+    #     use_residual=True,
+    # ),
+    use_spec=False,
     # Disable TOF and THM branches entirely for IMU variant
     use_tof=False,
     use_thm=False,
@@ -58,7 +66,7 @@ training = dict(
     # start_lr is no longer used; learning rates are defined per-layer below
     weight_decay=1e-2,
     use_amp=False, 
-    mixup_enabled=True,
+    mixup_enabled=False,
     mixup_alpha=0.2,
     # loss=dict(type='FocalLoss', gamma=2.0, alpha=0.25),
 
@@ -66,18 +74,14 @@ training = dict(
     # Choose 'cosine' or 'reduce_on_plateau'
     scheduler_cfg=dict(
         # type='cosine',  # Default is cosine annealing
-        type='reduce_on_plateau',
-        # --- Settings for 'reduce_on_plateau' ---
-        factor=0.2,   # Factor to reduce LR by (e.g., new_lr = lr * factor)
-        patience=5,   # Epochs to wait for improvement before reducing LR
-        min_lr=1e-6,  # Minimum learning rate
+        type='cosine',
         warmup_ratio=0.1, # Optional warmup for ReduceLROnPlateau
-        
         # --- NEW: Specific Learning Rates per Branch ---
         layer_lrs=dict(
             imu=1e-3,
-            mlp=2e-3,
-            fusion=2e-3,
+            mlp=1e-3,
+            fusion=1e-3,
+            spec=1e-3,
         )
     ),
 )

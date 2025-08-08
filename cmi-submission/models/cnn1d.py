@@ -176,14 +176,3 @@ class CNN1D(nn.Module):
 
         # output shape is (batch, output_dim) for both methods
         return output
-
-    def get_model_info(self):
-        """Get model parameter information"""
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        return {
-            'total_params': total_params,
-            'trainable_params': trainable_params,
-            'model_size_mb': total_params * 4 / 1024 / 1024  # Assuming float32
-        }
