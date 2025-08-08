@@ -18,7 +18,7 @@ import train
 
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
-CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
+CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
 # 你想要运行的试验次数
 N_TRIALS = 100
 # 初始随机搜索的次数
@@ -103,174 +103,215 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
 def objective(trial: optuna.trial.Trial) -> float:
     """
     Optuna 的目标函数。
+    为支持多变量采样，已对内部动态依赖进行扁平化处理。
     """
     cfg = train.load_py_config(CONFIG_FILE_PATH)
     variant = cfg.data.get('variant')
     
-    # 将 variant 信息存入 trial，方便 callback 函数使用
     trial.set_user_attr('variant', variant)
     
     print(f"\nStarting Trial {trial.number} for '{variant}' branch")
 
     # ===================================================================
-    #                  1. 定义通用超参数的搜索空间
+    #
+    # Part 1: 定义超参数搜索空间
+    # -----------------------------------------------------------------
+    # `if variant == 'full'` 是安全的，因为它在单个 study 中是恒定的。
+    # 但循环次数等内部依赖仍需扁平化。
+    #
     # ===================================================================
 
+    # --- 设定动态层数的最大值 ---
+    MAX_IMU_LAYERS = 4
+    MAX_MLP_LAYERS = 3
+    MAX_THM_LAYERS = 4
+    MAX_TOF_CNN_LAYERS = 3
+    MAX_FUSION_LAYERS = 3
+
+    # --- 1. 定义通用超参数 ---
     cfg.training['epochs'] = trial.suggest_int('epochs', 20, 150)
     cfg.training['patience'] = trial.suggest_int('patience', 10, 30, step=5)
     cfg.training['weight_decay'] = trial.suggest_float('weight_decay', 1e-6, 1e-1, log=True)
-    # --- Mixup Augmentation ---
+    
+    # Mixup (扁平化)
     cfg.training['mixup_enabled'] = trial.suggest_categorical('mixup_enabled', [True, False])
-    if cfg.training['mixup_enabled']:
-        cfg.training['mixup_alpha'] = trial.suggest_float('mixup_alpha', 0.1, 0.5)
-    else:
-        cfg.training['mixup_alpha'] = 0.0
+    mixup_alpha = trial.suggest_float('mixup_alpha', 0.1, 0.5)
+    cfg.training['mixup_alpha'] = mixup_alpha if cfg.training['mixup_enabled'] else 0.0
 
-    # --- Scheduler Choice ---
+    # Scheduler (扁平化)
     scheduler_type = trial.suggest_categorical('scheduler_type', ['cosine', 'reduce_on_plateau'])
     scheduler_cfg = {'type': scheduler_type}
+    # 统一 warmup_ratio 参数，让采样器学习通用效果
+    scheduler_cfg['warmup_ratio'] = trial.suggest_float('warmup_ratio', 0.0, 0.2)
+    # 为 ReduceOnPlateau 定义参数
+    lr_reduce_factor = trial.suggest_float('lr_reduce_factor', 0.2, 0.8, step=0.1)
+    lr_patience = trial.suggest_int('lr_patience', 5, 15, step=2)
+    min_lr = trial.suggest_float('min_lr', 1e-7, 1e-5, log=True)
     if scheduler_type == 'reduce_on_plateau':
-        scheduler_cfg['factor'] = trial.suggest_float('lr_reduce_factor', 0.2, 0.8, step=0.1)
-        scheduler_cfg['patience'] = trial.suggest_int('lr_patience', 5, 15, step=2)
-        scheduler_cfg['min_lr'] = trial.suggest_float('min_lr', 1e-7, 1e-5, log=True)
-        scheduler_cfg['warmup_ratio'] = trial.suggest_float('warmup_ratio_plateau', 0.0, 0.2)
-    elif scheduler_type == 'cosine':
-        scheduler_cfg['warmup_ratio'] = trial.suggest_float('warmup_ratio_cosine', 0.0, 0.2)
-    
-    # --- NEW: Search for absolute learning rates per branch ---
+        scheduler_cfg['factor'] = lr_reduce_factor
+        scheduler_cfg['patience'] = lr_patience
+        scheduler_cfg['min_lr'] = min_lr
+
+    # 分层学习率
     layer_lrs = {}
     layer_lrs['imu'] = trial.suggest_float('lr_imu', 1e-5, 1e-2, log=True)
     layer_lrs['mlp'] = trial.suggest_float('lr_mlp', 1e-5, 1e-2, log=True)
-    if variant == 'full':
-        layer_lrs['thm'] = trial.suggest_float('lr_thm', 1e-5, 1e-2, log=True)
-        layer_lrs['tof'] = trial.suggest_float('lr_tof', 1e-5, 1e-2, log=True)
     layer_lrs['fusion'] = trial.suggest_float('lr_fusion', 1e-5, 1e-2, log=True)
-    scheduler_cfg['layer_lrs'] = layer_lrs
 
-    cfg.training['scheduler_cfg'] = scheduler_cfg
-    # --- End of LR Search ---
-
-    # --- IMU Branch Architecture ---
-    num_imu_layers = trial.suggest_int('num_imu_layers', 2, 4)
-    imu_filters = []
-    imu_kernel_sizes = []
-    for i in range(num_imu_layers):
-        imu_filters.append(trial.suggest_int(f'imu_filter_{i}', 32, 1536, step=16))
-        imu_kernel_sizes.append(trial.suggest_categorical(f'imu_kernel_{i}', [3, 5, 7, 9, 11]))
-    cfg.model['imu_branch_cfg']['filters'] = imu_filters
-    cfg.model['imu_branch_cfg']['kernel_sizes'] = imu_kernel_sizes
-    
-    # --- NEW: IMU Temporal Aggregation Choice ---
-    imu_temporal_aggregation = trial.suggest_categorical('imu_temporal_aggregation', ['global_pool', 'temporal_encoder'])
-    cfg.model['imu_branch_cfg']['temporal_aggregation'] = imu_temporal_aggregation
-    
-    if imu_temporal_aggregation == 'temporal_encoder':
-        cfg.model['imu_branch_cfg']['temporal_mode'] = trial.suggest_categorical('imu_temporal_mode', ['lstm', 'transformer'])
-        if cfg.model['imu_branch_cfg']['temporal_mode'] == 'lstm':
-            cfg.model['imu_branch_cfg']['lstm_hidden'] = trial.suggest_int('imu_lstm_hidden', 128, 512, step=64)
-            cfg.model['imu_branch_cfg']['bidirectional'] = trial.suggest_categorical('imu_bidirectional', [True, False])
-        else:  # transformer
-            cfg.model['imu_branch_cfg']['num_heads'] = trial.suggest_categorical('imu_num_heads', [4, 8])
-            cfg.model['imu_branch_cfg']['num_layers'] = trial.suggest_int('imu_num_layers', 1, 3)
-    
-    # --- NEW: IMU Residual Connections ---
+    # IMU 分支 (扁平化)
+    num_imu_layers = trial.suggest_int('num_imu_layers', 2, MAX_IMU_LAYERS)
+    imu_filters_all = [trial.suggest_int(f'imu_filter_{i}', 32, 1536, step=16) for i in range(MAX_IMU_LAYERS)]
+    imu_kernel_sizes_all = [trial.suggest_categorical(f'imu_kernel_{i}', [3, 5, 7, 9, 11]) for i in range(MAX_IMU_LAYERS)]
+    cfg.model['imu_branch_cfg']['filters'] = imu_filters_all[:num_imu_layers]
+    cfg.model['imu_branch_cfg']['kernel_sizes'] = imu_kernel_sizes_all[:num_imu_layers]
     cfg.model['imu_branch_cfg']['use_residual'] = trial.suggest_categorical('imu_use_residual', [True, False])
+
+    # --- IMU Temporal Aggregation (正确、无条件地定义所有相关参数) ---
+
+    # 首先，定义顶层选择
+    imu_temporal_aggregation = trial.suggest_categorical('imu_temporal_aggregation', ['global_pool', 'temporal_encoder'])
+    imu_temporal_mode = trial.suggest_categorical('imu_temporal_mode', ['lstm', 'transformer'])
+
+    # 其次，无条件定义 'temporal_encoder' 分支下的所有子参数
+    # LSTM 参数
+    imu_lstm_hidden = trial.suggest_int('imu_lstm_hidden', 128, 512, step=64)
+    imu_bidirectional = trial.suggest_categorical('imu_bidirectional', [True, False])
+
+    # Transformer 参数 (包含 ff_dim)
+    imu_transformer_heads = trial.suggest_categorical('imu_num_heads', [4, 8])
+    imu_transformer_layers = trial.suggest_int('imu_num_layers', 1, 3)
+    imu_transformer_ff_dim = trial.suggest_int('imu_ff_dim', 256, 1024, step=128)
+    imu_transformer_dropout = trial.suggest_float('imu_dropout', 0.1, 0.4)
+
+    cfg.model['imu_branch_cfg']['temporal_aggregation'] = imu_temporal_aggregation
+
+    # 只有当选择了 'temporal_encoder' 时，才继续组装其内部配置
+    if imu_temporal_aggregation == 'temporal_encoder':
+        # 将模式选择赋给 cfg
+        cfg.model['imu_branch_cfg']['temporal_mode'] = imu_temporal_mode
+        
+        # 根据模式选择，组装 LSTM 或 Transformer 的具体配置
+        if imu_temporal_mode == 'lstm':
+            cfg.model['imu_branch_cfg']['lstm_hidden'] = imu_lstm_hidden
+            cfg.model['imu_branch_cfg']['bidirectional'] = imu_bidirectional
+        else:  # transformer
+            cfg.model['imu_branch_cfg']['num_heads'] = imu_transformer_heads
+            cfg.model['imu_branch_cfg']['num_layers'] = imu_transformer_layers
+            cfg.model['imu_branch_cfg']['ff_dim'] = imu_transformer_ff_dim # 组装 ff_dim
+            cfg.model['imu_branch_cfg']['dropout'] = imu_transformer_dropout  # 组装 dropout
     
-    num_mlp_hidden_layers = trial.suggest_int('num_mlp_hidden_layers', 1, 3)
-    mlp_hidden_dims = []
-    for i in range(num_mlp_hidden_layers):
-        mlp_hidden_dims.append(trial.suggest_int(f'mlp_hidden_dim_{i}', 16, 256, step=16))
-    cfg.model['mlp_branch_cfg']['hidden_dims'] = mlp_hidden_dims
+    # MLP 分支 (扁平化)
+    num_mlp_hidden_layers = trial.suggest_int('num_mlp_hidden_layers', 1, MAX_MLP_LAYERS)
+    mlp_hidden_dims_all = [trial.suggest_int(f'mlp_hidden_dim_{i}', 16, 256, step=16) for i in range(MAX_MLP_LAYERS)]
+    cfg.model['mlp_branch_cfg']['hidden_dims'] = mlp_hidden_dims_all[:num_mlp_hidden_layers]
     cfg.model['mlp_branch_cfg']['output_dim'] = trial.suggest_int('mlp_output_dim', 16, 128, step=16)
     cfg.model['mlp_branch_cfg']['dropout_rate'] = trial.suggest_float('mlp_dropout_rate', 0.1, 0.5)
 
-    # ===================================================================
-    #          2. 为 "full" 分支定义额外的超参数搜索空间
-    # ===================================================================
+    # --- 2. 为 "full" 分支定义额外超参数 ---
     if variant == 'full':
-        # --- THM Branch Architecture ---
-        num_thm_layers = trial.suggest_int('num_thm_layers', 1, 4)
-        thm_filters = []
-        thm_kernel_sizes = []
-        for i in range(num_thm_layers):
-            thm_filters.append(trial.suggest_int(f'thm_filter_{i}', 16, 512, step=16))
-            thm_kernel_sizes.append(trial.suggest_categorical(f'thm_kernel_{i}', [3, 5, 7]))
-        cfg.model['thm_branch_cfg']['filters'] = thm_filters
-        cfg.model['thm_branch_cfg']['kernel_sizes'] = thm_kernel_sizes
+        layer_lrs['thm'] = trial.suggest_float('lr_thm', 1e-5, 1e-2, log=True)
+        layer_lrs['tof'] = trial.suggest_float('lr_tof', 1e-5, 1e-2, log=True)
         
-        # --- NEW: THM Temporal Aggregation Choice ---
-        thm_temporal_aggregation = trial.suggest_categorical('thm_temporal_aggregation', ['global_pool', 'temporal_encoder'])
-        cfg.model['thm_branch_cfg']['temporal_aggregation'] = thm_temporal_aggregation
-        
-        if thm_temporal_aggregation == 'temporal_encoder':
-            cfg.model['thm_branch_cfg']['temporal_mode'] = trial.suggest_categorical('thm_temporal_mode', ['lstm', 'transformer'])
-            if cfg.model['thm_branch_cfg']['temporal_mode'] == 'lstm':
-                cfg.model['thm_branch_cfg']['lstm_hidden'] = trial.suggest_int('thm_lstm_hidden', 64, 256, step=32)
-                cfg.model['thm_branch_cfg']['bidirectional'] = trial.suggest_categorical('thm_bidirectional', [True, False])
-            else:  # transformer
-                cfg.model['thm_branch_cfg']['num_heads'] = trial.suggest_categorical('thm_num_heads', [4, 8])
-                cfg.model['thm_branch_cfg']['num_layers'] = trial.suggest_int('thm_num_layers', 1, 2)
-        
-        # --- NEW: THM Residual Connections ---
+        # THM 分支 (扁平化)
+        num_thm_layers = trial.suggest_int('num_thm_layers', 1, MAX_THM_LAYERS)
+        thm_filters_all = [trial.suggest_int(f'thm_filter_{i}', 16, 512, step=16) for i in range(MAX_THM_LAYERS)]
+        thm_kernel_sizes_all = [trial.suggest_categorical(f'thm_kernel_{i}', [3, 5, 7]) for i in range(MAX_THM_LAYERS)]
+        cfg.model['thm_branch_cfg']['filters'] = thm_filters_all[:num_thm_layers]
+        cfg.model['thm_branch_cfg']['kernel_sizes'] = thm_kernel_sizes_all[:num_thm_layers]
         cfg.model['thm_branch_cfg']['use_residual'] = trial.suggest_categorical('thm_use_residual', [True, False])
+        
+        # THM Temporal Aggregation (正确、无条件地定义所有相关参数)
+        thm_temporal_aggregation = trial.suggest_categorical('thm_temporal_aggregation', ['global_pool', 'temporal_encoder'])
+        thm_temporal_mode = trial.suggest_categorical('thm_temporal_mode', ['lstm', 'transformer'])
 
+        # THM LSTM 参数
+        thm_lstm_hidden = trial.suggest_int('thm_lstm_hidden', 64, 256, step=32)
+        thm_bidirectional = trial.suggest_categorical('thm_bidirectional', [True, False])
+
+        # THM Transformer 参数
+        thm_transformer_heads = trial.suggest_categorical('thm_num_heads', [4, 8])
+        thm_transformer_layers = trial.suggest_int('thm_num_layers', 1, 2)
+        # 这里也应该有一个 ff_dim
+        thm_transformer_ff_dim = trial.suggest_int('thm_ff_dim', 256, 1024, step=128)
+        thm_transformer_dropout = trial.suggest_float('thm_dropout', 0.1, 0.4)
+
+        # --- 组装 THM 分支配置 ---
+        cfg.model['thm_branch_cfg']['temporal_aggregation'] = thm_temporal_aggregation
+
+        if thm_temporal_aggregation == 'temporal_encoder':
+            cfg.model['thm_branch_cfg']['temporal_mode'] = thm_temporal_mode
+            if thm_temporal_mode == 'lstm':
+                cfg.model['thm_branch_cfg']['lstm_hidden'] = thm_lstm_hidden
+                cfg.model['thm_branch_cfg']['bidirectional'] = thm_bidirectional
+            else:  # transformer
+                cfg.model['thm_branch_cfg']['num_heads'] = thm_transformer_heads
+                cfg.model['thm_branch_cfg']['num_layers'] = thm_transformer_layers
+                cfg.model['thm_branch_cfg']['ff_dim'] = thm_transformer_ff_dim
+                cfg.model['thm_branch_cfg']['dropout'] = thm_transformer_dropout
+
+        # TOF 分支 (扁平化)
+        cfg.model['tof_branch_cfg']['use_residual'] = trial.suggest_categorical('tof_use_residual', [True, False])
+        num_tof_cnn_layers = trial.suggest_categorical('num_tof_cnn_layers', [2, 3])
+        tof_kernel_0 = trial.suggest_categorical('tof_kernel_0', [2, 3])
+        tof_kernel_1 = trial.suggest_categorical('tof_kernel_1', [2, 3])
+        tof_conv_channels_all = [trial.suggest_int(f'tof_conv_channel_{i}', 32, 256, step=32) for i in range(MAX_TOF_CNN_LAYERS)]
+        
+        if num_tof_cnn_layers == 2:
+            cfg.model['tof_branch_cfg']['kernel_sizes'] = [tof_kernel_0, tof_kernel_1]
+            max_ch = 256
+        else:
+            cfg.model['tof_branch_cfg']['kernel_sizes'] = [3, 3, 2]
+            max_ch = 128
+        
+        tof_channels_assembled = [min(ch, max_ch) for ch in tof_conv_channels_all]
+        cfg.model['tof_branch_cfg']['conv_channels'] = tof_channels_assembled[:num_tof_cnn_layers]
+
+        # TOF Temporal (扁平化)
         tof_temporal_mode = trial.suggest_categorical('tof_temporal_mode', ['lstm', 'transformer'])
         cfg.model['tof_branch_cfg']['temporal_mode'] = tof_temporal_mode
         
-        num_tof_cnn_layers = trial.suggest_categorical('num_tof_cnn_layers', [2, 3])
-
-        if num_tof_cnn_layers == 2:
-            tof_kernel_sizes = [
-                trial.suggest_categorical('tof_kernel_0', [2, 3]),
-                trial.suggest_categorical('tof_kernel_1', [2, 3]),
-            ]
-        else:
-            tof_kernel_sizes = [3, 3, 2]
-
-        tof_conv_channels = []
-        max_ch = 256 if num_tof_cnn_layers == 2 else 128
-        for i in range(num_tof_cnn_layers):
-            tof_conv_channels.append(trial.suggest_int(f'tof_conv_channel_{i}', 32, max_ch, step=32))
-    
-        cfg.model['tof_branch_cfg']['conv_channels'] = tof_conv_channels
-        cfg.model['tof_branch_cfg']['kernel_sizes'] = tof_kernel_sizes
+        tof_lstm_hidden = trial.suggest_int('tof_lstm_hidden', 64, 256, step=32)
+        tof_lstm_layers = trial.suggest_int('tof_lstm_layers', 1, 2)
+        tof_bidirectional = trial.suggest_categorical('tof_bidirectional', [True, False])
         
-        # --- NEW: TOF Residual Connections ---
-        cfg.model['tof_branch_cfg']['use_residual'] = trial.suggest_categorical('tof_use_residual', [True, False])
+        tof_transformer_heads = trial.suggest_categorical('tof_num_heads', [4, 8])
+        tof_transformer_layers = trial.suggest_int('tof_num_layers', 1, 3)
+        tof_transformer_ff_dim = trial.suggest_int('tof_ff_dim', 256, 1024, step=128)
+        tof_transformer_dropout = trial.suggest_float('tof_dropout', 0.1, 0.4)
         
         if tof_temporal_mode == 'transformer':
-            cfg.model['tof_branch_cfg']['num_heads'] = trial.suggest_categorical('tof_num_heads', [4, 8])
-            cfg.model['tof_branch_cfg']['num_layers'] = trial.suggest_int('tof_num_layers', 1, 3)
-            cfg.model['tof_branch_cfg']['ff_dim'] = trial.suggest_int('tof_ff_dim', 256, 1024, step=128)
-            cfg.model['tof_branch_cfg']['dropout'] = trial.suggest_float('tof_dropout', 0.1, 0.4)
-        elif tof_temporal_mode == 'lstm':
-            cfg.model['tof_branch_cfg']['lstm_hidden'] = trial.suggest_int('tof_lstm_hidden', 64, 256, step=32)
-            cfg.model['tof_branch_cfg']['lstm_layers'] = trial.suggest_int('tof_lstm_layers', 1, 2)
-            cfg.model['tof_branch_cfg']['bidirectional'] = trial.suggest_categorical('tof_bidirectional', [True, False])
-
-    # ===================================================================
-    #          3. 定义 Fusion Head 的搜索空间 (MLP-only)
-    # ===================================================================
-    fusion_type = 'mlp'
+            cfg.model['tof_branch_cfg']['num_heads'] = tof_transformer_heads
+            cfg.model['tof_branch_cfg']['num_layers'] = tof_transformer_layers
+            cfg.model['tof_branch_cfg']['ff_dim'] = tof_transformer_ff_dim
+            cfg.model['tof_branch_cfg']['dropout'] = tof_transformer_dropout
+        else: # lstm
+            cfg.model['tof_branch_cfg']['lstm_hidden'] = tof_lstm_hidden
+            cfg.model['tof_branch_cfg']['lstm_layers'] = tof_lstm_layers
+            cfg.model['tof_branch_cfg']['bidirectional'] = tof_bidirectional
     
+    # 将最终确定的学习率配置赋给 cfg
+    scheduler_cfg['layer_lrs'] = layer_lrs
+    cfg.training['scheduler_cfg'] = scheduler_cfg
+    
+    # --- 3. 定义 Fusion Head ---
+    # 清理旧的或不相关的键
     for key in ['hidden_dims', 'dropout_rates', 'branch_dims', 'embed_dim', 'num_heads', 'depth', 'dropout']:
         cfg.model['fusion_head_cfg'].pop(key, None)
 
     cfg.model['fusion_head_cfg']['type'] = 'FusionHead'
-    num_fusion_layers = trial.suggest_int('mlp_fusion_layers', 1, 3)
-    fusion_hidden_dims = []
-    fusion_dropout_rates = []
-    for i in range(num_fusion_layers):
-        fusion_hidden_dims.append(trial.suggest_int(f'mlp_fusion_hidden_dim_{i}', 32, 512, step=16))
-        fusion_dropout_rates.append(trial.suggest_float(f'mlp_fusion_dropout_{i}', 0.1, 0.5))
-    cfg.model['fusion_head_cfg']['hidden_dims'] = fusion_hidden_dims
-    cfg.model['fusion_head_cfg']['dropout_rates'] = fusion_dropout_rates
+    num_fusion_layers = trial.suggest_int('mlp_fusion_layers', 1, MAX_FUSION_LAYERS)
+    fusion_hidden_dims_all = [trial.suggest_int(f'mlp_fusion_hidden_dim_{i}', 32, 512, step=16) for i in range(MAX_FUSION_LAYERS)]
+    fusion_dropout_rates_all = [trial.suggest_float(f'mlp_fusion_dropout_{i}', 0.1, 0.5) for i in range(MAX_FUSION_LAYERS)]
+    cfg.model['fusion_head_cfg']['hidden_dims'] = fusion_hidden_dims_all[:num_fusion_layers]
+    cfg.model['fusion_head_cfg']['dropout_rates'] = fusion_dropout_rates_all[:num_fusion_layers]
     
     try:
         # ===================================================================
         #                          4. 运行训练流程
         # ===================================================================
-        log_dir = os.path.join(LOG_DIR, study.study_name)
+        # study 对象应该从主脚本中获取，这里为了代码能运行先假设它存在
+        study_name = trial.study.study_name
+        log_dir = os.path.join(LOG_DIR, study_name)
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
 
@@ -303,6 +344,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         print(f"Trial {trial.number} failed with an exception: {e}")
         import traceback
         traceback.print_exc()
+        # 假设 oof_score 越大越好，返回一个很差的数字
         return -1.0
 
 
