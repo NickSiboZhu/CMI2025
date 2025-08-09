@@ -457,100 +457,166 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     
     return history
 
-def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
-    """Train 5 models using 5-fold cross-validation"""
-    print("="*60); print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION"); print("="*60)
-    os.makedirs(output_dir, exist_ok=True)
-    if device is None: device = setup_device()
+def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, spec_params: dict = None, output_dir: str = 'weights'):
+    """
+    使用5折交叉验证训练5个模型。
     
-    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(show_stratification=show_stratification, variant=variant)
-    oof_preds = np.full(len(y_all), -1, dtype=int)
+    此版本功能完整，包括:
+    - 传递STFT参数以动态生成频谱图。
+    - 为每个折叠创建并保存模型、scaler以及频谱图统计文件(spec_stats)。
+    """
+    print("="*60)
+    print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
+    print("="*60)
+    
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 设置设备
+    if device is None:
+        device = setup_device()
+    
+    # 准备K折数据，并传递spec_params
+    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(
+        show_stratification=show_stratification, 
+        variant=variant,
+    )
+    
+    num_samples = len(y_all)
+    oof_preds = np.full(num_samples, -1, dtype=int)
     oof_targets = y_all.copy()
     
-    # Dynamically inject feature dimensions
-    sample_imu, sample_thm, sample_tof, sample_static = fold_data[0]['X_train_imu'], fold_data[0]['X_train_thm'], fold_data[0]['X_train_tof'], fold_data[0]['X_train_static']
+    # 动态注入特征维度
+    sample_imu = fold_data[0]['X_train_imu']
+    sample_thm = fold_data[0]['X_train_thm']
+    sample_tof = fold_data[0]['X_train_tof']
+    sample_static = fold_data[0]['X_train_static']
+    sample_spec = fold_data[0]['X_train_spec']
+
     model_cfg['imu_branch_cfg']['input_channels'] = sample_imu.shape[2]
-    if 'thm_branch_cfg' in model_cfg: model_cfg['thm_branch_cfg']['input_channels'] = sample_thm.shape[2]
-    if 'tof_branch_cfg' in model_cfg: model_cfg['tof_branch_cfg']['input_channels'] = sample_tof.shape[2] // 64
+    if 'thm_branch_cfg' in model_cfg:
+        model_cfg['thm_branch_cfg']['input_channels'] = sample_thm.shape[2]
+    if 'tof_branch_cfg' in model_cfg:
+        model_cfg['tof_branch_cfg']['input_channels'] = sample_tof.shape[2] // 64
+    if 'spec_branch_cfg' in model_cfg:
+        model_cfg['spec_branch_cfg']['in_channels'] = sample_spec.shape[1]
     model_cfg['mlp_branch_cfg']['input_features'] = sample_static.shape[1]
     
-    # --- NEW: Set spec branch input channels from data ---
-    if 'spec_branch_cfg' in model_cfg:
-        sample_spec = fold_data[0]['X_train_spec']
-        model_cfg['spec_branch_cfg']['in_channels'] = sample_spec.shape[1] # Spectrogram channels
-        print(f"  Spectrogram channels: {sample_spec.shape[1]}")
-
-    print(f"\nModel configuration from config file:"); print({k: v for k, v in model_cfg.items() if k != 'type'})
-    print(f"\nTraining Configuration:")
-    if mixup_enabled: print(f"  Data Augmentation: Mixup (alpha={mixup_alpha})")
-    print(f"  Loss Function: {'Focal Loss' if loss_function == 'focal' else 'Cross Entropy Loss'}")
+    print(f"\nModel configuration from config file:")
+    for k, v in (model_cfg or {}).items():
+        if k != 'type': print(f"  {k}: {v}")
     
-    fold_results, fold_models, fold_histories = [], [], []
+    fold_results = []
+    fold_models = []
+    fold_histories = []
     
+    # 训练每个折叠
     for fold_idx in range(5):
-        print(f"\n" + "="*60 + f"\nTRAINING FOLD {fold_idx + 1}/5\n" + "="*60)
+        print(f"\n" + "="*60)
+        print(f"TRAINING FOLD {fold_idx + 1}/5")
+        print("="*60)
+        
         fold = fold_data[fold_idx]
-        y_train_series = pd.Series(label_encoder.inverse_transform(fold['y_train']))
-        class_weight_dict = calculate_composite_weights_18_class(y_18_class_series=y_train_series, label_encoder_18_class=label_encoder, target_gesture_names=list(BFRB_GESTURES))
         spec_stats = fold['spec_stats']
-        # --- MODIFIED: Pass spec data to the dataset ---
+        
+        y_train_series = pd.Series(label_encoder.inverse_transform(fold['y_train']))
+        class_weight_dict = calculate_composite_weights_18_class(y_train_series, label_encoder, list(BFRB_GESTURES))
+        
+        # 创建数据集，并传入spec_stats
         train_dataset = MultimodalDataset(
             fold['X_train_imu'], fold['X_train_thm'], fold['X_train_tof'], fold['X_train_spec'],
             fold['X_train_static'], fold['y_train'], mask=fold['train_mask'],
-            class_weight_dict=class_weight_dict, spec_stats=spec_stats # <-- Pass stats
+            class_weight_dict=class_weight_dict, spec_stats=spec_stats
         )
         val_dataset = MultimodalDataset(
             fold['X_val_imu'], fold['X_val_thm'], fold['X_val_tof'], fold['X_val_spec'],
             fold['X_val_static'], fold['y_val'], mask=fold['val_mask'],
-            spec_stats=spec_stats # <-- Pass stats to validation too
+            spec_stats=spec_stats
         )
+
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
         
         print(f"\nBuilding model for fold {fold_idx + 1}...")
         model = build_from_cfg(model_cfg, MODELS)
+        
         criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none') if loss_function == 'focal' else nn.CrossEntropyLoss(reduction='none')
-        model, criterion = model.to(device), criterion.to(device)
+        
+        model = model.to(device)
+        criterion = criterion.to(device)
+        print(f"Model and criterion loaded to {device}")
         
         print(f"\nTraining fold {fold_idx + 1}...")
-        history = train_model(model=model, train_loader=train_loader, val_loader=val_loader, label_encoder=label_encoder, epochs=epochs, patience=patience, weight_decay=weight_decay, use_amp=use_amp, device=device, variant=variant, fold_tag=f'_{fold_idx+1}', criterion=criterion, mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha, scheduler_cfg=scheduler_cfg, output_dir=output_dir)
+        history = train_model(
+            model=model, train_loader=train_loader, val_loader=val_loader, label_encoder=label_encoder, 
+            epochs=epochs, patience=patience, weight_decay=weight_decay, use_amp=use_amp, 
+            device=device, variant=variant, fold_tag=f'_{fold_idx+1}', criterion=criterion, 
+            mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha, scheduler_cfg=scheduler_cfg, 
+            output_dir=output_dir
+        )
         
         print(f"\nEvaluating fold {fold_idx + 1}...")
         _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder)
         oof_preds[fold['val_idx']] = all_preds_val
         best_val_score = max(history['val_competition_score'])
         
+        # 保存模型
         model_filename = os.path.join(output_dir, f'model_fold_{fold_idx + 1}_{variant}.pth')
         torch.save({'state_dict': model.state_dict(), 'model_cfg': model_cfg}, model_filename)
         print(f"Model saved as '{model_filename}'")
 
+        # 保存 scaler
+        scaler_fold = fold['scaler']
         scaler_filename = os.path.join(output_dir, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
-        with open(scaler_filename, 'wb') as sf: pickle.dump(fold['scaler'], sf)
+        with open(scaler_filename, 'wb') as sf:
+            pickle.dump(scaler_fold, sf)
         print(f"Scaler saved as '{scaler_filename}'")
         
-        fold_results.append({'fold': fold_idx + 1, 'best_val_score': best_val_score, 'model_filename': model_filename})
-        fold_models.append(model); fold_histories.append(history)
+        # 保存该折叠的频谱图统计量 (spec_stats)
+        spec_stats_filename = os.path.join(output_dir, f'spec_stats_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(spec_stats_filename, 'wb') as f:
+            pickle.dump(spec_stats, f)
+        print(f"Spectrogram stats saved as '{spec_stats_filename}'")
+        
+        fold_results.append({'fold': fold_idx + 1, 'best_val_score': best_val_score})
+        fold_models.append(model)
+        fold_histories.append(history)
         print(f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
     
+    # 保存全局标签编码器
     le_filename = os.path.join(output_dir, f'label_encoder_{variant}.pkl')
-    with open(le_filename, 'wb') as lf: pickle.dump(label_encoder, lf)
+    with open(le_filename, 'wb') as lf:
+        pickle.dump(label_encoder, lf)
     print(f"Label encoder saved as '{le_filename}'")
     
+    # 打印和保存所有折叠的总结
     print(f"\n" + "="*60 + "\n5-FOLD CROSS-VALIDATION SUMMARY\n" + "="*60)
     best_scores = [result['best_val_score'] for result in fold_results]
     print(f"Best Validation Scores per Fold: {[f'{score:.4f}' for score in best_scores]}")
     print(f"\nMean Best Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
+    
     best_fold_idx = np.argmax(best_scores)
     print(f"\nBest performing fold: Fold {best_fold_idx + 1} (Score: {best_scores[best_fold_idx]:.4f})")
     
-    summary = {'fold_results': fold_results, 'mean_best_score': float(np.mean(best_scores)), 'std_best_score': float(np.std(best_scores)), 'best_fold': int(best_fold_idx + 1), 'best_fold_score': float(best_scores[best_fold_idx])}
-    with open(os.path.join(output_dir, f'kfold_summary_{variant}.json'), 'w') as f: json.dump(summary, f, indent=2)
+    summary = {
+        'fold_results': fold_results,
+        'mean_best_score': float(np.mean(best_scores)),
+        'std_best_score': float(np.std(best_scores)),
+        'best_fold': int(best_fold_idx + 1),
+        'best_fold_score': float(best_scores[best_fold_idx])
+    }
+    with open(os.path.join(output_dir, f'kfold_summary_{variant}.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
     print(f"Summary saved to '{os.path.join(output_dir, f'kfold_summary_{variant}.json')}'")
     
+    # 计算并保存OOF结果
     oof_comp_score = competition_metric(oof_targets, oof_preds, label_encoder)
     print(f"\n🏆 Overall OOF Competition Score: {oof_comp_score:.4f}")
-
-    oof_df = pd.DataFrame({'sequence_id': sequence_ids_all, 'gesture_true': label_encoder.inverse_transform(oof_targets), 'gesture_pred': label_encoder.inverse_transform(oof_preds)})
+    oof_df = pd.DataFrame({
+        'sequence_id': sequence_ids_all,
+        'gesture_true': label_encoder.inverse_transform(oof_targets),
+        'gesture_pred': label_encoder.inverse_transform(oof_preds),
+    })
     oof_path = os.path.join(output_dir, f'oof_predictions_{variant}.csv')
     oof_df.to_csv(oof_path, index=False)
     print(f"OOF predictions saved to '{oof_path}'")

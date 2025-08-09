@@ -12,7 +12,7 @@ from scipy.spatial.transform import Rotation as R
 import warnings
 from scipy import signal
 
-def generate_spectrogram(ts_data, fs=10.0, nperseg=16, noverlap=8, max_length=100):
+def generate_spectrogram(ts_data, fs=10.0, nperseg=20, noverlap=15, max_length=100):
     """
     从时序信号生成对数功率谱图。
     MODIFIED: 动态计算输出形状，以支持可变的STFT参数。

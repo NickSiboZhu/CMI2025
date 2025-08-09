@@ -5,7 +5,7 @@ CMI – Detect Behavior with Sensor Data
 推理脚本 (最终混合模型版本 - 已修复padding错误)
 
 此版本为最终整合版，包含以下核心功能：
-- 加载并运行一个混合1D+2D的深度学习模型 (HybridMultimodalityModel)。
+- 加载并运行一个混合1D+2D的深度学习模型 (MultimodalityModel)。
 - 在推理时动态地从时域信号生成频谱图 (Spectrograms)。
 - 使用与每个模型折叠相匹配的预处理器 (ColumnTransformer) 和频谱图统计量 (spec_stats)
   来确保数据处理与训练时完全一致。
@@ -33,23 +33,13 @@ BASE_DIR   = os.path.dirname(__file__)
 WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
-from models.multimodality import HybridMultimodalityModel
-from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS
+from models.multimodality import MultimodalityModel
+from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS, generate_spectrogram
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
 MAP_NON_TARGET = "Drink from bottle/cup"
 SEQ_LEN        = 100
-
-def generate_spectrogram(ts_data, fs=10.0, nperseg=16, noverlap=8):
-    """从时序信号生成对数功率谱图。"""
-    if ts_data is None or len(ts_data) == 0:
-        freq_bins = nperseg // 2 + 1
-        time_bins = 12
-        return np.zeros((freq_bins, time_bins), dtype=np.float32)
-    f, t, Zxx = signal.stft(ts_data, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    log_spectrogram = np.log1p(np.abs(Zxx))
-    return log_spectrogram.astype(np.float32)
 
 def _load_preprocessing_objects(variant: str):
     """为给定变体加载标签编码器 (label encoder)。"""
@@ -91,7 +81,7 @@ def _load_models(device, variant: str):
         model_cfg = {k: v for k, v in ckpt['model_cfg'].items() if k != 'type'}
         state_dict = ckpt['state_dict']
         
-        model = HybridMultimodalityModel(**model_cfg)
+        model = MultimodalityModel(**model_cfg)
         
         is_compiled = any(key.startswith('_orig_mod.') for key in state_dict.keys())
         if is_compiled:
@@ -177,6 +167,10 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
         return MAP_NON_TARGET
 
     variant, features_df = preprocess_single_sequence(sequence, demographics)
+    
+    if variant not in RESOURCES:
+        raise RuntimeError(f"Attempted to predict with variant '{variant}', but its resources were not loaded successfully at startup.")
+
     res = RESOURCES[variant]
     le = res["label_encoder"]
     model_scaler_stats_triplets = res["model_scaler_stats_triplets"]
@@ -187,7 +181,9 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
         for model, scaler, spec_stats in model_scaler_stats_triplets:
             
             # 1. 标准化时域数据
-            X_scaled_unpadded = scaler.transform(features_df)
+            # --- MODIFIED: 在此处添加 .astype(np.float32) 来确保数据类型一致 ---
+            X_scaled_unpadded = scaler.transform(features_df).astype(np.float32)
+            
             scaled_feature_names = scaler.get_feature_names_out()
 
             # 2. 拆分多模态数据
@@ -205,9 +201,7 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             spec_idx = [list(scaled_feature_names).index(c) for c in spec_source_cols]
 
             static_arr = X_scaled_unpadded[0:1, static_idx]
-            tof_arr = X_scaled_unpadded[:, tof_idx]
-            thm_arr = X_scaled_unpadded[:, thm_idx]
-            imu_arr = X_scaled_unpadded[:, imu_idx]
+            tof_arr, thm_arr, imu_arr = X_scaled_unpadded[:, tof_idx], X_scaled_unpadded[:, thm_idx], X_scaled_unpadded[:, imu_idx]
             spec_source_arr = X_scaled_unpadded[:, spec_idx]
 
             # 3. 对时域数据进行 Padding
@@ -220,24 +214,19 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             spec_mean, spec_std = spec_stats['mean'], spec_stats['std']
             for i in range(spec_source_arr.shape[1]):
                 signal_1d = spec_source_arr[:, i]
-                
-                # --- MODIFIED: 使用修正后的健壮逻辑处理padding/truncation ---
                 seq_len_current = len(signal_1d)
                 if seq_len_current >= SEQ_LEN:
-                    # 如果序列过长，则从末尾截断
                     padded_signal = signal_1d[-SEQ_LEN:]
                 else:
-                    # 如果序列过短，则在开头填充
-                    pad_width = SEQ_LEN - seq_len_current
-                    padded_signal = np.pad(signal_1d, (pad_width, 0), 'constant')
+                    padded_signal = np.pad(signal_1d, (SEQ_LEN - seq_len_current, 0), 'constant')
                 
-                spec = generate_spectrogram(padded_signal)
+                spec = generate_spectrogram(padded_signal, max_length=SEQ_LEN)
                 spec_norm = (spec - spec_mean) / (spec_std + 1e-6)
                 sequence_spectrograms.append(spec_norm)
             
             X_spec = np.stack(sequence_spectrograms, axis=0)[np.newaxis, ...]
             
-            # 5. 转换为Tensor
+            # 5. 转换为Tensor (由于上游已是float32, 这里生成的也是FloatTensor)
             xb_imu = torch.from_numpy(X_imu_pad).to(DEVICE)
             xb_thm = torch.from_numpy(X_thm_pad).to(DEVICE)
             xb_tof = torch.from_numpy(X_tof_pad).to(DEVICE)
@@ -248,12 +237,9 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             # 6. 使用混合模型进行前向传播
             probs = torch.softmax(model(xb_imu, xb_thm, xb_tof, xb_spec, xb_static, mask=xb_mask), dim=1).cpu().numpy()
             
-            if probs_sum is None:
-                probs_sum = probs
-            else:
-                probs_sum += probs
+            if probs_sum is None: probs_sum = probs
+            else: probs_sum += probs
 
-        # 对集成模型的概率进行平均
         avg_probs = probs_sum / len(model_scaler_stats_triplets)
 
     pred_idx = int(np.argmax(avg_probs, axis=1)[0])

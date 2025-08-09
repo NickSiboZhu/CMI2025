@@ -20,13 +20,9 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[7, 5, 3],
+        kernel_sizes=[5, 5, 3],
         # NEW: Temporal aggregation options
-        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
-        temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
-        lstm_hidden=128,
-        bidirectional=False,
-        # NEW: ResNet-style residual connections
+        temporal_aggregation='global_pool',  # 'global_pool' or 'temporal_encoder'
         use_residual=True
     ),
 
@@ -39,14 +35,14 @@ model = dict(
         dropout_rate=0.5
     ),
 
-    # spec_branch_cfg=dict(
-    #     type='SpectrogramCNN',
-    #     in_channels=6,
-    #     filters=[32, 64, 128],
-    #     kernel_sizes=[3, 3, 3],
-    #     use_residual=True,
-    # ),
-    use_spec=False,
+    spec_branch_cfg=dict(
+        type='SpectrogramCNN',
+        in_channels=6,
+        filters=[32, 64, 128],
+        kernel_sizes=[3, 3, 3],
+        use_residual=True,
+    ),
+    # use_spec=False,
     # Disable TOF and THM branches entirely for IMU variant
     use_tof=False,
     use_thm=False,
