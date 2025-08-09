@@ -20,13 +20,9 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[7, 5, 3],
+        kernel_sizes=[5, 5, 3],
         # NEW: Temporal aggregation options
-        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
-        temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
-        lstm_hidden=128,
-        bidirectional=False,
-        # NEW: ResNet-style residual connections
+        temporal_aggregation='global_pool',  # 'global_pool' or 'temporal_encoder'
         use_residual=True
     ),
 
@@ -38,11 +34,7 @@ model = dict(
         filters=[32, 64, 128],           # different architecture for THM
         kernel_sizes=[5, 5, 3],
         # NEW: Temporal aggregation options
-        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
-        temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
-        lstm_hidden=128,
-        bidirectional=False,
-        # NEW: ResNet-style residual connections
+        temporal_aggregation='global_pool',  # 'global_pool' or 'temporal_encoder'
         use_residual=True
     ),
 
@@ -70,6 +62,14 @@ model = dict(
         hidden_dims=[64],
         output_dim=32,
         dropout_rate=0.5
+    ),
+
+    spec_branch_cfg=dict(
+        type='SpectrogramCNN',
+        in_channels=6,
+        filters=[32, 64, 128],
+        kernel_sizes=[3, 3, 3],
+        use_residual=True,
     ),
 
     # Enable THM and TOF branch processing
@@ -112,6 +112,7 @@ training = dict(
             thm=1e-3,
             tof=5e-4,
             mlp=2e-3,
+            spec=2e-3,
             fusion=2e-3,
         )
     ),

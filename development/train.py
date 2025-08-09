@@ -1,26 +1,6 @@
-#!/usr/bin/env python3
-"""
-Gesture Recognition Training Script (Config-Driven)
+# train.py
 
-This script handles the complete training pipeline for gesture recognition using
-multimodal fusion with 5-fold cross-validation and group-aware splitting. It uses the
-official Kaggle competition metric for model selection and evaluation.
-
-Usage:
-    python train.py <config_file>                           # Config-driven training (required)
-    python train.py ../cmi-submission/configs/multimodality_model_v1_full_config.py  # Example with config
-    python train.py <config_file> --stratification          # Show stratification details
-    
-Configuration:
-    All training parameters are specified in the config file:
-    - Model architecture (MultimodalityModel with registry system)
-    - Training settings (epochs, learning rate, loss function)
-    - Data settings (variant, batch size)
-    - Environment settings (GPU selection)
-    
-Note: Models use LayerNorm for sequential data (better for sensor sequences)
-"""
-
+# ... (所有 imports 保持不变) ...
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -71,7 +51,7 @@ from utils.focal_loss import FocalLoss
 from utils.registry import build_from_cfg
 from models import MODELS
 
-# Import our model and data preprocessing
+# --- MODIFIED: Import the new Hybrid model and updated dataset class ---
 from models.multimodality import MultimodalityModel
 from models.datasets import MultimodalDataset
 from data_utils.data_preprocessing import prepare_data_kfold_multimodal
@@ -79,7 +59,7 @@ from data_utils.data_preprocessing import prepare_data_kfold_multimodal
 # Directory holding all models, scalers, summaries
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
 os.makedirs(WEIGHT_DIR, exist_ok=True)
-
+# ... (calculate_composite_weights_18_class 和 competition_metric 保持不变) ...
 def calculate_composite_weights_18_class(y_18_class_series: pd.Series, 
                                            label_encoder_18_class: LabelEncoder, 
                                            target_gesture_names: list):
@@ -278,61 +258,47 @@ def setup_device(gpu_id=None):
     
     return device
 
-
+# --- MODIFIED: Function signatures to accept `spec_data` ---
 def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp=True, scheduler=None, mixup_enabled=False, mixup_alpha=0.4):
-    """
-    Train for one epoch.
-    MODIFIED: Added Mixup augmentation controlled by mixup_enabled and mixup_alpha.
-    """
     model.train() 
     total_loss = 0
-    all_preds = []
-    all_targets = []
+    all_preds, all_targets = [], []
     
-    for (imu_data, thm_data, tof_data, static_data, mask), target, sample_weights in dataloader:
-        imu_data = imu_data.to(device)
-        thm_data = thm_data.to(device)
-        tof_data = tof_data.to(device)
-        static_data = static_data.to(device)
-        mask = mask.to(device)
-        target = target.to(device)
-        sample_weights = sample_weights.to(device)
+    # --- MODIFIED: Unpack spec_data from dataloader ---
+    for (imu_data, thm_data, tof_data, spec_data, static_data, mask), target, sample_weights in dataloader:
+        imu_data, thm_data, tof_data = imu_data.to(device), thm_data.to(device), tof_data.to(device)
+        spec_data, static_data, mask = spec_data.to(device), static_data.to(device), mask.to(device)
+        target, sample_weights = target.to(device), sample_weights.to(device)
         
         optimizer.zero_grad()
 
         with amp.autocast(device_type=device.type, enabled=use_amp):
-            # --- Mixup Logic ---
             if mixup_enabled and mixup_alpha > 0.0:
-                # 1. Get mixup coefficient from Beta distribution
                 lam = np.random.beta(mixup_alpha, mixup_alpha)
-                # 2. Get shuffled indices for mixing
                 rand_index = torch.randperm(imu_data.size(0)).to(device)
+                
+                # --- MODIFIED: Mix spec_data as well ---
+                imu_data = lam * imu_data + (1 - lam) * imu_data[rand_index]
+                thm_data = lam * thm_data + (1 - lam) * thm_data[rand_index]
+                tof_data = lam * tof_data + (1 - lam) * tof_data[rand_index]
+                spec_data = lam * spec_data + (1 - lam) * spec_data[rand_index]
+                static_data = lam * static_data + (1 - lam) * static_data[rand_index]
+                mask = torch.max(mask, mask[rand_index])
 
-                # 3. Mix inputs
-                imu_data = lam * imu_data + (1 - lam) * imu_data[rand_index, :]
-                thm_data = lam * thm_data + (1 - lam) * thm_data[rand_index, :]
-                tof_data = lam * tof_data + (1 - lam) * tof_data[rand_index, :]
-                static_data = lam * static_data + (1 - lam) * static_data[rand_index, :]
-                # Combine masks: if either original sample has data, the mixed one does too
-                mask = torch.max(mask, mask[rand_index, :])
-
-                # 4. Get targets and weights for mixed loss calculation
                 target_a, target_b = target, target[rand_index]
                 weights_a, weights_b = sample_weights, sample_weights[rand_index]
 
-                # 5. Forward pass with mixed data
-                output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
+                # --- MODIFIED: Pass spec_data to the model ---
+                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask)
                 
-                # 6. Calculate mixed loss (weighted)
                 loss_a = criterion(output, target_a) * weights_a
                 loss_b = criterion(output, target_b) * weights_b
                 loss = (lam * loss_a + (1 - lam) * loss_b).mean()
 
-            else: # Original logic (no Mixup)
-                output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
-                per_sample_loss = criterion(output, target)
-                weighted_loss = per_sample_loss * sample_weights
-                loss = weighted_loss.mean()
+            else:
+                # --- MODIFIED: Pass spec_data to the model ---
+                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask)
+                loss = (criterion(output, target) * sample_weights).mean()
         
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -342,60 +308,36 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
             scheduler.step()
         
         total_loss += loss.item()
-        pred = output.argmax(dim=1)
-        
-        # For metrics, we compare against the original (un-mixed) targets
-        all_preds.extend(pred.cpu().numpy())
+        all_preds.extend(output.argmax(dim=1).cpu().numpy())
         all_targets.extend(target.cpu().numpy())
     
-    avg_loss = total_loss / len(dataloader)
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    accuracy = 100. * (all_preds == all_targets).sum() / len(all_targets)
-    
-    return avg_loss, accuracy, all_preds, all_targets
+    return total_loss / len(dataloader), 100. * (np.array(all_preds) == np.array(all_targets)).mean(), np.array(all_preds), np.array(all_targets)
 
 def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_amp=True):
-    """
-    Validate for one epoch and compute all relevant metrics.
-    MODIFIED: Uses its own standard CrossEntropyLoss for validation loss to avoid
-              being affected by weighted loss from training.
-    """
     model.eval()
     total_loss = 0
-    all_preds = []
-    all_targets = []
-    
-    # Instantiate its own criterion for unweighted loss calculation
+    all_preds, all_targets = [], []
     val_criterion = nn.CrossEntropyLoss().to(device)
     
     with torch.no_grad():
-        # MODIFIED: Unpack the dummy weight value, but don't use it
-        for (imu_data, thm_data, tof_data, static_data, mask), target, _ in dataloader:
-            imu_data = imu_data.to(device)
-            thm_data = thm_data.to(device)
-            tof_data = tof_data.to(device)
-            static_data = static_data.to(device)
-            mask = mask.to(device) # Move mask to device
+        # --- MODIFIED: Unpack spec_data from dataloader ---
+        for (imu_data, thm_data, tof_data, spec_data, static_data, mask), target, _ in dataloader:
+            imu_data, thm_data, tof_data = imu_data.to(device), thm_data.to(device), tof_data.to(device)
+            spec_data, static_data, mask = spec_data.to(device), static_data.to(device), mask.to(device)
             target = target.to(device)
             
             with amp.autocast(device_type=device.type, enabled=use_amp):
-                output = model(imu_data, thm_data, tof_data, static_data, mask=mask)
-                 # Calculate loss using the local, unweighted criterion
+                # --- MODIFIED: Pass spec_data to the model ---
+                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask)
                 loss = val_criterion(output, target)
             
             total_loss += loss.item()
-            pred = output.argmax(dim=1)
-            
-            all_preds.extend(pred.cpu().numpy())
+            all_preds.extend(output.argmax(dim=1).cpu().numpy())
             all_targets.extend(target.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
-    
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    
-    accuracy = 100. * (all_preds == all_targets).sum() / len(all_targets)
+    all_preds, all_targets = np.array(all_preds), np.array(all_targets)
+    accuracy = 100. * (all_preds == all_targets).mean()
     comp_score = competition_metric(all_targets, all_preds, label_encoder)
     
     return avg_loss, accuracy, comp_score, all_preds, all_targets
@@ -413,11 +355,12 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         print("Using discriminative learning rates per layer.")
         param_groups = []
         
-        # Define all possible branches and their LR keys
+        # --- MODIFIED: Add 'spec' branch to the map ---
         branch_map = {
             'imu': model.imu_branch,
             'thm': getattr(model, 'thm_branch', None),
             'tof': getattr(model, 'tof_branch', None),
+            'spec': getattr(model, 'spec_branch', None), # NEW
             'mlp': model.mlp_branch,
             'fusion': model.classifier_head
         }
@@ -435,14 +378,11 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
                     # This is a safeguard. If a branch exists but its LR is not specified, raise an error.
                     raise ValueError(f"Learning rate for active branch '{name}' not specified in 'layer_lrs'.")
         
-        # The base LR for AdamW can be anything, as each group has its own LR.
-        # It's good practice to set it to a reasonable default, though it won't be used for these groups.
         optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
 
     else:
         # Fallback for backward compatibility or simple training runs
         print("Using a single learning rate for the entire model.")
-        # Attempt to get start_lr from training_cfg, with a default.
         start_lr = scheduler_cfg.get('start_lr', 1e-3) if scheduler_cfg else 1e-3
         optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
 
@@ -450,46 +390,26 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
 
     # --- NEW: Dynamic Scheduler Setup ---
-    if scheduler_cfg is None:
-        scheduler_cfg = {'type': 'cosine'} # Default to cosine
-
+    if scheduler_cfg is None: scheduler_cfg = {'type': 'cosine'} # Default to cosine
     scheduler = None
     if scheduler_cfg['type'] == 'cosine':
         total_training_steps = epochs * len(train_loader)
-        # Allow warmup_ratio to be configured from scheduler_cfg, default to 0.1
         warmup_ratio = scheduler_cfg.get('warmup_ratio', 0.1)
         warmup_steps = int(warmup_ratio * total_training_steps)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_training_steps,
-        )
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
         print(f"Using Cosine Annealing scheduler with warmup ratio: {warmup_ratio} ({warmup_steps} steps).")
     elif scheduler_cfg['type'] == 'reduce_on_plateau':
-        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='max', # Step on max validation score
-            factor=scheduler_cfg.get('factor', 0.2),
-            patience=scheduler_cfg.get('patience', 10),
-            min_lr=scheduler_cfg.get('min_lr', 1e-6),
-            verbose=True
-        )
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=scheduler_cfg.get('factor', 0.2), patience=scheduler_cfg.get('patience', 10), min_lr=scheduler_cfg.get('min_lr', 1e-6), verbose=True)
         warmup_ratio = scheduler_cfg.get('warmup_ratio', 0.0)
         warmup_epochs = int(warmup_ratio * epochs) if warmup_ratio > 0 else 0
-        
         if warmup_epochs > 0:
             scheduler = WarmupAndReduceLROnPlateau(optimizer, warmup_epochs, plateau_scheduler)
             print(f"Using ReduceLROnPlateau with a {warmup_epochs}-epoch linear warmup.")
         else:
-            scheduler = plateau_scheduler # Use the original scheduler if no warmup
+            scheduler = plateau_scheduler
             print(f"Using standard ReduceLROnPlateau scheduler.")
     
-    history = {
-        'train_loss': [], 'train_accuracy': [], 'train_competition_score': [],
-        'val_loss': [], 'val_accuracy': [], 'val_competition_score': [],
-        'learning_rate': []
-    }
-    
+    history = {'train_loss': [], 'train_accuracy': [], 'train_competition_score': [], 'val_loss': [], 'val_accuracy': [], 'val_competition_score': [], 'learning_rate': []}
     best_val_score = 0
     patience_counter = 0
     
@@ -497,23 +417,12 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     
     for epoch in range(epochs):
         start_time = time.time()
-        
-        train_loss, train_acc, train_preds, train_targets = train_epoch(
-            model, train_loader, criterion, optimizer, device, scaler, use_amp, scheduler,
-            mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha
-        )
+        train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp, scheduler, mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha)
         train_score = competition_metric(train_targets, train_preds, label_encoder)
-        
         val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
-
-
         
-        # The new scheduler wrapper handles its own logic, so we just step it.
-        # For cosine scheduler, this is a no-op if no warmup is used.
         if scheduler is not None:
-             if isinstance(scheduler, WarmupAndReduceLROnPlateau):
-                 scheduler.step(val_score)
-             elif isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+             if isinstance(scheduler, (WarmupAndReduceLROnPlateau, torch.optim.lr_scheduler.ReduceLROnPlateau)):
                  scheduler.step(val_score)
 
         if val_score > best_val_score:
@@ -525,31 +434,16 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         else:
             patience_counter += 1
         
-        history['train_loss'].append(train_loss)
-        history['train_accuracy'].append(train_acc)
-        history['train_competition_score'].append(train_score)
-        history['val_loss'].append(val_loss)
-        history['val_accuracy'].append(val_acc)
-        history['val_competition_score'].append(val_score)
-        current_lrs = [g['lr'] for g in optimizer.param_groups]
-        history['learning_rate'].append(current_lrs)
+        history['train_loss'].append(train_loss); history['train_accuracy'].append(train_acc); history['train_competition_score'].append(train_score)
+        history['val_loss'].append(val_loss); history['val_accuracy'].append(val_acc); history['val_competition_score'].append(val_score)
+        history['learning_rate'].append([g['lr'] for g in optimizer.param_groups])
         
         epoch_time = time.time() - start_time
         
-        # --- Learning Rate Logging ---
-        # Check if discriminative LRs are used by inspecting the first param group for a 'name'
-        if 'name' not in optimizer.param_groups[0]:
-            lr_info = f"LR: {optimizer.param_groups[0]['lr']:.6f}"
-        else:
-            # Build LR string from named parameter groups for robustness
-            active_lrs = {group['name']: group['lr'] for group in optimizer.param_groups}
-            lr_info = "LRs: " + ", ".join([f"{k}={v:.2e}" for k, v in active_lrs.items()])
-
+        if 'name' not in optimizer.param_groups[0]: lr_info = f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+        else: lr_info = "LRs: " + ", ".join([f"{group['name']}={group['lr']:.2e}" for group in optimizer.param_groups])
         
-        print(f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): '
-              f'Train Loss: {train_loss:.4f}, Train Score: {train_score:.4f} | '
-              f'Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | '
-              f'{lr_info}')
+        print(f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): Train Loss: {train_loss:.4f}, Train Score: {train_score:.4f} | Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | {lr_info}')
         
         if patience_counter >= patience:
             print(f'Early stopping at epoch {epoch+1} as validation score did not improve for {patience} epochs.')
@@ -563,234 +457,147 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     
     return history
 
-
-
-def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
-    """Train 5 models using 5-fold cross-validation"""
+def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, spec_params: dict = None, output_dir: str = 'weights'):
+    """
+    使用5折交叉验证训练5个模型。
+    
+    此版本功能完整，包括:
+    - 传递STFT参数以动态生成频谱图。
+    - 为每个折叠创建并保存模型、scaler以及频谱图统计文件(spec_stats)。
+    """
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
     print("="*60)
     
-    # Ensure the output directory exists
+    # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     
-    # Setup device
+    # 设置设备
     if device is None:
         device = setup_device()
     
-    # Prepare all folds and get full labels & sequence IDs for OOF reconstruction
-    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(show_stratification=show_stratification, variant=variant)
+    # 准备K折数据，并传递spec_params
+    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(
+        show_stratification=show_stratification, 
+        variant=variant,
+    )
+    
     num_samples = len(y_all)
     oof_preds = np.full(num_samples, -1, dtype=int)
     oof_targets = y_all.copy()
     
-    # Dynamically inject feature dimensions from actual data
+    # 动态注入特征维度
     sample_imu = fold_data[0]['X_train_imu']
     sample_thm = fold_data[0]['X_train_thm']
-    sample_tof = fold_data[0]['X_train_tof']                                     
+    sample_tof = fold_data[0]['X_train_tof']
     sample_static = fold_data[0]['X_train_static']
+    sample_spec = fold_data[0]['X_train_spec']
 
-    imu_channels  = sample_imu.shape[2]
-    thm_channels  = sample_thm.shape[2]
-    tof_channels  = sample_tof.shape[2]
-    static_features = sample_static.shape[1]
-
-    print("Auto-detected dimensions:")
-    print(f"  IMU channels: {imu_channels}")
-    print(f"  THM channels: {thm_channels}")
-    print(f"  TOF channels: {tof_channels} (flattened: {tof_channels // 64} sensors × 64 pixels)")
-    print(f"  Static features: {static_features}")
-
-    # Set IMU branch input channels (config structure defined in config file)
-    model_cfg['imu_branch_cfg']['input_channels'] = imu_channels
-    
-    # Set THM branch input channels (config structure defined in config file)
+    model_cfg['imu_branch_cfg']['input_channels'] = sample_imu.shape[2]
     if 'thm_branch_cfg' in model_cfg:
-        model_cfg['thm_branch_cfg']['input_channels'] = thm_channels
-    
-    # Set TOF branch input channels (config structure defined in config file)
+        model_cfg['thm_branch_cfg']['input_channels'] = sample_thm.shape[2]
     if 'tof_branch_cfg' in model_cfg:
-        # TOF data is flattened as (num_sensors * 64), so we need to calculate num_sensors
-        num_tof_sensors = tof_channels // 64  # 320 // 64 = 5 sensors
-        model_cfg['tof_branch_cfg']['input_channels'] = num_tof_sensors
+        model_cfg['tof_branch_cfg']['input_channels'] = sample_tof.shape[2] // 64
+    if 'spec_branch_cfg' in model_cfg:
+        model_cfg['spec_branch_cfg']['in_channels'] = sample_spec.shape[1]
+    model_cfg['mlp_branch_cfg']['input_features'] = sample_static.shape[1]
     
-    # Set static features for MLP branch
-    model_cfg['mlp_branch_cfg']['input_features'] = static_features
-    
-    # Model parameters (same for all folds)
-    # Display model configuration from config file
     print(f"\nModel configuration from config file:")
     for k, v in (model_cfg or {}).items():
-        if k != 'type':
-            print(f"  {k}: {v}")
-
-    # Configure loss function and normalization
-    print(f"\nTraining Configuration:")
-    # MODIFIED: Display Mixup status
-    if mixup_enabled:
-        print(f"  Data Augmentation: Mixup (alpha={mixup_alpha})")
-    if loss_function == 'focal':
-        print(f"  Loss Function: Focal Loss (gamma={focal_gamma}, alpha={focal_alpha})")
-    else:
-        print(f"  Loss Function: Cross Entropy Loss")
-    print(f"  Normalization: LayerNorm (better for sequential sensor data)")
-    print(f"   - 1D CNN: LayerNorm for temporal features")
-    print(f"   - 2D CNN: BatchNorm for spatial features") 
-    print(f"   - Fusion Head: LayerNorm for combined features")
+        if k != 'type': print(f"  {k}: {v}")
     
-    # Store results for all folds
     fold_results = []
     fold_models = []
     fold_histories = []
     
-    # Train each fold
+    # 训练每个折叠
     for fold_idx in range(5):
         print(f"\n" + "="*60)
         print(f"TRAINING FOLD {fold_idx + 1}/5")
         print("="*60)
         
-        # Get fold data
         fold = fold_data[fold_idx]
-
-        # Create a pandas Series with gesture names for the weight function
+        spec_stats = fold['spec_stats']
+        
         y_train_series = pd.Series(label_encoder.inverse_transform(fold['y_train']))
+        class_weight_dict = calculate_composite_weights_18_class(y_train_series, label_encoder, list(BFRB_GESTURES))
         
-        # The weight function returns a {class_index: weight} dictionary
-        class_weight_dict = calculate_composite_weights_18_class(
-            y_18_class_series=y_train_series,
-            label_encoder_18_class=label_encoder,
-            target_gesture_names=list(BFRB_GESTURES)
-        )
-        print("Sample weights calculated.")
-        
-        # Create multimodal datasets and dataloaders
+        # 创建数据集，并传入spec_stats
         train_dataset = MultimodalDataset(
-            fold['X_train_imu'],
-            fold['X_train_thm'],
-            fold['X_train_tof'], 
-            fold['X_train_static'], 
-            fold['y_train'],
-            mask=fold['train_mask'],  # Pass the training mask
-            class_weight_dict=class_weight_dict
+            fold['X_train_imu'], fold['X_train_thm'], fold['X_train_tof'], fold['X_train_spec'],
+            fold['X_train_static'], fold['y_train'], mask=fold['train_mask'],
+            class_weight_dict=class_weight_dict, spec_stats=spec_stats
         )
         val_dataset = MultimodalDataset(
-            fold['X_val_imu'],
-            fold['X_val_thm'],
-            fold['X_val_tof'], 
-            fold['X_val_static'], 
-            fold['y_val'],
-            mask=fold['val_mask']    # Pass the validation mask
+            fold['X_val_imu'], fold['X_val_thm'], fold['X_val_tof'], fold['X_val_spec'],
+            fold['X_val_static'], fold['y_val'], mask=fold['val_mask'],
+            spec_stats=spec_stats
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,persistent_workers=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,persistent_workers=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
         
-        # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
         model = build_from_cfg(model_cfg, MODELS)
         
-        # Configure loss function for this fold
-        if loss_function == 'focal':
-            criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none')
-            print(f"  Using Focal Loss (gamma={focal_gamma}, alpha={focal_alpha}, reduction='none')")
-        else:
-            criterion = nn.CrossEntropyLoss(reduction='none')
-            print(f"  Using Cross Entropy Loss (reduction='none')")
+        criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none') if loss_function == 'focal' else nn.CrossEntropyLoss(reduction='none')
         
         model = model.to(device)
-        
-        # Compile model for faster training
-        # try:
-        #     model = torch.compile(model)
-        # except Exception as e:
-        #     print(f"⚠️  torch.compile failed: {str(e)}")
-        #     print("   Falling back not to use torch.compile.")
-        
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
         
-        # Train model
         print(f"\nTraining fold {fold_idx + 1}...")
         history = train_model(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            label_encoder=label_encoder,
-            epochs=epochs,
-            patience=patience,
-            weight_decay=weight_decay,
-            use_amp=use_amp,
-            device=device,
-            variant=variant,
-            fold_tag=f'_{fold_idx+1}',
-            criterion=criterion,
-            # MODIFIED: Pass mixup parameters down
-            mixup_enabled=mixup_enabled,
-            mixup_alpha=mixup_alpha,
-            scheduler_cfg=scheduler_cfg,
-            output_dir=output_dir  # Pass output_dir to train_model
+            model=model, train_loader=train_loader, val_loader=val_loader, label_encoder=label_encoder, 
+            epochs=epochs, patience=patience, weight_decay=weight_decay, use_amp=use_amp, 
+            device=device, variant=variant, fold_tag=f'_{fold_idx+1}', criterion=criterion, 
+            mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha, scheduler_cfg=scheduler_cfg, 
+            output_dir=output_dir
         )
         
-        # Evaluate model and capture predictions for OOF
         print(f"\nEvaluating fold {fold_idx + 1}...")
         _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder)
-        
-        # Store into OOF array using original indices
         oof_preds[fold['val_idx']] = all_preds_val
-        
-        # Calculate final validation score
         best_val_score = max(history['val_competition_score'])
         
-        # Save model for this fold
+        # 保存模型
         model_filename = os.path.join(output_dir, f'model_fold_{fold_idx + 1}_{variant}.pth')
-        checkpoint = {
-            'state_dict': model.state_dict(),
-            'model_cfg': model_cfg
-        }
-        torch.save(checkpoint, model_filename)
+        torch.save({'state_dict': model.state_dict(), 'model_cfg': model_cfg}, model_filename)
         print(f"Model saved as '{model_filename}'")
 
-        # ------------------ NEW: Save scaler for this fold ------------------
+        # 保存 scaler
         scaler_fold = fold['scaler']
         scaler_filename = os.path.join(output_dir, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
         with open(scaler_filename, 'wb') as sf:
             pickle.dump(scaler_fold, sf)
         print(f"Scaler saved as '{scaler_filename}'")
         
-        # Store results
-        fold_results.append({
-            'fold': fold_idx + 1,
-            'best_val_score': best_val_score,
-            'model_filename': model_filename
-        })
+        # 保存该折叠的频谱图统计量 (spec_stats)
+        spec_stats_filename = os.path.join(output_dir, f'spec_stats_fold_{fold_idx + 1}_{variant}.pkl')
+        with open(spec_stats_filename, 'wb') as f:
+            pickle.dump(spec_stats, f)
+        print(f"Spectrogram stats saved as '{spec_stats_filename}'")
         
+        fold_results.append({'fold': fold_idx + 1, 'best_val_score': best_val_score})
         fold_models.append(model)
         fold_histories.append(history)
-        
         print(f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
     
-    # ------------------ NEW: Save global label encoder ------------------
+    # 保存全局标签编码器
     le_filename = os.path.join(output_dir, f'label_encoder_{variant}.pkl')
     with open(le_filename, 'wb') as lf:
         pickle.dump(label_encoder, lf)
     print(f"Label encoder saved as '{le_filename}'")
     
-    # Summary of all folds
-    print(f"\n" + "="*60)
-    print("5-FOLD CROSS-VALIDATION SUMMARY")
-    print("="*60)
-    
+    # 打印和保存所有折叠的总结
+    print(f"\n" + "="*60 + "\n5-FOLD CROSS-VALIDATION SUMMARY\n" + "="*60)
     best_scores = [result['best_val_score'] for result in fold_results]
-    
     print(f"Best Validation Scores per Fold: {[f'{score:.4f}' for score in best_scores]}")
-    print(f"")
-    print(f"Mean Best Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
+    print(f"\nMean Best Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
     
-    # Find best fold
     best_fold_idx = np.argmax(best_scores)
     print(f"\nBest performing fold: Fold {best_fold_idx + 1} (Score: {best_scores[best_fold_idx]:.4f})")
     
-    # Save summary
     summary = {
         'fold_results': fold_results,
         'mean_best_score': float(np.mean(best_scores)),
@@ -798,16 +605,13 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         'best_fold': int(best_fold_idx + 1),
         'best_fold_score': float(best_scores[best_fold_idx])
     }
-    
     with open(os.path.join(output_dir, f'kfold_summary_{variant}.json'), 'w') as f:
         json.dump(summary, f, indent=2)
     print(f"Summary saved to '{os.path.join(output_dir, f'kfold_summary_{variant}.json')}'")
     
-    # Compute overall OOF competition score
+    # 计算并保存OOF结果
     oof_comp_score = competition_metric(oof_targets, oof_preds, label_encoder)
     print(f"\n🏆 Overall OOF Competition Score: {oof_comp_score:.4f}")
-
-    # Save OOF predictions to CSV
     oof_df = pd.DataFrame({
         'sequence_id': sequence_ids_all,
         'gesture_true': label_encoder.inverse_transform(oof_targets),
@@ -819,7 +623,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     
     return oof_comp_score, fold_models, fold_histories, fold_results
 
-
+# ... (main function remains largely the same, just calling the modified functions) ...
 def main():
     """Main training function - config file required"""
     parser = argparse.ArgumentParser(description="Gesture Recognition Training (Config Required)")

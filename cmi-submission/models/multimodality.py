@@ -13,15 +13,13 @@ from . import fusion_head  # Import fusion head module
 @MODELS.register_module()
 class MultimodalityModel(nn.Module):
     """
-    A multimodal fusion model for gesture recognition.
+    A hybrid multimodal fusion model for gesture recognition.
 
     This model combines:
-    1. A 1D CNN branch for processing IMU sequential sensor data
-    2. A 1D CNN branch for processing THM (thermopile) sequential data
-    3. A 2D CNN branch for processing TOF sensor grids (spatial depth information)
-    4. An MLP branch for processing static demographic data
-    
-    The features from all branches are fused and passed to a final classifier head.
+    1. A 1D CNN branch for processing IMU/THM time-domain data.
+    2. A 2D CNN branch for processing Spectrograms (time-frequency data).
+    3. A 2D CNN branch for processing TOF sensor grids.
+    4. An MLP branch for processing static demographic data.
     """
     def __init__(self,
                  # --- required configs ---
@@ -33,171 +31,102 @@ class MultimodalityModel(nn.Module):
                  fusion_head_cfg: dict = None,
                  tof_branch_cfg: dict = None,
                  thm_branch_cfg: dict = None,
+                 # --- NEW: Config for the spectrogram branch ---
+                 spec_branch_cfg: dict = None,
                  # --- modality toggles ---
                  use_tof: bool = True,
                  use_thm: bool = True,
+                 # --- NEW: Toggle for the spectrogram branch ---
+                 use_spec: bool = True,
                  ):
-        """
-        MultimodalityModel constructor. All configuration is provided via config dicts.
-        Each branch (CNN1D for IMU, CNN1D for THM, MLP, TOF2D) has its own config dict for maximum flexibility.
-        """
         super(MultimodalityModel, self).__init__()
 
         # Store modality flags
         self.use_tof = use_tof
         self.use_thm = use_thm
+        # --- NEW: Store spectrogram flag ---
+        self.use_spec = use_spec
 
-        # ------------------------------------------------------------------
-        # 1. Build 1-D CNN branch for IMU
-        # ------------------------------------------------------------------
-        imu_branch_cfg = imu_branch_cfg.copy()
-
+        # --- Build 1D CNN branches (IMU, THM) ---
         self.imu_branch = build_from_cfg(imu_branch_cfg, MODELS)
-        self.imu_output_size = getattr(self.imu_branch, 'cnn_output_size', None)
-        if self.imu_output_size is None:
-            raise AttributeError("CNN1D model must have attribute 'cnn_output_size'")
-
-        # ------------------------------------------------------------------
-        # 2. Build 1-D CNN branch for THM (thermopile) (optional)
-        # ------------------------------------------------------------------
+        self.imu_output_size = self.imu_branch.cnn_output_size
+        
         if self.use_thm:
-            thm_branch_cfg = thm_branch_cfg.copy()
-
-            # Ensure required parameters are set
-            thm_branch_cfg.setdefault('type', 'CNN1D')
-            thm_branch_cfg.setdefault('sequence_length', sequence_length)
-
             self.thm_branch = build_from_cfg(thm_branch_cfg, MODELS)
-            self.thm_output_size = getattr(
-                self.thm_branch,
-                'cnn_output_size',
-                thm_branch_cfg.get('output_dim', 64)
-            )
+            self.thm_output_size = self.thm_branch.cnn_output_size
         else:
-            # THM disabled
             self.thm_branch = None
             self.thm_output_size = 0
 
-        # ------------------------------------------------------------------
-        # 3. Build 2-D CNN branch for TOF (optional)
-        # ------------------------------------------------------------------
-        if self.use_tof:
-            tof_branch_cfg = tof_branch_cfg.copy()
-
-            self.tof_branch = build_from_cfg(tof_branch_cfg, MODELS)
-            # Infer output size strictly from the instantiated branch first ― this captures
-            # dynamic situations (e.g., bidirectional LSTM doubling hidden size).
-            # Fall back to config only if the attribute is missing.
-            self.tof_2d_output_size = getattr(self.tof_branch, 'out_features', tof_branch_cfg.get('out_features', 128))
+        # --- NEW: Build 2D CNN branch for Spectrograms ---
+        if self.use_spec:
+            spec_branch_cfg = spec_branch_cfg.copy()
+            self.spec_branch = build_from_cfg(spec_branch_cfg, MODELS)
+            self.spec_output_size = self.spec_branch.out_features
         else:
-            # TOF disabled → no branch, zero additional features
+            self.spec_branch = None
+            self.spec_output_size = 0
+            
+        # --- Build 2D CNN branch for TOF ---
+        if self.use_tof:
+            self.tof_branch = build_from_cfg(tof_branch_cfg, MODELS)
+            self.tof_2d_output_size = self.tof_branch.out_features
+        else:
             self.tof_branch = None
             self.tof_2d_output_size = 0
 
-        # ------------------------------------------------------------------
-        # 4. Build MLP branch
-        # ------------------------------------------------------------------
-        mlp_branch_cfg = mlp_branch_cfg.copy()
-
-        # build branch
+        # --- Build MLP branch ---
         self.mlp_branch = build_from_cfg(mlp_branch_cfg, MODELS)
-        self.mlp_output_size = getattr(self.mlp_branch, 'output_dim', mlp_branch_cfg.get('output_dim', 32))
+        self.mlp_output_size = self.mlp_branch.output_dim
 
-        # ------------------------------------------------------------------
-        # 5. Fusion head (configurable)
-        # ------------------------------------------------------------------
-        # Dynamically calculate combined feature size from actual branch outputs
+        # --- Fusion head ---
         combined_feature_size = (self.imu_output_size + self.thm_output_size + 
-                               self.tof_2d_output_size + self.mlp_output_size)
-
-        # Ensure required parameters are set
-        fusion_head_cfg = fusion_head_cfg.copy()
-        fusion_head_cfg.setdefault('type', 'FusionHead')
-        fusion_head_cfg['num_classes'] = num_classes
-        fusion_head_cfg['input_dim'] = combined_feature_size  # FusionHead expects 'input_dim'
+                               self.spec_output_size + self.tof_2d_output_size + 
+                               self.mlp_output_size)
         
-        # Print for visibility during model construction
+        fusion_head_cfg['num_classes'] = num_classes
+        fusion_head_cfg['input_dim'] = combined_feature_size
+        
         print(f"\n[MultimodalityModel] Detected branch output dimensions:")
-        print(f"  IMU: {self.imu_output_size}")
-        if self.use_thm:
-            print(f"  THM: {self.thm_output_size}")
-        if self.use_tof:
-            print(f"  TOF: {self.tof_2d_output_size}")
+        print(f"  IMU (1D): {self.imu_output_size}")
+        if self.use_thm: print(f"  THM (1D): {self.thm_output_size}")
+        if self.use_spec: print(f"  Spectrogram (2D): {self.spec_output_size}")
+        if self.use_tof: print(f"  TOF (2D): {self.tof_2d_output_size}")
         print(f"  MLP: {self.mlp_output_size}")
         print(f"  Total combined features: {combined_feature_size}")
-
-        # For advanced fusion heads, collect and pass branch dimensions
-        fusion_type = fusion_head_cfg.get('type', 'FusionHead')
-        if fusion_type in ['BilinearFusionHead', 'AttentionFusionHead', 'TransformerFusionHead']:
-            branch_dims = []
-            # The order must match the feature concatenation order in the forward pass
-            branch_dims.append(self.imu_output_size)
-            if self.use_thm:
-                branch_dims.append(self.thm_output_size)
-            branch_dims.append(self.mlp_output_size)
-            if self.use_tof:
-                branch_dims.append(self.tof_2d_output_size)
-            fusion_head_cfg['branch_dims'] = branch_dims
-
+        
         self.classifier_head = build_from_cfg(fusion_head_cfg, MODELS)
 
-    def forward(self, imu_input: torch.Tensor, thm_input: torch.Tensor, tof_input: torch.Tensor, static_input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+    # --- MODIFIED: Updated forward pass signature ---
+    def forward(self, imu_input: torch.Tensor, thm_input: torch.Tensor, 
+                tof_input: torch.Tensor, spec_input: torch.Tensor, 
+                static_input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
-        Defines the forward pass logic of the multimodal fusion model.
-        
-        Args:
-            imu_input: IMU sequential sensor data (batch_size, seq_len, imu_features)
-            thm_input: THM sequential sensor data (batch_size, seq_len, thm_features)
-            tof_input: TOF sensor data (batch_size, seq_len, 320) - 5 sensors × 64 pixels
-            static_input: Static demographic data (batch_size, static_features)
-            mask: An optional boolean tensor to mask padded elements in sequences. (batch_size, seq_len)
+        Defines the forward pass logic of the hybrid multimodal fusion model.
         """
-        # 1. Process IMU data through the 1D CNN branch
+        # 1. Process 1D time-domain data
         imu_features = self.imu_branch(imu_input, mask=mask)
-        
-        # 2. Process THM data (optional)
         thm_features = self.thm_branch(thm_input, mask=mask) if self.use_thm else None
         
-        # 3. Process TOF data (optional)
+        # 2. Process 2D time-frequency data (Spectrograms)
+        spec_features = self.spec_branch(spec_input) if self.use_spec else None
+        
+        # 3. Process 2D spatial data (TOF)
         tof_features = self.tof_branch(tof_input, mask=mask) if self.use_tof else None
         
-        # 4. Process static data through the MLP branch
+        # 4. Process static data
         mlp_features = self.mlp_branch(static_input)
         
-        # 5. Concatenate the features from all branches
+        # 5. Concatenate features from all active branches
         features_to_concat = [imu_features]
-        if thm_features is not None:
-            features_to_concat.append(thm_features)
+        if thm_features is not None: features_to_concat.append(thm_features)
+        if spec_features is not None: features_to_concat.append(spec_features)
+        if tof_features is not None: features_to_concat.append(tof_features)
         features_to_concat.append(mlp_features)
-        if tof_features is not None:
-            features_to_concat.append(tof_features)
         
         combined_features = torch.cat(features_to_concat, dim=1)
         
-        # 6. Pass the fused features through the final classifier head
+        # 6. Final classification
         output = self.classifier_head(combined_features)
         
         return output
-
-    def get_model_info(self) -> dict:
-        """
-        Helper function to return the model's total parameter count and approximate size.
-        """
-        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        model_size_mb = total_params * 4 / (1024**2)  # Assuming float32 parameters
-        
-        # Get info from individual branches
-        imu_info = self.imu_branch.get_model_info()
-        thm_info = self.thm_branch.get_model_info() if self.thm_branch is not None else {'total_params': 0}
-        tof_info = self.tof_branch.get_model_info() if self.tof_branch is not None else {'total_params': 0}
-        mlp_info = self.mlp_branch.get_model_info()
-        
-        return {
-            'total_params': total_params, 
-            'model_size_mb': model_size_mb,
-            'imu_params': imu_info['total_params'],
-            'thm_params': thm_info['total_params'],
-            'tof_params': tof_info['total_params'],
-            'mlp_params': mlp_info['total_params'],
-            'fusion_head_params': total_params - imu_info['total_params'] - thm_info['total_params'] - tof_info['total_params'] - mlp_info['total_params']
-        } 
