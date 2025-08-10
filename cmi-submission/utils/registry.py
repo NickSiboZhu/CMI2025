@@ -35,7 +35,7 @@ class Registry:
 
 
 def build_from_cfg(cfg: Dict[str, Any], registry: Registry, default_args: Optional[Dict[str, Any]] = None):
-    """Instantiate an object from a config dict."""
+    """Instantiate an object from a config dict (strict, config-driven)."""
     if not isinstance(cfg, dict):
         raise TypeError("cfg must be a dict")
     if "type" not in cfg:
@@ -47,7 +47,5 @@ def build_from_cfg(cfg: Dict[str, Any], registry: Registry, default_args: Option
     if obj_cls is None:
         raise KeyError(f"{obj_type} is not registered in the `{registry.name}` registry")
 
-    if default_args:
-        for k, v in default_args.items():
-            args.setdefault(k, v)
+    # Remove fallback default_args merging to ensure everything comes from cfg
     return obj_cls(**args) 

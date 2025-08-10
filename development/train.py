@@ -44,6 +44,19 @@ import pandas as pd
 import importlib.util, runpy
 from torch import amp  
 
+
+def set_seed(seed_value=42):
+    """Set seed for reproducibility."""
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    torch.cuda.manual_seed(seed_value)
+    torch.cuda.manual_seed_all(seed_value)  # if you are using multi-GPU.
+    os.environ['PYTHONHASHSEED'] = str(seed_value)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"Random seed set to {seed_value}")
+
+
 # --- Helper to load python config file ---
 
 def load_py_config(config_path):
@@ -113,10 +126,11 @@ def calculate_composite_weights_18_class(y_18_class_series: pd.Series,
     normalized_weights = {name: w / avg_raw_weight for name, w in raw_weights.items()}
     
     # 创建最终的 class_weight 字典 {class_index: weight}
-    class_weight_dict = {
-        idx: normalized_weights.get(name, 1.0)
-        for idx, name in enumerate(label_encoder_18_class.classes_)
-    }
+    class_weight_dict = {}
+    for idx, name in enumerate(label_encoder_18_class.classes_):
+        if name not in normalized_weights:
+            raise KeyError(f"Missing normalized weight for class '{name}'. Check class_weights calculation.")
+        class_weight_dict[idx] = normalized_weights[name]
     print(class_weight_dict)
 
     return class_weight_dict
@@ -407,7 +421,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         criterion = nn.CrossEntropyLoss()
 
     # --- NEW: Optimizer setup with specific layer learning rates ---
-    layer_lrs = scheduler_cfg.get('layer_lrs') if scheduler_cfg else None
+    layer_lrs = scheduler_cfg['layer_lrs'] if scheduler_cfg else None
     
     if layer_lrs:
         print("Using discriminative learning rates per layer.")
@@ -442,8 +456,8 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     else:
         # Fallback for backward compatibility or simple training runs
         print("Using a single learning rate for the entire model.")
-        # Attempt to get start_lr from training_cfg, with a default.
-        start_lr = scheduler_cfg.get('start_lr', 1e-3) if scheduler_cfg else 1e-3
+        # Strict: require start_lr in scheduler_cfg if single LR path is used
+        start_lr = scheduler_cfg['start_lr'] if scheduler_cfg else 1e-3
         optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
 
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
@@ -456,8 +470,8 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     scheduler = None
     if scheduler_cfg['type'] == 'cosine':
         total_training_steps = epochs * len(train_loader)
-        # Allow warmup_ratio to be configured from scheduler_cfg, default to 0.1
-        warmup_ratio = scheduler_cfg.get('warmup_ratio', 0.1)
+        # Warmup_ratio is now required for this scheduler type
+        warmup_ratio = scheduler_cfg['warmup_ratio']
         warmup_steps = int(warmup_ratio * total_training_steps)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
@@ -466,15 +480,16 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         )
         print(f"Using Cosine Annealing scheduler with warmup ratio: {warmup_ratio} ({warmup_steps} steps).")
     elif scheduler_cfg['type'] == 'reduce_on_plateau':
+        # All parameters are now required for this scheduler type
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='max', # Step on max validation score
-            factor=scheduler_cfg.get('factor', 0.2),
-            patience=scheduler_cfg.get('patience', 10),
-            min_lr=scheduler_cfg.get('min_lr', 1e-6),
+            factor=scheduler_cfg['factor'],
+            patience=scheduler_cfg['patience'],
+            min_lr=scheduler_cfg['min_lr'],
             verbose=True
         )
-        warmup_ratio = scheduler_cfg.get('warmup_ratio', 0.0)
+        warmup_ratio = scheduler_cfg['warmup_ratio']
         warmup_epochs = int(warmup_ratio * epochs) if warmup_ratio > 0 else 0
         
         if warmup_epochs > 0:
@@ -565,7 +580,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
 
-def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
+def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR, num_workers: int = 4, max_length: int = 100):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -579,7 +594,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         device = setup_device()
     
     # Prepare all folds and get full labels & sequence IDs for OOF reconstruction
-    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(show_stratification=show_stratification, variant=variant)
+    fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(
+        show_stratification=show_stratification, 
+        variant=variant,
+        max_length=max_length
+    )
     num_samples = len(y_all)
     oof_preds = np.full(num_samples, -1, dtype=int)
     oof_targets = y_all.copy()
@@ -679,11 +698,12 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             fold['X_val_tof'], 
             fold['X_val_static'], 
             fold['y_val'],
-            mask=fold['val_mask']    # Pass the validation mask
+            mask=fold['val_mask'],    # Pass the validation mask
+            class_weight_dict=class_weight_dict
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True,persistent_workers=True)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True,persistent_workers=True)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True,persistent_workers=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True,persistent_workers=True)
         
         # Build model for this fold
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -832,22 +852,45 @@ def main():
     print(f"Loading config from: {args.config}")
     cfg = load_py_config(args.config)
     
-    # Extract parameters from config
-    epochs = cfg.training.get('epochs', 50)
-    patience = cfg.training.get('patience', 15)
-    weight_decay = cfg.training.get('weight_decay', 1e-2)
-    batch_size = cfg.data.get('batch_size', 32)
-    use_amp = cfg.training.get('use_amp', True)
-    variant = cfg.data.get('variant', 'full')
-    loss_function = 'focal' if cfg.training.get('loss', {}).get('type') == 'FocalLoss' else 'ce'
-    focal_gamma = cfg.training.get('loss', {}).get('gamma', 2.0)
-    focal_alpha = cfg.training.get('loss', {}).get('alpha', 1.0)
-    gpu_id = cfg.environment.get('gpu_id')
-    mixup_enabled = cfg.training.get('mixup_enabled', True)
-    mixup_alpha = cfg.training.get('mixup_alpha', 0.4)
-    # --- NEW: Read scheduler config from file ---
-    scheduler_cfg = cfg.training.get('scheduler_cfg', {'type': 'cosine'})
+    # --- NEW: Set seed for reproducibility ---
+    # Will raise KeyError if 'seed' is missing from config
+    set_seed(cfg.environment['seed'])
+    
+    # Extract parameters from config (strict, no fallbacks)
+    print("\nExtracting configuration (strict mode)...")
+    try:
+        epochs = cfg.training['epochs']
+        patience = cfg.training['patience']
+        weight_decay = cfg.training['weight_decay']
+        batch_size = cfg.data['batch_size']
+        use_amp = cfg.training['use_amp']
+        variant = cfg.data['variant']
+        gpu_id = cfg.environment['gpu_id']  # Use None in config for auto-select
+        mixup_enabled = cfg.training['mixup_enabled']
+        mixup_alpha = cfg.training['mixup_alpha']
+        scheduler_cfg = cfg.training['scheduler_cfg']
+        num_workers = cfg.environment['num_workers']
+        max_length = cfg.data['max_length']
 
+        # Handle loss function configuration strictly
+        loss_cfg = cfg.training['loss']
+        loss_type = loss_cfg['type']
+
+        if loss_type == 'FocalLoss':
+            loss_function = 'focal'
+            focal_gamma = loss_cfg['gamma']
+            focal_alpha = loss_cfg['alpha']
+        elif loss_type == 'CrossEntropyLoss':
+            loss_function = 'ce'
+            focal_gamma = 2.0  # Not used for CE, but required by function signature
+            focal_alpha = 1.0  # Not used for CE
+        else:
+            raise ValueError(f"Unsupported loss type: '{loss_type}' in config.")
+
+    except KeyError as e:
+        print(f"\n❌ Configuration Error: Missing required key in config file: {e}")
+        print("   Please ensure all required parameters are defined.")
+        sys.exit(1)
     
     print(f"\nTraining Configuration from {args.config}:")
     print(f"  Epochs: {epochs}")
@@ -859,7 +902,7 @@ def main():
     print(f"  Mixup Enabled: {mixup_enabled}")
     if mixup_enabled:
         print(f"  Mixup Alpha: {mixup_alpha}")
-    print(f"  Loss Function: {loss_function}")
+    print(f"  Loss Function: {loss_type}") # Use the name from config
     if loss_function == 'focal':
         print(f"  Focal Gamma: {focal_gamma}")
         print(f"  Focal Alpha: {focal_alpha}")
@@ -868,7 +911,7 @@ def main():
     print(f"  Scheduler Config: {scheduler_cfg}")
     
     # Print layer-specific learning rates if configured
-    layer_lrs = scheduler_cfg.get('layer_lrs') if scheduler_cfg else None
+    layer_lrs = scheduler_cfg['layer_lrs'] if 'layer_lrs' in scheduler_cfg else None
     if layer_lrs is not None:
         print(f"  Layer-Specific Learning Rates:")
         for layer_name, lr_value in layer_lrs.items():
@@ -894,7 +937,9 @@ def main():
         mixup_enabled=mixup_enabled,
         mixup_alpha=mixup_alpha,
         scheduler_cfg=scheduler_cfg,
-        output_dir=WEIGHT_DIR  # Explicitly pass the default
+        output_dir=WEIGHT_DIR,  # Explicitly pass the default
+        num_workers=num_workers,
+        max_length=max_length
     )
     
     print("✅ Config-driven training completed!")

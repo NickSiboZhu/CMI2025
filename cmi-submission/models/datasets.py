@@ -46,8 +46,11 @@ class MultimodalDataset(Dataset):
         # Create sample weights based on the class weight dictionary
         self.sample_weights = None
         if class_weight_dict:
-            # For each label in y, find its corresponding weight from the dictionary
-            weights = np.array([class_weight_dict.get(label_idx, 1.0) for label_idx in y])
+            # For each label in y, find its corresponding weight from the dictionary (strict)
+            try:
+                weights = np.array([class_weight_dict[label_idx] for label_idx in y])
+            except KeyError as e:
+                raise KeyError(f"Missing weight for class index {e.args[0]} in class_weight_dict.")
             self.sample_weights = torch.FloatTensor(weights)
 
     def __len__(self):
@@ -67,5 +70,5 @@ class MultimodalDataset(Dataset):
             weight = self.sample_weights[idx]
             return data_tuple, label, weight
         else:
-            # Return a default weight of 1.0 if no weights are specified
-            return data_tuple, label, 1.0
+            # Strict: require weights to be provided by caller
+            raise RuntimeError("Sample weights were not provided. Provide class_weight_dict when creating the dataset.")

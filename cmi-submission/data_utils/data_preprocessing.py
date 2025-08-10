@@ -356,10 +356,10 @@ def load_and_preprocess_data(variant: str = "full"):
     print("✅ Preprocessing complete. Returning full DataFrame.")
     return train_df, label_encoder, feature_cols
 
-def pad_sequences(sequences, max_length=None):
+def pad_sequences(sequences, max_length: int):
     """
     Pad sequences to same length and generate a corresponding attention mask.
-    MODIFIED: Creates float32 arrays to save memory.
+    MODIFIED: Creates float32 arrays to save memory and requires max_length.
     """
     if not sequences:
         return np.array([], dtype=np.float32), np.array([], dtype=np.float32) # CHANGED
@@ -491,7 +491,7 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     return X_train_normalized, X_val_normalized, scaler
 
 
-def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str="full", n_splits: int=5):
+def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str="full", n_splits: int=5, max_length: int=None):
     """
     Prepare K-Fold data for multimodal architecture *with THM separated by default*.
     The pipeline: Split → Normalize → Pad, and returns numpy arrays ready for the
@@ -545,7 +545,7 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
         X_val_norm_df   = X_val_norm
 
         # 5. ✨ 在标准化之后，分离多模态数据并进行 Padding
-        max_length = 100
+        # max_length is now a required parameter
         
         # 处理训练集
         # 1. 一次性按 'sequence_id' 对 DataFrame 进行分组
@@ -613,12 +613,13 @@ if __name__ == "__main__":
     print("Running data preprocessing script...")
     # 可选择 "full" 或 "imu" 变体进行测试
     VARIANT = "full" 
+    MAX_LENGTH = 100 # Define max_length for the test run
     
-    fold_data, le, y_all, sids = prepare_data_kfold_multimodal(variant=VARIANT)
+    fold_data, le, y_all, sids = prepare_data_kfold_multimodal(variant=VARIANT, max_length=MAX_LENGTH)
     
     print("\n--- Example: Data from Fold 1 ---")
     first_fold = fold_data[0]
-    print(f"X_train_non_tof shape: {first_fold['X_train_non_tof'].shape}")
+    print(f"X_train_imu shape: {first_fold['X_train_imu'].shape}")
     print(f"X_train_tof shape: {first_fold['X_train_tof'].shape}")
     print(f"X_train_static shape: {first_fold['X_train_static'].shape}")
     print(f"y_train shape: {first_fold['y_train'].shape}")

@@ -24,18 +24,17 @@ class MultimodalityModel(nn.Module):
     The features from all branches are fused and passed to a final classifier head.
     """
     def __init__(self,
-                 # --- required configs ---
-                 num_classes: int = 18,
-                 sequence_length: int = 100,
-                 # --- branch configs ---
-                 imu_branch_cfg: dict = None,
-                 mlp_branch_cfg: dict = None,
-                 fusion_head_cfg: dict = None,
-                 tof_branch_cfg: dict = None,
-                 thm_branch_cfg: dict = None,
-                 # --- modality toggles ---
+                 # --- required configs (no defaults) ---
+                 num_classes: int,
+                 sequence_length: int,
+                 imu_branch_cfg: dict,
+                 mlp_branch_cfg: dict,
+                 fusion_head_cfg: dict,
+                 # --- optional branch configs & toggles ---
                  use_tof: bool = True,
+                 tof_branch_cfg: dict = None,
                  use_thm: bool = True,
+                 thm_branch_cfg: dict = None,
                  ):
         """
         MultimodalityModel constructor. All configuration is provided via config dicts.
@@ -51,28 +50,26 @@ class MultimodalityModel(nn.Module):
         # 1. Build 1-D CNN branch for IMU
         # ------------------------------------------------------------------
         imu_branch_cfg = imu_branch_cfg.copy()
+        # Inject shared sequence_length into the sub-config
+        imu_branch_cfg['sequence_length'] = sequence_length
 
         self.imu_branch = build_from_cfg(imu_branch_cfg, MODELS)
-        self.imu_output_size = getattr(self.imu_branch, 'cnn_output_size', None)
-        if self.imu_output_size is None:
-            raise AttributeError("CNN1D model must have attribute 'cnn_output_size'")
+        # Directly access attribute; will raise AttributeError if not found, enforcing contract on sub-model.
+        self.imu_output_size = self.imu_branch.cnn_output_size
 
         # ------------------------------------------------------------------
         # 2. Build 1-D CNN branch for THM (thermopile) (optional)
         # ------------------------------------------------------------------
         if self.use_thm:
+            if thm_branch_cfg is None:
+                raise ValueError("'thm_branch_cfg' must be provided when 'use_thm' is True.")
+            
             thm_branch_cfg = thm_branch_cfg.copy()
-
-            # Ensure required parameters are set
-            thm_branch_cfg.setdefault('type', 'CNN1D')
-            thm_branch_cfg.setdefault('sequence_length', sequence_length)
+            # Inject shared sequence_length into the sub-config
+            thm_branch_cfg['sequence_length'] = sequence_length
 
             self.thm_branch = build_from_cfg(thm_branch_cfg, MODELS)
-            self.thm_output_size = getattr(
-                self.thm_branch,
-                'cnn_output_size',
-                thm_branch_cfg.get('output_dim', 64)
-            )
+            self.thm_output_size = self.thm_branch.cnn_output_size
         else:
             # THM disabled
             self.thm_branch = None
@@ -82,13 +79,16 @@ class MultimodalityModel(nn.Module):
         # 3. Build 2-D CNN branch for TOF (optional)
         # ------------------------------------------------------------------
         if self.use_tof:
+            if tof_branch_cfg is None:
+                raise ValueError("'tof_branch_cfg' must be provided when 'use_tof' is True.")
+
             tof_branch_cfg = tof_branch_cfg.copy()
+            # Inject shared sequence_length into the sub-config
+            tof_branch_cfg['seq_len'] = sequence_length
 
             self.tof_branch = build_from_cfg(tof_branch_cfg, MODELS)
-            # Infer output size strictly from the instantiated branch first ― this captures
-            # dynamic situations (e.g., bidirectional LSTM doubling hidden size).
-            # Fall back to config only if the attribute is missing.
-            self.tof_2d_output_size = getattr(self.tof_branch, 'out_features', tof_branch_cfg.get('out_features', 128))
+            # Infer output size strictly from the instantiated branch
+            self.tof_2d_output_size = self.tof_branch.out_features
         else:
             # TOF disabled → no branch, zero additional features
             self.tof_branch = None
@@ -101,7 +101,7 @@ class MultimodalityModel(nn.Module):
 
         # build branch
         self.mlp_branch = build_from_cfg(mlp_branch_cfg, MODELS)
-        self.mlp_output_size = getattr(self.mlp_branch, 'output_dim', mlp_branch_cfg.get('output_dim', 32))
+        self.mlp_output_size = self.mlp_branch.output_dim
 
         # ------------------------------------------------------------------
         # 5. Fusion head (configurable)
@@ -110,9 +110,8 @@ class MultimodalityModel(nn.Module):
         combined_feature_size = (self.imu_output_size + self.thm_output_size + 
                                self.tof_2d_output_size + self.mlp_output_size)
 
-        # Ensure required parameters are set
+        # The 'type' must be explicitly defined in the config; no more fallback.
         fusion_head_cfg = fusion_head_cfg.copy()
-        fusion_head_cfg.setdefault('type', 'FusionHead')
         fusion_head_cfg['num_classes'] = num_classes
         fusion_head_cfg['input_dim'] = combined_feature_size  # FusionHead expects 'input_dim'
         
@@ -127,7 +126,7 @@ class MultimodalityModel(nn.Module):
         print(f"  Total combined features: {combined_feature_size}")
 
         # For advanced fusion heads, collect and pass branch dimensions
-        fusion_type = fusion_head_cfg.get('type', 'FusionHead')
+        fusion_type = fusion_head_cfg['type'] # Strict: will raise KeyError if not present
         if fusion_type in ['BilinearFusionHead', 'AttentionFusionHead', 'TransformerFusionHead']:
             branch_dims = []
             # The order must match the feature concatenation order in the forward pass

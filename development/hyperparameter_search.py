@@ -18,16 +18,14 @@ import train
 
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
-CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
+CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
 # 你想要运行的试验次数
 N_TRIALS = 100
 # 初始随机搜索的次数
 N_STARTUP_TRIALS = 30
 # Get variant from config to dynamically set paths and study names
 base_cfg = train.load_py_config(CONFIG_FILE_PATH)
-variant = base_cfg.data.get('variant')
-if not variant:
-    raise ValueError(f"'variant' not found in config file: {CONFIG_FILE_PATH}")
+variant = base_cfg.data['variant']
 
 DB_PATH = f'sqlite:///{variant}-study.db'
 STUDY_NAME = f'{variant}_search'
@@ -68,8 +66,8 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
     if study.best_trial.number == trial.number:
         print(f"\nNew best trial found: #{trial.number} with score {trial.value:.4f}. Saving models.")
         
-        # Get variant from the trial's user attributes
-        variant = trial.user_attrs.get('variant', 'unknown')
+        # Get variant from the trial's user attributes (strict)
+        variant = trial.user_attrs['variant']
 
         # --- NEW LOGIC: Copy from trial artifacts to the final weights directory ---
         # Define a list of files to copy to handle missing files gracefully
@@ -106,7 +104,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     为支持多变量采样，已对内部动态依赖进行扁平化处理。
     """
     cfg = train.load_py_config(CONFIG_FILE_PATH)
-    variant = cfg.data.get('variant')
+    variant = cfg.data['variant']
     
     trial.set_user_attr('variant', variant)
     
@@ -165,6 +163,9 @@ def objective(trial: optuna.trial.Trial) -> float:
     cfg.model['imu_branch_cfg']['filters'] = imu_filters_all[:num_imu_layers]
     cfg.model['imu_branch_cfg']['kernel_sizes'] = imu_kernel_sizes_all[:num_imu_layers]
     cfg.model['imu_branch_cfg']['use_residual'] = trial.suggest_categorical('imu_use_residual', [True, False])
+    # --- IMU SE hyperparameters ---
+    cfg.model['imu_branch_cfg']['use_se'] = trial.suggest_categorical('imu_use_se', [True, False])
+    cfg.model['imu_branch_cfg']['se_reduction'] = trial.suggest_categorical('imu_se_reduction', [8, 16, 32])
 
     # --- IMU Temporal Aggregation (正确、无条件地定义所有相关参数) ---
 
@@ -175,10 +176,11 @@ def objective(trial: optuna.trial.Trial) -> float:
     # 其次，无条件定义 'temporal_encoder' 分支下的所有子参数
     # LSTM 参数
     imu_lstm_hidden = trial.suggest_int('imu_lstm_hidden', 128, 512, step=64)
+    imu_lstm_layers = trial.suggest_int('imu_lstm_layers', 1, 2)
     imu_bidirectional = trial.suggest_categorical('imu_bidirectional', [True, False])
 
     # Transformer 参数 (包含 ff_dim)
-    imu_transformer_heads = trial.suggest_categorical('imu_num_heads', [4, 8])
+    imu_transformer_heads = trial.suggest_categorical('imu_num_heads', [4, 8, 16])
     imu_transformer_layers = trial.suggest_int('imu_num_layers', 1, 3)
     imu_transformer_ff_dim = trial.suggest_int('imu_ff_dim', 256, 1024, step=128)
     imu_transformer_dropout = trial.suggest_float('imu_dropout', 0.1, 0.4)
@@ -193,6 +195,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         # 根据模式选择，组装 LSTM 或 Transformer 的具体配置
         if imu_temporal_mode == 'lstm':
             cfg.model['imu_branch_cfg']['lstm_hidden'] = imu_lstm_hidden
+            cfg.model['imu_branch_cfg']['lstm_layers'] = imu_lstm_layers
             cfg.model['imu_branch_cfg']['bidirectional'] = imu_bidirectional
         else:  # transformer
             cfg.model['imu_branch_cfg']['num_heads'] = imu_transformer_heads
@@ -219,6 +222,9 @@ def objective(trial: optuna.trial.Trial) -> float:
         cfg.model['thm_branch_cfg']['filters'] = thm_filters_all[:num_thm_layers]
         cfg.model['thm_branch_cfg']['kernel_sizes'] = thm_kernel_sizes_all[:num_thm_layers]
         cfg.model['thm_branch_cfg']['use_residual'] = trial.suggest_categorical('thm_use_residual', [True, False])
+        # --- THM SE hyperparameters ---
+        cfg.model['thm_branch_cfg']['use_se'] = trial.suggest_categorical('thm_use_se', [True, False])
+        cfg.model['thm_branch_cfg']['se_reduction'] = trial.suggest_categorical('thm_se_reduction', [8, 16, 32])
         
         # THM Temporal Aggregation (正确、无条件地定义所有相关参数)
         thm_temporal_aggregation = trial.suggest_categorical('thm_temporal_aggregation', ['global_pool', 'temporal_encoder'])
@@ -226,10 +232,11 @@ def objective(trial: optuna.trial.Trial) -> float:
 
         # THM LSTM 参数
         thm_lstm_hidden = trial.suggest_int('thm_lstm_hidden', 64, 256, step=32)
+        thm_lstm_layers = trial.suggest_int('thm_lstm_layers', 1, 2)
         thm_bidirectional = trial.suggest_categorical('thm_bidirectional', [True, False])
 
         # THM Transformer 参数
-        thm_transformer_heads = trial.suggest_categorical('thm_num_heads', [4, 8])
+        thm_transformer_heads = trial.suggest_categorical('thm_num_heads', [4, 8, 16])
         thm_transformer_layers = trial.suggest_int('thm_num_layers', 1, 2)
         # 这里也应该有一个 ff_dim
         thm_transformer_ff_dim = trial.suggest_int('thm_ff_dim', 256, 1024, step=128)
@@ -242,6 +249,7 @@ def objective(trial: optuna.trial.Trial) -> float:
             cfg.model['thm_branch_cfg']['temporal_mode'] = thm_temporal_mode
             if thm_temporal_mode == 'lstm':
                 cfg.model['thm_branch_cfg']['lstm_hidden'] = thm_lstm_hidden
+                cfg.model['thm_branch_cfg']['lstm_layers'] = thm_lstm_layers
                 cfg.model['thm_branch_cfg']['bidirectional'] = thm_bidirectional
             else:  # transformer
                 cfg.model['thm_branch_cfg']['num_heads'] = thm_transformer_heads
@@ -251,16 +259,33 @@ def objective(trial: optuna.trial.Trial) -> float:
 
         # TOF 分支 (扁平化)
         cfg.model['tof_branch_cfg']['use_residual'] = trial.suggest_categorical('tof_use_residual', [True, False])
+        # --- TOF SE hyperparameters ---
+        cfg.model['tof_branch_cfg']['use_se'] = trial.suggest_categorical('tof_use_se', [True, False])
+        cfg.model['tof_branch_cfg']['se_reduction'] = trial.suggest_categorical('tof_se_reduction', [8, 16, 32])
+        # --- TOF Sensor Gate hyperparameters ---
+        use_tof_sensor_gate = trial.suggest_categorical('tof_use_sensor_gate', [False, True])
+        cfg.model['tof_branch_cfg']['use_sensor_gate'] = use_tof_sensor_gate
+        
+        # Only suggest dependent parameters if the gate is enabled
+        if use_tof_sensor_gate:
+            is_adaptive = trial.suggest_categorical('tof_sensor_gate_adaptive', [False, True])
+            cfg.model['tof_branch_cfg']['sensor_gate_adaptive'] = is_adaptive
+            # Only suggest init value for non-adaptive gate
+            if not is_adaptive:
+                cfg.model['tof_branch_cfg']['sensor_gate_init'] = trial.suggest_float('tof_sensor_gate_init', 0.5, 1.5)
+        
         num_tof_cnn_layers = trial.suggest_categorical('num_tof_cnn_layers', [2, 3])
         tof_kernel_0 = trial.suggest_categorical('tof_kernel_0', [2, 3])
         tof_kernel_1 = trial.suggest_categorical('tof_kernel_1', [2, 3])
+        # Unconditionally suggest kernel for the third layer to keep the space static
+        tof_kernel_2 = trial.suggest_categorical('tof_kernel_2', [2, 3])
         tof_conv_channels_all = [trial.suggest_int(f'tof_conv_channel_{i}', 32, 256, step=32) for i in range(MAX_TOF_CNN_LAYERS)]
         
         if num_tof_cnn_layers == 2:
             cfg.model['tof_branch_cfg']['kernel_sizes'] = [tof_kernel_0, tof_kernel_1]
             max_ch = 256
         else:
-            cfg.model['tof_branch_cfg']['kernel_sizes'] = [3, 3, 2]
+            cfg.model['tof_branch_cfg']['kernel_sizes'] = [tof_kernel_0, tof_kernel_1, tof_kernel_2]
             max_ch = 128
         
         tof_channels_assembled = [min(ch, max_ch) for ch in tof_conv_channels_all]
@@ -274,7 +299,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         tof_lstm_layers = trial.suggest_int('tof_lstm_layers', 1, 2)
         tof_bidirectional = trial.suggest_categorical('tof_bidirectional', [True, False])
         
-        tof_transformer_heads = trial.suggest_categorical('tof_num_heads', [4, 8])
+        tof_transformer_heads = trial.suggest_categorical('tof_num_heads', [4, 8, 16])
         tof_transformer_layers = trial.suggest_int('tof_num_layers', 1, 3)
         tof_transformer_ff_dim = trial.suggest_int('tof_ff_dim', 256, 1024, step=128)
         tof_transformer_dropout = trial.suggest_float('tof_dropout', 0.1, 0.4)
@@ -296,7 +321,8 @@ def objective(trial: optuna.trial.Trial) -> float:
     # --- 3. 定义 Fusion Head ---
     # 清理旧的或不相关的键
     for key in ['hidden_dims', 'dropout_rates', 'branch_dims', 'embed_dim', 'num_heads', 'depth', 'dropout']:
-        cfg.model['fusion_head_cfg'].pop(key, None)
+        if key in cfg.model['fusion_head_cfg']:
+            cfg.model['fusion_head_cfg'].pop(key)
 
     cfg.model['fusion_head_cfg']['type'] = 'FusionHead'
     num_fusion_layers = trial.suggest_int('mlp_fusion_layers', 1, MAX_FUSION_LAYERS)
@@ -315,26 +341,173 @@ def objective(trial: optuna.trial.Trial) -> float:
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
 
+        # Build a compact view of the actually used parameters to keep logs clean
+        effective_params = {
+            'training': {
+                'epochs': cfg.training['epochs'],
+                'patience': cfg.training['patience'],
+                'weight_decay': cfg.training['weight_decay'],
+                'mixup_enabled': cfg.training['mixup_enabled'],
+                'mixup_alpha': cfg.training['mixup_alpha'],
+            },
+            'scheduler': {
+                'type': scheduler_type,
+                'warmup_ratio': scheduler_cfg['warmup_ratio']
+            },
+            'layer_lrs': scheduler_cfg['layer_lrs']
+        }
+        if scheduler_type == 'reduce_on_plateau':
+            effective_params['scheduler'].update({
+                'factor': scheduler_cfg['factor'],
+                'patience': scheduler_cfg['patience'],
+                'min_lr': scheduler_cfg['min_lr']
+            })
+
+        # IMU effective configuration
+        _imu_eff = {
+            'num_layers': num_imu_layers,
+            'filters': cfg.model['imu_branch_cfg']['filters'],
+            'kernel_sizes': cfg.model['imu_branch_cfg']['kernel_sizes'],
+            'use_residual': cfg.model['imu_branch_cfg']['use_residual'],
+            'use_se': cfg.model['imu_branch_cfg']['use_se'],
+            'temporal_aggregation': cfg.model['imu_branch_cfg']['temporal_aggregation']
+        }
+        if _imu_eff['use_se']:
+            _imu_eff['se_reduction'] = cfg.model['imu_branch_cfg']['se_reduction']
+        effective_params['imu_branch'] = _imu_eff
+        if cfg.model['imu_branch_cfg']['temporal_aggregation'] == 'temporal_encoder':
+            if imu_temporal_mode == 'lstm':
+                effective_params['imu_branch']['temporal'] = {
+                    'mode': 'lstm',
+                    'lstm_hidden': cfg.model['imu_branch_cfg']['lstm_hidden'],
+                    'lstm_layers': cfg.model['imu_branch_cfg']['lstm_layers'],
+                    'bidirectional': cfg.model['imu_branch_cfg']['bidirectional']
+                }
+            else:
+                effective_params['imu_branch']['temporal'] = {
+                    'mode': 'transformer',
+                    'num_heads': cfg.model['imu_branch_cfg']['num_heads'],
+                    'num_layers': cfg.model['imu_branch_cfg']['num_layers'],
+                    'ff_dim': cfg.model['imu_branch_cfg']['ff_dim'],
+                    'dropout': cfg.model['imu_branch_cfg']['dropout']
+                }
+
+        # MLP effective configuration
+        effective_params['mlp_branch'] = {
+            'num_hidden_layers': num_mlp_hidden_layers,
+            'hidden_dims': cfg.model['mlp_branch_cfg']['hidden_dims'],
+            'output_dim': cfg.model['mlp_branch_cfg']['output_dim'],
+            'dropout_rate': cfg.model['mlp_branch_cfg']['dropout_rate']
+        }
+
+        if variant == 'full':
+            # THM effective configuration
+            _thm_eff = {
+                'num_layers': num_thm_layers,
+                'filters': cfg.model['thm_branch_cfg']['filters'],
+                'kernel_sizes': cfg.model['thm_branch_cfg']['kernel_sizes'],
+                'use_residual': cfg.model['thm_branch_cfg']['use_residual'],
+                'use_se': cfg.model['thm_branch_cfg']['use_se'],
+                'temporal_aggregation': cfg.model['thm_branch_cfg']['temporal_aggregation']
+            }
+            if _thm_eff['use_se']:
+                _thm_eff['se_reduction'] = cfg.model['thm_branch_cfg']['se_reduction']
+            effective_params['thm_branch'] = _thm_eff
+            if thm_temporal_aggregation == 'temporal_encoder':
+                if thm_temporal_mode == 'lstm':
+                    effective_params['thm_branch']['temporal'] = {
+                        'mode': 'lstm',
+                        'lstm_hidden': cfg.model['thm_branch_cfg']['lstm_hidden'],
+                        'lstm_layers': cfg.model['thm_branch_cfg']['lstm_layers'],
+                        'bidirectional': cfg.model['thm_branch_cfg']['bidirectional']
+                    }
+                else:
+                    effective_params['thm_branch']['temporal'] = {
+                        'mode': 'transformer',
+                        'num_heads': cfg.model['thm_branch_cfg']['num_heads'],
+                        'num_layers': cfg.model['thm_branch_cfg']['num_layers'],
+                        'ff_dim': cfg.model['thm_branch_cfg']['ff_dim'],
+                        'dropout': cfg.model['thm_branch_cfg']['dropout']
+                    }
+
+            # TOF effective configuration
+            # Build TOF effective params with conditional sensor-gate details
+            _tof_eff = {
+                'num_cnn_layers': num_tof_cnn_layers,
+                'conv_channels': cfg.model['tof_branch_cfg']['conv_channels'],
+                'kernel_sizes': cfg.model['tof_branch_cfg']['kernel_sizes'],
+                'use_residual': cfg.model['tof_branch_cfg']['use_residual'],
+                'use_se': cfg.model['tof_branch_cfg']['use_se'],
+                'use_sensor_gate': use_tof_sensor_gate,
+                'temporal_mode': cfg.model['tof_branch_cfg']['temporal_mode']
+            }
+            if _tof_eff['use_se']:
+                _tof_eff['se_reduction'] = cfg.model['tof_branch_cfg']['se_reduction']
+            if use_tof_sensor_gate:
+                _tof_eff['sensor_gate_adaptive'] = cfg.model['tof_branch_cfg']['sensor_gate_adaptive']
+                if not cfg.model['tof_branch_cfg']['sensor_gate_adaptive']:
+                    _tof_eff['sensor_gate_init'] = cfg.model['tof_branch_cfg']['sensor_gate_init']
+            effective_params['tof_branch'] = _tof_eff
+            if tof_temporal_mode == 'lstm':
+                effective_params['tof_branch']['temporal'] = {
+                    'mode': 'lstm',
+                    'lstm_hidden': cfg.model['tof_branch_cfg']['lstm_hidden'],
+                    'lstm_layers': cfg.model['tof_branch_cfg']['lstm_layers'],
+                    'bidirectional': cfg.model['tof_branch_cfg']['bidirectional']
+                }
+            else:
+                effective_params['tof_branch']['temporal'] = {
+                    'mode': 'transformer',
+                    'num_heads': cfg.model['tof_branch_cfg']['num_heads'],
+                    'num_layers': cfg.model['tof_branch_cfg']['num_layers'],
+                    'ff_dim': cfg.model['tof_branch_cfg']['ff_dim'],
+                    'dropout': cfg.model['tof_branch_cfg']['dropout']
+                }
+
+        # Fusion head effective configuration
+        effective_params['fusion_head'] = {
+            'num_layers': num_fusion_layers,
+            'hidden_dims': cfg.model['fusion_head_cfg']['hidden_dims'],
+            'dropout_rates': cfg.model['fusion_head_cfg']['dropout_rates']
+        }
+
+        # Store effective params for callback usage
+        trial.set_user_attr('effective_params', effective_params)
+
         with open(log_path, 'w', encoding='utf-8') as f:
             f.write("="*60 + "\n")
-            f.write(f"TRIAL {trial.number} PARAMETERS\n")
+            f.write(f"TRIAL {trial.number} PARAMETERS (EFFECTIVE)\n")
             f.write("="*60 + "\n")
-            f.write(json.dumps(trial.params, indent=4))
+            f.write(json.dumps(effective_params, indent=4))
             f.write("\n\n" + "="*60 + "\n")
             f.write("TRAINING LOG\n")
             f.write("="*60 + "\n")
 
         with manage_output(log_path):
-            device = train.setup_device(cfg.environment.get('gpu_id'))
+            # Use strict loading for gpu_id
+            gpu_id = cfg.environment['gpu_id']
+            device = train.setup_device(gpu_id)
+            
+            # Pass all required arguments to the training function
             oof_score, _, _, _ = train.train_kfold_models(
-                epochs=cfg.training['epochs'], patience=cfg.training['patience'],
+                epochs=cfg.training['epochs'], 
+                patience=cfg.training['patience'],
                 weight_decay=cfg.training['weight_decay'],
-                batch_size=cfg.data['batch_size'], use_amp=cfg.training['use_amp'],
-                variant=cfg.data['variant'], model_cfg=cfg.model,
-                mixup_enabled=cfg.training['mixup_enabled'], mixup_alpha=cfg.training['mixup_alpha'],
+                batch_size=cfg.data['batch_size'], 
+                use_amp=cfg.training['use_amp'],
+                variant=cfg.data['variant'], 
+                model_cfg=cfg.model,
+                mixup_enabled=cfg.training['mixup_enabled'], 
+                mixup_alpha=cfg.training['mixup_alpha'],
                 scheduler_cfg=cfg.training['scheduler_cfg'],
-                device=device, show_stratification=False, loss_function='ce',
-                output_dir=TRIAL_ARTIFACTS_DIR
+                device=device, 
+                show_stratification=False, 
+                loss_function='ce',  # Hardcoded as requested
+                focal_gamma=2.0,     # Default, not used for 'ce'
+                focal_alpha=1.0,     # Default, not used for 'ce'
+                output_dir=TRIAL_ARTIFACTS_DIR,
+                num_workers=cfg.environment['num_workers'],
+                max_length=cfg.data['max_length']
             )
         
         torch.cuda.empty_cache()
@@ -356,9 +529,11 @@ if __name__ == "__main__":
     print("="*60)
 
     print("Preparing and pre-loading data... This will happen only once.")
+    # Pass max_length to the pre-loading function
     preloaded_data_tuple = train.prepare_data_kfold_multimodal(
         show_stratification=False, 
-        variant=variant
+        variant=variant,
+        max_length=base_cfg.data['max_length']
     )
     print("Data has been pre-loaded into memory.")
     print("="*60)

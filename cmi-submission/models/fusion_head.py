@@ -12,25 +12,17 @@ class LinearFusionHead(nn.Module):
     and passes them through a sequence of linear layers.
     """
     
-    def __init__(self, input_dim, num_classes, hidden_dims=None, dropout_rates=None):
+    def __init__(self, input_dim, num_classes, hidden_dims, dropout_rates):
         super(LinearFusionHead, self).__init__()
         
-        if hidden_dims is None:
-            hidden_dims = [256, 128, 64]
-        if dropout_rates is None:
-            dropout_rates = [0.5] * len(hidden_dims)
-        
-        # Ensure dropout_rates matches hidden_dims length
-        if len(dropout_rates) < len(hidden_dims):
-            dropout_rates.extend([0.5] * (len(hidden_dims) - len(dropout_rates)))
+        assert len(hidden_dims) == len(dropout_rates), "Length of hidden_dims and dropout_rates must be equal."
         
         layers = [nn.LayerNorm(input_dim)]
         in_dim = input_dim
         
-        for idx, out_dim in enumerate(hidden_dims):
+        for out_dim, dr in zip(hidden_dims, dropout_rates):
             layers.append(nn.Linear(in_dim, out_dim))
             layers.append(nn.ReLU())
-            dr = dropout_rates[idx] if idx < len(dropout_rates) else 0.5
             layers.append(nn.Dropout(dr))
             in_dim = out_dim
         
@@ -58,13 +50,12 @@ class AttentionFusionHead(nn.Module):
     different feature groups before classification.
     """
     
-    def __init__(self, input_dim, num_classes, branch_dims, hidden_dims=None, dropout_rates=None):
+    def __init__(self, input_dim, num_classes, branch_dims, hidden_dims, dropout_rates):
         super(AttentionFusionHead, self).__init__()
         
-        if hidden_dims is None:
-            hidden_dims = [256, 128]
-        if dropout_rates is None:
-            dropout_rates = [0.5] * len(hidden_dims)
+        # The first hidden_dim is for projection, the rest for classification
+        assert len(hidden_dims) > 0, "hidden_dims must not be empty for AttentionFusionHead"
+        assert len(dropout_rates) == len(hidden_dims) - 1, "dropout_rates must have one less element than hidden_dims"
         
         self.branch_dims = branch_dims  # [cnn_dim, tof_dim, mlp_dim]
         
@@ -84,7 +75,7 @@ class AttentionFusionHead(nn.Module):
         for idx, out_dim in enumerate(hidden_dims[1:], 1):
             layers.append(nn.Linear(in_dim, out_dim))
             layers.append(nn.ReLU())
-            dr = dropout_rates[idx-1] if idx-1 < len(dropout_rates) else 0.5
+            dr = dropout_rates[idx-1]
             layers.append(nn.Dropout(dr))
             in_dim = out_dim
         
@@ -133,13 +124,10 @@ class BilinearFusionHead(nn.Module):
     between different modalities before classification.
     """
     
-    def __init__(self, input_dim, num_classes, branch_dims, fusion_dim=128, hidden_dims=None, dropout_rates=None):
+    def __init__(self, input_dim, num_classes, branch_dims, fusion_dim, hidden_dims, dropout_rates):
         super(BilinearFusionHead, self).__init__()
         
-        if hidden_dims is None:
-            hidden_dims = [256, 128]
-        if dropout_rates is None:
-            dropout_rates = [0.5] * len(hidden_dims)
+        assert len(hidden_dims) == len(dropout_rates), "Length of hidden_dims and dropout_rates must be equal."
         
         self.branch_dims = branch_dims
         self.fusion_dim = fusion_dim
@@ -158,10 +146,9 @@ class BilinearFusionHead(nn.Module):
         layers = [nn.LayerNorm(total_fusion_dim)]
         in_dim = total_fusion_dim
         
-        for idx, out_dim in enumerate(hidden_dims):
+        for out_dim, dr in zip(hidden_dims, dropout_rates):
             layers.append(nn.Linear(in_dim, out_dim))
             layers.append(nn.ReLU())
-            dr = dropout_rates[idx] if idx < len(dropout_rates) else 0.5
             layers.append(nn.Dropout(dr))
             in_dim = out_dim
         
@@ -210,11 +197,11 @@ class TransformerFusionHead(nn.Module):
     def __init__(self,
                  branch_dims,
                  num_classes,
+                 embed_dim,
+                 num_heads,
+                 depth,
+                 dropout,
                  input_dim=None,  # kept for compatibility with MultimodalityModel
-                 embed_dim=256,
-                 num_heads=4,
-                 depth=2,
-                 dropout=0.1,
                  use_positional_encoding=False):
         super().__init__()
 

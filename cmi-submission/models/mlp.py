@@ -10,29 +10,14 @@ class MLP(nn.Module):
     (e.g., age, sex) into a dense feature vector (embedding).
     """
     def __init__(self,
-                 # v2 legacy args
-                 static_input_features: int = None,
-                 mlp_output_size: int = None,
-                 # v3 new args
-                 input_features: int = None,
-                 hidden_dims: list = None,
-                 output_dim: int = None,
+                 input_features: int,
+                 hidden_dims: list,
+                 output_dim: int,
                  dropout_rate: float = 0.5):
         """
-        Dynamic constructor that supports both the original (static_input_features, mlp_output_size)
-        signature and the new v3 signature based on a list of hidden_dims.
+        Strict constructor for an MLP. All architectural parameters are required.
         """
         super(MLP, self).__init__()
-
-        # Back-compat mapping ------------------------------------------------
-        if input_features is None:
-            input_features = static_input_features
-        if output_dim is None and mlp_output_size is not None:
-            output_dim = mlp_output_size
-        if hidden_dims is None:
-            hidden_dims = [64]
-        if output_dim is None:
-            output_dim = 32
 
         layers = []
         in_dim = input_features
@@ -51,4 +36,10 @@ class MLP(nn.Module):
         Defines the forward pass logic for the MLP branch.
         """
         return self.layers(x)
+
+
+    def get_model_info(self):
+        """Get model parameter information"""
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return {'total_params': total_params}
 

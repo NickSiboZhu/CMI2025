@@ -8,32 +8,23 @@ import pandas as pd
 from scipy.interpolate import griddata
 from scipy.spatial import QhullError
 
-# Import sensor configuration defaults
-try:
-    from .data_preprocessing import DEFAULT_NUM_TOF_SENSORS, DEFAULT_TOF_PIXELS_PER_SENSOR
-except ImportError:
-    # Fallback if import fails
-    DEFAULT_NUM_TOF_SENSORS = 5
-    DEFAULT_TOF_PIXELS_PER_SENSOR = 64
+"""
+ToF utilities. Dynamic detection is used; no hard-coded defaults required.
+"""
 
 
-def get_tof_columns(df_columns=None) -> dict:
+def get_tof_columns(df_columns) -> dict:
     """
     Return a mapping: sensor_id -> list of column names (tof_X_v0 … v63).
-    
-    If df_columns is provided, dynamically detect TOF configuration from actual data.
-    Otherwise, use default configuration.
+    Requires df_columns so detection is always data-driven.
     """
-    if df_columns is not None:
-        # Dynamically detect from actual columns
-        from .data_preprocessing import get_sensor_config
-        config = get_sensor_config(df_columns)
-        sensor_ids = config['tof_sensor_ids']
-        pixels_per_sensor = config['tof_pixels_per_sensor']
-    else:
-        # Use defaults
-        sensor_ids = list(range(1, DEFAULT_NUM_TOF_SENSORS + 1))
-        pixels_per_sensor = DEFAULT_TOF_PIXELS_PER_SENSOR
+    if df_columns is None:
+        raise ValueError("df_columns is required for get_tof_columns")
+    # Dynamically detect from actual columns
+    from .data_preprocessing import get_sensor_config
+    config = get_sensor_config(df_columns)
+    sensor_ids = config['tof_sensor_ids']
+    pixels_per_sensor = config['tof_pixels_per_sensor']
     
     mapping = {}
     for sid in sensor_ids:

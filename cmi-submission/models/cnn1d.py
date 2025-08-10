@@ -1,6 +1,26 @@
 import torch
 import torch.nn as nn
 from . import MODELS  # Import registry
+from timm.layers import SqueezeExcite as TimmSE
+
+ 
+
+class TimmSE1DWrapper(nn.Module):
+    """
+    Wrap timm's 2D SqueezeExcite so it can be applied on 1D tensors (N, C, L).
+    We temporarily add a singleton spatial dim and remove it after SE.
+    """
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        # timm 1.0.15 signature: SqueezeExcite(channels, rd_ratio=1/16, rd_channels=None, ...)
+        rd_ratio = 1.0 / max(1, reduction)
+        self.se2d = TimmSE(channels=channels, rd_ratio=rd_ratio)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, L)
+        x_expanded = x.unsqueeze(-1)      # (N, C, L, 1)
+        x_se = self.se2d(x_expanded)      # (N, C, L, 1)
+        return x_se.squeeze(-1)           # (N, C, L)
 
 @MODELS.register_module()
 class CNN1D(nn.Module):
@@ -13,32 +33,30 @@ class CNN1D(nn.Module):
     """
     def __init__(self,
                  input_channels: int,
-                 sequence_length: int = 100,
-                 num_classes: int = 18,
-                 filters: list = None,
-                 kernel_sizes: list = None,
-                 # NEW: Temporal aggregation options
-                 temporal_aggregation: str = 'global_pool',  # 'global_pool' or 'temporal_encoder'
-                 temporal_mode: str = 'lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
-                 lstm_hidden: int = 256,
-                 lstm_layers: int = 1,
-                 bidirectional: bool = True,
-                 num_heads: int = 8,
-                 num_layers: int = 2,
-                 ff_dim: int = 512,
+                 filters: list,
+                 kernel_sizes: list,
+                 temporal_aggregation: str,
+                 # --- Optional params for temporal encoder ---
+                 sequence_length: int = None,
+                 temporal_mode: str = None,
+                 lstm_hidden: int = None,
+                 lstm_layers: int = None,
+                 bidirectional: bool = None,
+                 num_heads: int = None,
+                 num_layers: int = None,
+                 ff_dim: int = None,
                  dropout: float = 0.1,
-                 # NEW: ResNet-style residual connections
-                 use_residual: bool = False):
+                 # --- Other optional features ---
+                 use_residual: bool = False,
+                 use_se: bool = False,
+                 se_reduction: int = 16):
         super(CNN1D, self).__init__()
         
-        if filters is None:
-            filters = [64, 128, 256]
-        if kernel_sizes is None:
-            kernel_sizes = [5, 5, 3]
         assert len(filters) == len(kernel_sizes), "filters and kernel_sizes length mismatch"
 
         layers = []
         self.bn_layers = nn.ModuleList()
+        self.se_layers = nn.ModuleList() if use_se else None
         self.residual_projections = nn.ModuleList()  # For dimension matching in residual connections
         
         self.use_residual = use_residual
@@ -48,6 +66,10 @@ class CNN1D(nn.Module):
             # 使用 'same' padding 可以在不缩减序列长度的情况下更容易处理mask
             layers.append(nn.Conv1d(in_channels, out_c, kernel_size=k, padding='same'))
             self.bn_layers.append(nn.BatchNorm1d(out_c))
+
+            # Optional SE per block
+            if self.se_layers is not None:
+                self.se_layers.append(TimmSE1DWrapper(out_c, se_reduction))
             
             # Add 1x1 projection for residual connections when dimensions don't match
             if use_residual and in_channels != out_c:
@@ -66,6 +88,10 @@ class CNN1D(nn.Module):
         self.temporal_aggregation = temporal_aggregation
         
         if temporal_aggregation == 'temporal_encoder':
+            # --- Strict configuration check ---
+            if not all([sequence_length, temporal_mode]):
+                raise ValueError("`sequence_length` and `temporal_mode` must be provided for temporal_encoder.")
+            
             # Import and setup temporal encoder (reuse from cnn2d.py)
             from .cnn2d import TemporalEncoder
             
@@ -89,9 +115,11 @@ class CNN1D(nn.Module):
                 dropout=dropout
             )
             self.cnn_output_size = self.temporal_encoder.output_dim
-        else:
+        elif temporal_aggregation == 'global_pool':
             # Use traditional global pooling
             self.cnn_output_size = filters[-1]
+        else:
+            raise ValueError(f"Unknown temporal_aggregation: '{temporal_aggregation}'")
     
     def forward(self, x, mask=None):
         """
@@ -119,6 +147,10 @@ class CNN1D(nn.Module):
             
             x = conv(x)
             x = self.bn_layers[i](x)
+
+            # Apply SE before residual addition (SENet-style)
+            if self.se_layers is not None:
+                x = self.se_layers[i](x)
             
             # Apply residual connection if enabled
             if self.use_residual:

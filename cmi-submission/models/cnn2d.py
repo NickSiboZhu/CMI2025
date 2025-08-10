@@ -4,6 +4,9 @@ import numpy as np
 from . import MODELS
 from torch.nn.utils.rnn import pack_padded_sequence
 
+from timm.layers import SqueezeExcite as TimmSE
+
+    
 
 class TemporalEncoder(nn.Module):
     """
@@ -28,11 +31,19 @@ class TemporalEncoder(nn.Module):
         dropout (float): Dropout rate
     """
     
-    def __init__(self, mode='transformer', input_dim=128, seq_len=100,
-                 # LSTM args
-                 lstm_hidden=256, lstm_layers=2, bidirectional=True,
-                 # Transformer args  
-                 num_heads=8, num_layers=2, ff_dim=512, dropout=0.1):
+    def __init__(self,
+                 mode: str,
+                 input_dim: int,
+                 seq_len: int,
+                 # LSTM specific args (required if mode is 'lstm')
+                 lstm_hidden: int = None,
+                 lstm_layers: int = None,
+                 bidirectional: bool = None,
+                 # Transformer specific args (required if mode is 'transformer')
+                 num_heads: int = None,
+                 num_layers: int = None,
+                 ff_dim: int = None,
+                 dropout: float = 0.1):
         super().__init__()
         
         self.mode = mode
@@ -40,6 +51,10 @@ class TemporalEncoder(nn.Module):
         self.seq_len = seq_len
         
         if mode == 'lstm':
+            # --- Strict configuration check for LSTM ---
+            if not all([lstm_hidden, lstm_layers is not None, bidirectional is not None]):
+                raise ValueError("`lstm_hidden`, `lstm_layers`, and `bidirectional` must be provided for LSTM mode.")
+            
             self.bidirectional = bidirectional
             self.lstm = nn.LSTM(
                 input_size=input_dim,
@@ -51,11 +66,17 @@ class TemporalEncoder(nn.Module):
             self.output_dim = lstm_hidden * (2 if bidirectional else 1)
             
         elif mode == 'transformer':
+            # --- Strict configuration check for Transformer ---
+            if not all([num_heads, num_layers, ff_dim]):
+                 raise ValueError("`num_heads`, `num_layers`, and `ff_dim` must be provided for Transformer mode.")
+
             # Learnable [CLS] token
             self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim))
             
-            # Positional encoding for seq_len + 1 (includes [CLS] token)
-            self.pos_encoding = nn.Parameter(torch.randn(1, seq_len + 1, input_dim))
+            # Positional encoding will be dynamically generated in the forward pass
+            # to handle variable sequence lengths from the CNN pooling.
+            self.pos_encoding = None
+            self.dropout = nn.Dropout(dropout)
             
             # Transformer encoder
             encoder_layer = nn.TransformerEncoderLayer(
@@ -118,8 +139,15 @@ class TemporalEncoder(nn.Module):
             cls_tokens = self.cls_token.expand(batch_size, -1, -1)
             transformer_input = torch.cat([cls_tokens, features], dim=1)
             
+            # Dynamically create positional encoding for the current sequence length
+            current_seq_len = transformer_input.size(1) # seq_len + 1 for CLS
+            if self.pos_encoding is None or self.pos_encoding.size(1) != current_seq_len:
+                # Create it on the correct device
+                self.pos_encoding = nn.Parameter(torch.randn(1, current_seq_len, self.input_dim, device=features.device), requires_grad=True)
+            
             # Add positional encoding
             transformer_input = transformer_input + self.pos_encoding
+            transformer_input = self.dropout(transformer_input)
             
             # Create attention mask
             cls_mask = torch.ones(batch_size, 1, device=mask.device)
@@ -148,11 +176,20 @@ class TOF2DCNN(nn.Module):
     
     def __init__(self, input_channels=5, out_features=128, 
                  conv_channels=None, kernel_sizes=None,
-                 use_residual=False):
+                 use_residual=False,
+                 # NEW: Channel attention and pre-conv sensor gate
+                 use_se: bool = False,
+                 se_reduction: int = 16,
+                 use_sensor_gate: bool = False,
+                 sensor_gate_adaptive: bool = False,
+                 sensor_gate_init: float = 1.0):
         super(TOF2DCNN, self).__init__()
         
         self.input_channels = input_channels
         self.use_residual = use_residual
+        self.use_se = use_se
+        self.use_sensor_gate = use_sensor_gate
+        self.sensor_gate_adaptive = sensor_gate_adaptive
         # Note: out_features parameter kept for compatibility, but actual output
         # will be determined by the last conv channel
         
@@ -165,6 +202,7 @@ class TOF2DCNN(nn.Module):
 
         # Build conv layers manually for residual connections
         self.conv_blocks = nn.ModuleList()
+        self.se_layers = nn.ModuleList() if use_se else None
         self.residual_projections = nn.ModuleList()
         
         in_channels = input_channels
@@ -172,10 +210,14 @@ class TOF2DCNN(nn.Module):
             # Create conv block
             conv_block = nn.Sequential(
                 nn.Conv2d(in_channels, out_c, kernel_size=k, padding='same'),
-                nn.BatchNorm2d(out_c),
-                nn.ReLU()
+                nn.BatchNorm2d(out_c)
             )
             self.conv_blocks.append(conv_block)
+
+            if self.se_layers is not None:
+                # timm 1.0.15 signature: SqueezeExcite(channels, rd_ratio=1/16, rd_channels=None, ...)
+                rd_ratio = 1.0 / max(1, se_reduction)
+                self.se_layers.append(TimmSE(channels=out_c, rd_ratio=rd_ratio))
             
             # Add residual projection if needed
             if use_residual and in_channels != out_c:
@@ -185,12 +227,28 @@ class TOF2DCNN(nn.Module):
             
             in_channels = out_c
         
+        self.activation = nn.ReLU()
         self.conv_channels = conv_channels
         self.pool = nn.MaxPool2d(2)
         self.last_conv_channels = conv_channels[-1]
         
         # Global average pooling to get fixed-size output
         self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # Optional static or adaptive pre-conv sensor gate (on raw 5 channels)
+        if use_sensor_gate:
+            if sensor_gate_adaptive:
+                # Adaptive gate via SE on raw sensor channels (5)
+                self.sensor_gate = nn.Sequential(
+                    nn.AdaptiveAvgPool2d(1),
+                    nn.Conv2d(self.input_channels, max(1, self.input_channels // 2), kernel_size=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(max(1, self.input_channels // 2), self.input_channels, kernel_size=1),
+                    nn.Sigmoid()
+                )
+            else:
+                # Static learnable per-sensor scale
+                self.sensor_gate = nn.Parameter(torch.full((1, self.input_channels, 1, 1), float(sensor_gate_init)))
         
         # Final projection layer
         # COMMENTED OUT: Let the CNN features speak for themselves
@@ -217,6 +275,14 @@ class TOF2DCNN(nn.Module):
             Tensor of shape (batch_size, last_conv_channels)
         """
         x = tof_grids
+
+        # Apply optional pre-conv sensor gate
+        if self.use_sensor_gate:
+            if self.sensor_gate_adaptive:
+                gate = self.sensor_gate(x)
+                x = x * gate
+            else:
+                x = x * self.sensor_gate
         
         # Process through conv blocks with optional residual connections
         for i, conv_block in enumerate(self.conv_blocks):
@@ -225,6 +291,10 @@ class TOF2DCNN(nn.Module):
             
             # Apply conv block
             x = conv_block(x)
+
+            # Apply SE before residual addition (SENet-style)
+            if self.se_layers is not None:
+                x = self.se_layers[i](x)
             
             # Apply residual connection if enabled
             if self.use_residual:
@@ -232,6 +302,8 @@ class TOF2DCNN(nn.Module):
                     # Project residual to match output dimensions
                     residual = self.residual_projections[i](residual)
                 x = x + residual
+            
+            x = self.activation(x)
             
             # Apply pooling (except for last layer)
             if i < len(self.conv_blocks) - 1:
@@ -288,28 +360,46 @@ class TemporalTOF2DCNN(nn.Module):
         dropout (float): Dropout rate
     """
 
-    def __init__(self, input_channels=5, seq_len=100, out_features=128,
-                 conv_channels=None, kernel_sizes=None,
-                 # Temporal encoder selection
-                 temporal_mode='transformer',
-                 # LSTM parameters
-                 lstm_hidden=256, lstm_layers=2, bidirectional=True,
-                 # Transformer parameters
-                 num_heads=8, num_layers=2, ff_dim=512, dropout=0.1,
-                 # NEW: Residual connections
-                 use_residual=False):
+    def __init__(self,
+                 input_channels: int,
+                 seq_len: int,
+                 conv_channels: list,
+                 kernel_sizes: list,
+                 temporal_mode: str,
+                 # --- Optional Features for Spatial CNN ---
+                 use_residual: bool = False,
+                 use_se: bool = False,
+                 se_reduction: int = 16,
+                 use_sensor_gate: bool = False,
+                 sensor_gate_adaptive: bool = False,
+                 sensor_gate_init: float = 1.0,
+                 # --- Temporal Encoder Params (required based on mode) ---
+                 lstm_hidden: int = None,
+                 lstm_layers: int = None,
+                 bidirectional: bool = None,
+                 num_heads: int = None,
+                 num_layers: int = None,
+                 ff_dim: int = None,
+                 dropout: float = 0.1):
         super(TemporalTOF2DCNN, self).__init__()
 
         self.input_channels = input_channels
         self.seq_len = seq_len
         self.temporal_mode = temporal_mode
-        # Note: out_features parameter is kept for config compatibility,
-        # but actual output is determined by spatial CNN's last conv channel
-        self.out_features = conv_channels[-1] if conv_channels else 128
 
         # ------------- Spatial CNN applied per-frame -------------
-        self.spatial_cnn = TOF2DCNN(input_channels, out_features,
-                                    conv_channels, kernel_sizes, use_residual)
+        self.spatial_cnn = TOF2DCNN(
+            input_channels,
+            # out_features is determined by conv_channels, so no longer needed here
+            conv_channels=conv_channels,
+            kernel_sizes=kernel_sizes,
+            use_residual=use_residual,
+            use_se=use_se,
+            se_reduction=se_reduction,
+            use_sensor_gate=use_sensor_gate,
+            sensor_gate_adaptive=sensor_gate_adaptive,
+            sensor_gate_init=sensor_gate_init,
+        )
         
         # Get the actual output dimension from spatial CNN
         self.spatial_out_dim = self.spatial_cnn.out_features

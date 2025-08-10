@@ -57,16 +57,12 @@ from data_utils.tof_utils import interpolate_tof
 # 每种变体都有其自己的scaler和模型权重文件。
 
 MAP_NON_TARGET = "Drink from bottle/cup"
-SEQ_LEN        = 100      # 与训练保持一致
 
 def _load_preprocessing_objects(variant: str):
     """
     为给定变体加载标签编码器 (label encoder)。
     """
     le_path = os.path.join(WEIGHT_DIR, f"label_encoder_{variant}.pkl")
-    if not os.path.exists(le_path):
-        # 回退到通用文件名 (旧的提交)
-        le_path = os.path.join(WEIGHT_DIR, "label_encoder.pkl")
     if not os.path.exists(le_path):
         raise FileNotFoundError(f"Label encoder for variant '{variant}' not found at {le_path}")
 
@@ -82,6 +78,7 @@ def _load_models(device, num_classes, variant: str):
     适用于 K-Fold 集成和单一模型提交。
     """
     pairs = []
+    model_cfg_once = None  # To store the config from the first loaded model
 
     # 首先查找 K-Fold 模型
     fold_paths = [os.path.join(WEIGHT_DIR, f"model_fold_{i}_{variant}.pth") for i in range(1, 6)]
@@ -102,37 +99,31 @@ def _load_models(device, num_classes, variant: str):
             with open(scaler_path, "rb") as f:
                 scaler = pickle.load(f)
 
-            # 从scaler获取输入维度信息
-            feature_names = scaler.get_feature_names_out()
-            static_in_features = len([c for c in feature_names if c in STATIC_FEATURE_COLS])
-            tof_in_channels = len([c for c in feature_names if c.startswith('tof_')])
-            non_tof_in_channels = len(feature_names) - static_in_features - tof_in_channels
-
             # 使用训练时保存的配置构建模型
             ckpt = torch.load(p, map_location=device)
             if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
                 model_cfg = ckpt['model_cfg']
+                if model_cfg_once is None:
+                    model_cfg_once = model_cfg  # Save the config
+                
                 # 移除'type'键，因为它用于注册表，而不是构造函数
-                model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
+                init_kwargs = {k: v for k, v in model_cfg.items() if k != 'type'}
                 state_dict = ckpt['state_dict']
-                model = MultimodalityModel(**model_cfg)
+                model = MultimodalityModel(**init_kwargs)
+                
                 # 移除 torch.compile 产生的 `_orig_mod.` 前缀
-                # 检查键是否以 `_orig_mod.` 开头
                 is_compiled = any(key.startswith('_orig_mod.') for key in state_dict.keys())
                 if is_compiled:
                     print("Model was trained with torch.compile(). Cleaning state_dict keys...")
                     from collections import OrderedDict
                     new_state_dict = OrderedDict()
                     for k, v in state_dict.items():
-                        # 去掉 '_orig_mod.' 前缀
                         name = k.replace('_orig_mod.', '', 1) 
                         new_state_dict[name] = v
                     model.load_state_dict(new_state_dict)
                 else:
-                    # 如果没有前缀，则正常加载
                     model.load_state_dict(state_dict)
             else:
-                # 为没有配置的旧checkpoint提供回退
                 raise ValueError(f"Checkpoint for {p} is in a legacy format without 'model_cfg'. Please retrain and save with model config.")
 
             model.to(device).eval()
@@ -140,39 +131,11 @@ def _load_models(device, num_classes, variant: str):
             pairs.append((model, scaler))
     else:
         print(f"No K-Fold models found")
-        # # 单一模型回退逻辑
-        # print(f"SINGLE MODEL for variant: {variant}")
-        # weight_path = os.path.join(WEIGHT_DIR, f"best_model_{variant}.pth")
-        # scaler_path = os.path.join(WEIGHT_DIR, f"scaler_{variant}.pkl")
 
-        # if not os.path.exists(weight_path):
-        #      raise FileNotFoundError(f"No weight file found for variant '{variant}'.")
-        # if not os.path.exists(scaler_path):
-        #     raise FileNotFoundError(f"No scaler file found for variant '{variant}'.")
-
-        # with open(scaler_path, "rb") as f:
-        #     scaler = pickle.load(f)
-
-        # feature_names = scaler.get_feature_names_out()
-        # static_in_features = len([c for c in feature_names if c in STATIC_FEATURE_COLS])
-        # tof_in_channels = len([c for c in feature_names if c.startswith('tof_')])
-        # non_tof_in_channels = len(feature_names) - static_in_features - tof_in_channels
+    if not pairs:
+        raise FileNotFoundError(f"No valid models found for variant '{variant}'.")
         
-        # # 使用与 K-Fold 相同的逻辑加载模型
-        # ckpt = torch.load(weight_path, map_location=device)
-        # if isinstance(ckpt, dict) and 'model_cfg' in ckpt:
-        #     model_cfg = ckpt['model_cfg']
-        #     model_cfg = {k: v for k, v in model_cfg.items() if k != 'type'}
-        #     state_dict = ckpt['state_dict']
-        #     model = MultimodalityModel(**model_cfg)
-        #     model.load_state_dict(state_dict)
-        # else:
-        #     raise ValueError(f"Checkpoint for {weight_path} is in a legacy format without 'model_cfg'. Please retrain and save with model config.")
-        
-        # model.to(device).eval()
-        # pairs.append((model, scaler))
-
-    return pairs
+    return pairs, model_cfg_once
 
 print("🔧  Initialising inference resources …")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -185,12 +148,13 @@ for v in VARIANTS:
     try:
         le = _load_preprocessing_objects(v)
         num_classes = len(le.classes_)
-        model_scaler_pairs = _load_models(DEVICE, num_classes, v)
+        model_scaler_pairs, model_cfg = _load_models(DEVICE, num_classes, v)
 
         RESOURCES[v] = {
             "label_encoder": le,
             "num_classes": num_classes,
-            "model_scaler_pairs": model_scaler_pairs, # <-- 现在是 (model, ColumnTransformer) 对
+            "model_scaler_pairs": model_scaler_pairs,
+            "model_cfg": model_cfg  # Store the model config
         }
         print(f"✅  Resources for '{v}' variant loaded successfully.")
     except FileNotFoundError as e:
@@ -237,9 +201,7 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     variant = _decide_variant(seq_df)
     
     if variant not in RESOURCES:
-        fallback_variant = "imu" if "imu" in RESOURCES else "full"
-        print(f"🧬 Variant '{variant}' not available, falling back to '{fallback_variant}'")
-        variant = fallback_variant
+        raise FileNotFoundError(f"Resources for variant '{variant}' not available. Ensure models and scalers are exported for this variant.")
     else:
         print(f"🧬 Preprocessing with variant: {variant}")
 
@@ -291,6 +253,9 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     le                   = res["label_encoder"]
     model_scaler_pairs   = res["model_scaler_pairs"]
     num_cls              = res["num_classes"]
+    # ✨ Get sequence length dynamically from the model's config
+    model_cfg            = res["model_cfg"]
+    sequence_length      = model_cfg['sequence_length']
 
     with torch.no_grad():
         probs_sum = np.zeros((1, num_cls))
@@ -319,9 +284,9 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             imu_arr    = X_scaled_unpadded[:, imu_idx]
 
             # 5. ✨ 分别对 IMU 和 THM 进行 Padding 并生成 mask
-            X_imu_pad, imu_mask = pad_sequences([imu_arr], max_length=SEQ_LEN)
-            X_thm_pad, thm_mask = pad_sequences([thm_arr], max_length=SEQ_LEN)
-            X_tof_pad, _                = pad_sequences([tof_arr], max_length=SEQ_LEN)
+            X_imu_pad, imu_mask = pad_sequences([imu_arr], max_length=sequence_length)
+            X_thm_pad, thm_mask = pad_sequences([thm_arr], max_length=sequence_length)
+            X_tof_pad, _                = pad_sequences([tof_arr], max_length=sequence_length)
             X_static                    = static_arr[0:1, :]  # 静态特征取第一行即可
 
             # 6. 转换为Tensor并预测

@@ -1,10 +1,4 @@
-try:
-    from ..utils.registry import Registry
-except (ImportError, ValueError):  # Fallback for development environment and direct script execution
-    try:
-        from utils.registry import Registry
-    except ImportError:
-        from development.utils.registry import Registry
+from utils.registry import Registry
 
 # Create the registry instance
 MODELS = Registry('models')
