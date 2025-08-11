@@ -38,8 +38,8 @@ def load_py_config(config_path):
 # ----------------------------------------------------------------------
 # Ensure shared code in cmi-submission/ is the one we import everywhere
 # ----------------------------------------------------------------------
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))             # …/development
-SUBM_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, '..', 'cmi-submission'))   # .. means go up one level
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))          # …/development
+SUBM_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, '..', 'cmi-submission'))  # .. means go up one level
 
 # Pre-pend so it has priority over the local development/ path.
 if SUBM_DIR not in sys.path:
@@ -51,18 +51,18 @@ from utils.focal_loss import FocalLoss
 from utils.registry import build_from_cfg
 from models import MODELS
 
-# --- MODIFIED: Import the new Hybrid model and updated dataset class ---
+# --- MODIFIED: Import the new data prep functions ---
 from models.multimodality import MultimodalityModel
 from models.datasets import MultimodalDataset
-from data_utils.data_preprocessing import prepare_data_kfold_multimodal
+from data_utils.data_preprocessing import prepare_data_kfold_multimodal, prepare_base_data_kfold, generate_and_attach_spectrograms
 
 # Directory holding all models, scalers, summaries
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
 os.makedirs(WEIGHT_DIR, exist_ok=True)
 # ... (calculate_composite_weights_18_class 和 competition_metric 保持不变) ...
 def calculate_composite_weights_18_class(y_18_class_series: pd.Series, 
-                                           label_encoder_18_class: LabelEncoder, 
-                                           target_gesture_names: list):
+                                         label_encoder_18_class: LabelEncoder, 
+                                         target_gesture_names: list):
     """
     为18分类模型计算自定义复合权重字典 {class_index: weight}。
     """
@@ -422,8 +422,8 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
         
         if scheduler is not None:
-             if isinstance(scheduler, (WarmupAndReduceLROnPlateau, torch.optim.lr_scheduler.ReduceLROnPlateau)):
-                 scheduler.step(val_score)
+                 if isinstance(scheduler, (WarmupAndReduceLROnPlateau, torch.optim.lr_scheduler.ReduceLROnPlateau)):
+                     scheduler.step(val_score)
 
         if val_score > best_val_score:
             best_val_score = val_score
@@ -457,6 +457,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     
     return history
 
+# --- MODIFIED: Added spec_params to the function signature ---
 def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, spec_params: dict = None, output_dir: str = 'weights'):
     """
     使用5折交叉验证训练5个模型。
@@ -476,10 +477,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     if device is None:
         device = setup_device()
     
-    # 准备K折数据，并传递spec_params
+    # --- MODIFIED: Pass spec_params to the data preparation function ---
     fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(
         show_stratification=show_stratification, 
         variant=variant,
+        spec_params=spec_params,
     )
     
     num_samples = len(y_all)
@@ -495,9 +497,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
 
     model_cfg['imu_branch_cfg']['input_channels'] = sample_imu.shape[2]
     if 'thm_branch_cfg' in model_cfg:
-        model_cfg['thm_branch_cfg']['input_channels'] = sample_thm.shape[2]
+        model_cfg['thm_branch_cfg']['input_channels'] = sample_thm.shape[2] if sample_thm.ndim > 2 else 0
     if 'tof_branch_cfg' in model_cfg:
-        model_cfg['tof_branch_cfg']['input_channels'] = sample_tof.shape[2] // 64
+        model_cfg['tof_branch_cfg']['input_channels'] = sample_tof.shape[2] // 64 if sample_tof.ndim > 2 else 0
     if 'spec_branch_cfg' in model_cfg:
         model_cfg['spec_branch_cfg']['in_channels'] = sample_spec.shape[1]
     model_cfg['mlp_branch_cfg']['input_features'] = sample_static.shape[1]
@@ -511,9 +513,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     fold_histories = []
     
     # 训练每个折叠
-    for fold_idx in range(5):
+    for fold_idx in range(len(fold_data)):
         print(f"\n" + "="*60)
-        print(f"TRAINING FOLD {fold_idx + 1}/5")
+        print(f"TRAINING FOLD {fold_idx + 1}/{len(fold_data)}")
         print("="*60)
         
         fold = fold_data[fold_idx]

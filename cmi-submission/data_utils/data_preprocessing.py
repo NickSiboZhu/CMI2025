@@ -1,3 +1,5 @@
+# data_preprocessing.py
+
 import pandas as pd
 import numpy as np
 import polars as pl
@@ -11,47 +13,52 @@ from sklearn.compose import ColumnTransformer
 from scipy.spatial.transform import Rotation as R
 import warnings
 from scipy import signal
+from joblib import Parallel, delayed
+import time
 
-def generate_spectrogram(ts_data, fs=10.0, nperseg=20, noverlap=15, max_length=100):
-    """
-    从时序信号生成对数功率谱图。
-    MODIFIED: 动态计算输出形状，以支持可变的STFT参数。
-    """
-    # 确保参数有效，防止 STFT 报错
-    if noverlap >= nperseg:
-        # 如果重叠大于或等于窗口大小，这是无效的，将其设置为一个合理的值
-        noverlap = nperseg // 2
-
-    # --- 动态计算输出形状 ---
-    # 获取STFT输出维度的最可靠方法是，对一个期望长度的零向量运行一次虚拟变换。
-    # 由于您的预处理流程确保了输入信号长度总是 max_length，我们可以这样做：
-    _, t_dummy, _ = signal.stft(np.zeros(max_length), fs=fs, nperseg=nperseg, noverlap=noverlap)
-    
-    # 从虚拟变换的结果中获取正确的维度
-    expected_time_bins = t_dummy.shape[0]
-    freq_bins = nperseg // 2 + 1 # 这是STFT的固定输出
-
-    # --- 处理空信号 ---
+# --- 2. 优化后的语谱图生成函数 ---
+def generate_spectrogram(ts_data, fs, nperseg, noverlap, max_length):
+    """一个封装好的、使用动态参数的优化版函数"""
     if ts_data is None or len(ts_data) == 0:
-        # 返回一个具有正确动态形状的零矩阵
-        return np.zeros((freq_bins, expected_time_bins), dtype=np.float32)
+        # 如果数据为空, 计算预期的形状并返回零矩阵
+        freqs, time_bins, _ = signal.stft(np.zeros(max_length), fs=fs, nperseg=nperseg, noverlap=noverlap)
+        spec_shape = (len(freqs), len(time_bins))
+        return np.zeros(spec_shape, dtype=np.float32)
     
-    # --- 处理真实信号 ---
-    # 此时，ts_data 应该已经被填充或截断为 max_length
     f, t, Zxx = signal.stft(ts_data, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    
-    # （可选，但推荐）一个健全性检查，确保真实输出和预期输出的形状一致
-    if t.shape[0] != expected_time_bins:
-        # 如果由于某些边缘情况导致长度不匹配，可以通过插值或填充来强制统一
-        # 但在您的流程中，因为输入长度固定，通常不会发生这种情况。
-        # 这里我们只加一个断言来捕获潜在问题。
-        assert t.shape[0] == expected_time_bins, \
-            f"Time bins mismatch! Expected {expected_time_bins}, but got {t.shape[0]}. " \
-            f"Params: nperseg={nperseg}, noverlap={noverlap}, len={len(ts_data)}"
-
     log_spectrogram = np.log1p(np.abs(Zxx))
-    
     return log_spectrogram.astype(np.float32)
+
+
+# --- 3. 用于并行处理的工作函数 ---
+def process_and_get_stats(group, spec_params, max_length):
+    """处理单个group，并返回其统计数据"""
+    # 从字典中解包参数
+    fs = spec_params['fs']
+    nperseg = spec_params['nperseg']
+    noverlap = spec_params['noverlap']
+    
+    count = 0
+    total_sum = 0.0
+    total_sum_sq = 0.0
+    spec_source_cols = ['linear_acc_x', 'linear_acc_y', 'linear_acc_z', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z']
+    for col in spec_source_cols: # 假设 spec_source_cols 已定义
+        signal_1d = group[col].values
+        seq_len = len(signal_1d)
+        
+        if seq_len >= max_length:
+            padded_signal = signal_1d[-max_length:]
+        else:
+            padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
+        
+        # 调用使用动态参数的优化函数
+        spec = generate_spectrogram(padded_signal, fs, nperseg, noverlap, max_length)
+        
+        count += spec.size
+        total_sum += np.sum(spec)
+        total_sum_sq += np.sum(spec**2)
+            
+    return count, total_sum, total_sum_sq
 
 def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
@@ -506,83 +513,109 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     
     return X_train_normalized, X_val_normalized, scaler
 
-
-def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str="full", n_splits: int=5):
+# --- NEW: Function to prepare base data (for hyperparameter search) ---
+def prepare_base_data_kfold(variant: str = "full", n_splits: int = 5):
     """
-    为多模态架构准备K-Fold数据。
-
-    此版本包含的核心功能:
-    1.  为每个折叠的训练集计算全局频谱图统计量 (均值/标准差)。
-    2.  健壮地处理任意长度的序列 (过长则截断，过短则填充)。
-    3.  返回所有模态的数据，包括为2D CNN准备的频谱图。
+    加载并预处理所有时域和静态数据，进行特征工程，标准化，并按K-Fold分割。
+    此函数 *不* 生成频谱图，为超参数搜索优化。
     """
     # 1. 加载并进行基础预处理 (包括特征工程)
+    start_time = time.time()
     all_data_df, label_encoder, all_feature_cols = load_and_preprocess_data(variant)
+    print(f"Base data loading and FE took {time.time() - start_time:.2f} seconds.")
 
-    # 2. 动态识别各模态的列名
-    static_cols = [c for c in STATIC_FEATURE_COLS if c in all_data_df.columns]
-    thm_cols, tof_cols = generate_feature_columns(all_data_df.columns)
+    # 2. 准备分层分组K折交叉验证
+    labels_map_df = all_data_df[["sequence_id", "gesture_encoded", "subject"]].drop_duplicates().reset_index(drop=True)
+    y = labels_map_df["gesture_encoded"].values
+    subjects = labels_map_df["subject"].values
+    unique_seq_ids = labels_map_df["sequence_id"].values
+
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    base_fold_data = []
+
+    print(f"\nPreparing {n_splits}-fold base splits (T-series & Static features)...")
+
+    for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(np.zeros(len(unique_seq_ids)), y, groups=subjects)):
+        print(f"\n--- Preparing Base Fold {fold_idx+1}/{n_splits} ---")
+        train_sids = unique_seq_ids[train_idx]
+        val_sids = unique_seq_ids[val_idx]
+
+        train_df = all_data_df[all_data_df["sequence_id"].isin(train_sids)].copy()
+        val_df = all_data_df[all_data_df["sequence_id"].isin(val_sids)].copy()
+
+        y_train = labels_map_df[labels_map_df["sequence_id"].isin(train_sids)]["gesture_encoded"].values
+        y_val = labels_map_df[labels_map_df["sequence_id"].isin(val_sids)]["gesture_encoded"].values
+
+        # 3. 标准化时域特征
+        X_train_norm, X_val_norm, scaler_fold = normalize_features(train_df[all_feature_cols], val_df[all_feature_cols])
+        # Add sequence_id back for grouping
+        X_train_norm["sequence_id"] = train_df["sequence_id"]
+        X_val_norm["sequence_id"] = val_df["sequence_id"]
+
+        base_fold_data.append({
+            'X_train_norm': X_train_norm,
+            'X_val_norm': X_val_norm,
+            'y_train': y_train,
+            'y_val': y_val,
+            'train_sids': train_sids,
+            'val_sids': val_sids,
+            'scaler': scaler_fold,
+            'val_idx': val_idx,
+            'all_feature_cols': all_feature_cols
+        })
+
+    print("\n✅ Base K-fold data prepared.")
+    return base_fold_data, label_encoder, y, unique_seq_ids
+
+# --- NEW: Function to generate and attach spectrograms ---
+def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"):
+    """
+    接收基础K-Fold数据和频谱图参数，生成频谱图并将其附加到每个折叠中。
+    [REVERTED] 恢复了原始的数据处理策略。
+    """
+    print(f"\nGenerating and attaching spectrograms with params: {spec_params}")
+    fs = spec_params['fs']
+    nperseg = spec_params['nperseg']
+    noverlap = spec_params['noverlap']
+    max_length = spec_params.get('max_length', 100)
+
+    # 动态识别各模态的列名
+    sample_fold = base_fold_data[0]
+    all_feature_cols = sample_fold['all_feature_cols']
+    
+    static_cols = [c for c in STATIC_FEATURE_COLS if c in all_feature_cols]
+    thm_cols, tof_cols = generate_feature_columns(all_feature_cols)
     thm_cols = [c for c in thm_cols if c in all_feature_cols]
     tof_cols = [c for c in tof_cols if c in all_feature_cols]
     imu_cols = [c for c in all_feature_cols if c not in static_cols and c not in tof_cols and c not in thm_cols]
-    
-    # 定义用于生成频谱图的源信号列
     spec_source_cols = ['linear_acc_x', 'linear_acc_y', 'linear_acc_z', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z']
-    spec_source_cols = [c for c in spec_source_cols if c in all_data_df.columns]
+    spec_source_cols = [c for c in spec_source_cols if c in all_feature_cols]
     print(f"Generating spectrograms from {len(spec_source_cols)} source signals.")
 
-    # 3. 准备分层分组K折交叉验证
-    labels_map_df    = all_data_df[["sequence_id", "gesture_encoded", "subject"]].drop_duplicates().reset_index(drop=True)
-    y                = labels_map_df["gesture_encoded"].values
-    subjects         = labels_map_df["subject"].values
-    unique_seq_ids   = labels_map_df["sequence_id"].values
+    final_fold_data = []
 
-    sgkf        = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    fold_data   = []
+    for fold_idx, base_fold in enumerate(base_fold_data):
+        print(f"\n--- Generating Spectrograms for Fold {fold_idx+1}/{len(base_fold_data)} ---")
+        X_train_norm = base_fold['X_train_norm']
+        X_val_norm = base_fold['X_val_norm']
+        train_sids = base_fold['train_sids']
+        val_sids = base_fold['val_sids']
 
-    print(f"\nPreparing {n_splits}-fold splits with Spectrogram branch...")
-    max_length = 100 # 定义所有序列处理的统一长度
-
-    for fold_idx, (train_idx, val_idx) in enumerate(sgkf.split(np.zeros(len(unique_seq_ids)), y, groups=subjects)):
-        print(f"\n--- Fold {fold_idx+1}/{n_splits} ---")
-        train_sids = unique_seq_ids[train_idx]
-        val_sids   = unique_seq_ids[val_idx]
-
-        train_df = all_data_df[all_data_df["sequence_id"].isin(train_sids)].copy()
-        val_df   = all_data_df[all_data_df["sequence_id"].isin(val_sids)].copy()
-
-        y_train = labels_map_df[labels_map_df["sequence_id"].isin(train_sids)]["gesture_encoded"].values
-        y_val   = labels_map_df[labels_map_df["sequence_id"].isin(val_sids)]["gesture_encoded"].values
-
-        # 4. 标准化 (在padding和生成频谱图之前)
-        X_train_norm, X_val_norm, scaler_fold = normalize_features(train_df[all_feature_cols], val_df[all_feature_cols])
-        X_train_norm["sequence_id"] = train_df["sequence_id"]
-        X_val_norm["sequence_id"]   = val_df["sequence_id"]
-
-        # 5. 计算该折叠训练集的全局频谱图统计量
-        print("Calculating global spectrogram statistics for this fold's training set...")
-        all_train_specs_for_fold = []
-        for sid in train_sids:
-            group = X_train_norm.loc[X_train_norm['sequence_id'] == sid]
-            for col in spec_source_cols:
-                # 使用健壮的逻辑处理序列长度
-                signal_1d = group[col].values
-                seq_len = len(signal_1d)
-                if seq_len >= max_length:
-                    padded_signal = signal_1d[-max_length:]
-                else:
-                    padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
-                
-                spec = generate_spectrogram(padded_signal)
-                all_train_specs_for_fold.append(spec)
+        # 1. 计算该折叠训练集的全局频谱图统计量
+        print("Calculating global spectrogram statistics...")
+        groups = [group for _, group in X_train_norm.groupby('sequence_id')]
+        results = Parallel(n_jobs=-1)(delayed(process_and_get_stats)(group, spec_params, max_length) for group in groups)
         
-        stacked_specs = np.stack(all_train_specs_for_fold, axis=0)
-        global_spec_mean = np.mean(stacked_specs)
-        global_spec_std = np.std(stacked_specs)
+        total_count = sum(r[0] for r in results)
+        global_sum = sum(r[1] for r in results)
+        global_sum_sq = sum(r[2] for r in results)
+
+        global_spec_mean = global_sum / total_count if total_count > 0 else 0.0
+        global_spec_std = np.sqrt(global_sum_sq / total_count - global_spec_mean**2) if total_count > 0 else 1.0
         print(f"  Global Spec Mean: {global_spec_mean:.4f}, Global Spec Std: {global_spec_std:.4f}")
         spec_stats = {'mean': global_spec_mean, 'std': global_spec_std}
 
-        # 6. 分离多模态数据, padding时域数据, 并生成频谱图
+        # 2. 分离多模态数据, padding时域数据, 并生成频谱图
         # --- 处理训练集 ---
         grouped_train = X_train_norm.groupby('sequence_id')
         train_static_list, train_imu_list, train_thm_list, train_tof_list, train_spec_list = [], [], [], [], []
@@ -591,26 +624,25 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
             group = grouped_train.get_group(sid)
             train_static_list.append(group[static_cols].iloc[0].values)
             train_imu_list.append(group[imu_cols].values)
-            train_thm_list.append(group[thm_cols].values)
-            train_tof_list.append(group[tof_cols].values)
+            train_thm_list.append(group[thm_cols].values) # [REVERTED]
+            train_tof_list.append(group[tof_cols].values) # [REVERTED]
             
             sequence_spectrograms = []
             for col in spec_source_cols:
                 signal_1d = group[col].values
                 seq_len = len(signal_1d)
-                if seq_len >= max_length:
-                    padded_signal = signal_1d[-max_length:]
-                else:
-                    padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
-                spec = generate_spectrogram(padded_signal)
+                padded_signal = signal_1d[-max_length:] if seq_len >= max_length else np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
+                spec = generate_spectrogram(padded_signal, fs, nperseg, noverlap, max_length)
                 sequence_spectrograms.append(spec)
             train_spec_list.append(np.stack(sequence_spectrograms, axis=0))
 
+        # --- [REVERTED] 恢复到原始的直接padding逻辑 ---
         X_train_static = np.array(train_static_list, dtype=np.float32)
         X_train_imu, train_mask = pad_sequences(train_imu_list, max_length=max_length)
         X_train_thm, _ = pad_sequences(train_thm_list, max_length=max_length)
         X_train_tof, _ = pad_sequences(train_tof_list, max_length=max_length)
         X_train_spec = np.array(train_spec_list, dtype=np.float32)
+
 
         # --- 处理验证集 ---
         grouped_val = X_val_norm.groupby('sequence_id')
@@ -620,44 +652,79 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
             group = grouped_val.get_group(sid)
             val_static_list.append(group[static_cols].iloc[0].values)
             val_imu_list.append(group[imu_cols].values)
-            val_thm_list.append(group[thm_cols].values)
-            val_tof_list.append(group[tof_cols].values)
+            val_thm_list.append(group[thm_cols].values) # [REVERTED]
+            val_tof_list.append(group[tof_cols].values) # [REVERTED]
 
             sequence_spectrograms = []
             for col in spec_source_cols:
                 signal_1d = group[col].values
                 seq_len = len(signal_1d)
-                if seq_len >= max_length:
-                    padded_signal = signal_1d[-max_length:]
-                else:
-                    padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
-                spec = generate_spectrogram(padded_signal)
+                padded_signal = signal_1d[-max_length:] if seq_len >= max_length else np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
+                spec = generate_spectrogram(padded_signal, fs, nperseg, noverlap, max_length)
                 sequence_spectrograms.append(spec)
             val_spec_list.append(np.stack(sequence_spectrograms, axis=0))
 
+        # --- [REVERTED] 恢复到原始的直接padding逻辑 ---
         X_val_static = np.array(val_static_list, dtype=np.float32)
         X_val_imu, val_mask = pad_sequences(val_imu_list, max_length=max_length)
         X_val_thm, _ = pad_sequences(val_thm_list, max_length=max_length)
         X_val_tof, _ = pad_sequences(val_tof_list, max_length=max_length)
         X_val_spec = np.array(val_spec_list, dtype=np.float32)
 
-        print(f"Train shapes: IMU={X_train_imu.shape}, THM={X_train_thm.shape}, TOF={X_train_tof.shape}, SPEC={X_train_spec.shape}, Static={X_train_static.shape}")
-        print(f"Val shapes:   IMU={X_val_imu.shape}, THM={X_val_thm.shape}, TOF={X_val_tof.shape}, SPEC={X_val_spec.shape}, Static={X_val_static.shape}")
-
-        # 7. 存储该折的所有数据
-        fold_data.append({
+        # 3. 存储该折的所有数据
+        final_fold = {
             'X_train_imu': X_train_imu, 'X_train_thm': X_train_thm, 'X_train_tof': X_train_tof,
             'X_train_spec': X_train_spec, 'X_train_static': X_train_static,
-            'y_train': y_train, 'train_mask': train_mask,
+            'y_train': base_fold['y_train'], 'train_mask': train_mask,
             'X_val_imu': X_val_imu, 'X_val_thm': X_val_thm, 'X_val_tof': X_val_tof,
             'X_val_spec': X_val_spec, 'X_val_static': X_val_static,
-            'y_val': y_val, 'val_mask': val_mask,
-            'scaler': scaler_fold, 
+            'y_val': base_fold['y_val'], 'val_mask': val_mask,
+            'scaler': base_fold['scaler'],
             'spec_stats': spec_stats,
-            'val_idx': val_idx,
-        })
+            'val_idx': base_fold['val_idx'],
+        }
+        final_fold_data.append(final_fold)
 
-    print("\n✅ K-fold preparation done. Returning data …")
+    return final_fold_data
+
+# --- MODIFIED: Main data preparation entry point ---
+def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str="full", n_splits: int=5, spec_params: dict = None):
+    """
+    为多模态架构准备K-Fold数据的主入口函数。
+    此函数现在协调基础数据的准备和频谱图的生成。
+    """
+    full_start_time = time.time()
+    # 1. 设置默认频谱图参数 (如果未提供)
+    if spec_params is None:
+        print("No spec_params provided, using default values.")
+        spec_params = {
+            'fs': 10.0,
+            'nperseg': 20,
+            'noverlap_ratio': 0.75, # 使用比例以便于搜索
+            'max_length': 100
+        }
+    
+    # 从比例计算重叠值
+    if 'noverlap_ratio' in spec_params:
+        spec_params['noverlap'] = int(spec_params['nperseg'] * spec_params['noverlap_ratio'])
+        # 确保 noverlap < nperseg
+        if spec_params['noverlap'] >= spec_params['nperseg']:
+            spec_params['noverlap'] = spec_params['nperseg'] // 2
+    
+    # 2. 准备基础数据 (除频谱图外的所有内容)
+    base_fold_data, label_encoder, y, unique_seq_ids = prepare_base_data_kfold(
+        variant=variant, 
+        n_splits=n_splits
+    )
+
+    # 3. 生成频谱图并附加到基础数据中
+    fold_data = generate_and_attach_spectrograms(
+        base_fold_data, 
+        spec_params, 
+        variant=variant
+    )
+
+    print(f"\n✅ Full K-fold data preparation took {time.time() - full_start_time:.2f} seconds.")
     return fold_data, label_encoder, y, unique_seq_ids
 
 
@@ -666,14 +733,18 @@ if __name__ == "__main__":
     # 可选择 "full" 或 "imu" 变体进行测试
     VARIANT = "full" 
     
+    # 使用默认参数测试新的数据准备流程
     fold_data, le, y_all, sids = prepare_data_kfold_multimodal(variant=VARIANT)
     
     print("\n--- Example: Data from Fold 1 ---")
     first_fold = fold_data[0]
-    print(f"X_train_non_tof shape: {first_fold['X_train_non_tof'].shape}")
+    print(f"X_train_imu shape: {first_fold['X_train_imu'].shape}")
+    print(f"X_train_thm shape: {first_fold['X_train_thm'].shape}")
     print(f"X_train_tof shape: {first_fold['X_train_tof'].shape}")
+    print(f"X_train_spec shape: {first_fold['X_train_spec'].shape}")
     print(f"X_train_static shape: {first_fold['X_train_static'].shape}")
     print(f"y_train shape: {first_fold['y_train'].shape}")
     print(f"Scaler type: {type(first_fold['scaler'])}")
+    print(f"Spec stats: {first_fold['spec_stats']}")
     
     print("\nData preprocessing script finished successfully!")
