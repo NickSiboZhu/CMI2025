@@ -265,14 +265,16 @@ def objective(trial: optuna.trial.Trial) -> float:
         # --- TOF Sensor Gate hyperparameters ---
         use_tof_sensor_gate = trial.suggest_categorical('tof_use_sensor_gate', [False, True])
         cfg.model['tof_branch_cfg']['use_sensor_gate'] = use_tof_sensor_gate
-        
-        # Only suggest dependent parameters if the gate is enabled
+
+        # Suggest sub-parameters UNCONDITIONALLY to keep a static search space for multivariate TPE
+        is_adaptive = trial.suggest_categorical('tof_sensor_gate_adaptive', [False, True])
+        sensor_gate_init = trial.suggest_float('tof_sensor_gate_init', 0.5, 1.5)
+
+        # Apply sub-parameters only if the gate is enabled
         if use_tof_sensor_gate:
-            is_adaptive = trial.suggest_categorical('tof_sensor_gate_adaptive', [False, True])
             cfg.model['tof_branch_cfg']['sensor_gate_adaptive'] = is_adaptive
-            # Only suggest init value for non-adaptive gate
             if not is_adaptive:
-                cfg.model['tof_branch_cfg']['sensor_gate_init'] = trial.suggest_float('tof_sensor_gate_init', 0.5, 1.5)
+                cfg.model['tof_branch_cfg']['sensor_gate_init'] = sensor_gate_init
         
         num_tof_cnn_layers = trial.suggest_categorical('num_tof_cnn_layers', [2, 3])
         tof_kernel_0 = trial.suggest_categorical('tof_kernel_0', [2, 3])
@@ -342,14 +344,17 @@ def objective(trial: optuna.trial.Trial) -> float:
         log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
 
         # Build a compact view of the actually used parameters to keep logs clean
+        _training_eff = {
+            'epochs': cfg.training['epochs'],
+            'patience': cfg.training['patience'],
+            'weight_decay': cfg.training['weight_decay'],
+            'mixup_enabled': cfg.training['mixup_enabled'],
+        }
+        if cfg.training['mixup_enabled']:
+            _training_eff['mixup_alpha'] = cfg.training['mixup_alpha']
+
         effective_params = {
-            'training': {
-                'epochs': cfg.training['epochs'],
-                'patience': cfg.training['patience'],
-                'weight_decay': cfg.training['weight_decay'],
-                'mixup_enabled': cfg.training['mixup_enabled'],
-                'mixup_alpha': cfg.training['mixup_alpha'],
-            },
+            'training': _training_eff,
             'scheduler': {
                 'type': scheduler_type,
                 'warmup_ratio': scheduler_cfg['warmup_ratio']
