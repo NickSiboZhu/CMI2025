@@ -8,6 +8,90 @@ from timm.layers import SqueezeExcite as TimmSE
 
     
 
+@MODELS.register_module()
+class SpectrogramCNN(nn.Module):
+    """
+    A highly configurable 2D CNN for processing spectrograms.
+    MODIFIED: Fixed a bug by using MaxPool1d for mask downsampling.
+    """
+    def __init__(self,
+                 in_channels: int,
+                 filters: list = None,
+                 kernel_sizes: list = None,
+                 use_residual: bool = True):
+        super().__init__()
+
+        if filters is None: filters = [32, 64, 128]
+        if kernel_sizes is None: kernel_sizes = [3, 3, 3]
+        assert len(filters) == len(kernel_sizes), "filters and kernel_sizes length mismatch"
+
+        self.use_residual = use_residual
+        self.out_features = filters[-1]
+
+        self.conv_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList()
+        self.residual_projections = nn.ModuleList()
+
+        current_channels = in_channels
+        for i, (out_c, k) in enumerate(zip(filters, kernel_sizes)):
+            self.conv_layers.append(nn.Conv2d(current_channels, out_c, kernel_size=k, padding='same'))
+            self.bn_layers.append(nn.BatchNorm2d(out_c))
+            if use_residual and current_channels != out_c:
+                self.residual_projections.append(nn.Conv2d(current_channels, out_c, kernel_size=1))
+            else:
+                self.residual_projections.append(None)
+            current_channels = out_c
+        
+        self.activation = nn.ReLU()
+        # 2D池化层，用于处理特征图
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2) 
+        
+        # --- NEW: 为1D掩码专门定义一个1D池化层 ---
+        self.mask_pool = nn.MaxPool1d(kernel_size=2, stride=2)
+        
+        self.final_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x: torch.Tensor, time_mask: torch.Tensor = None) -> torch.Tensor:
+        if time_mask is None:
+            time_mask = torch.ones(x.shape[0], x.shape[3], device=x.device)
+
+        for i, conv in enumerate(self.conv_layers):
+            # 将1D时间掩码扩展为4D以便广播
+            mask_4d = time_mask.view(x.shape[0], 1, 1, x.shape[3])
+
+            x = x * mask_4d
+            
+            residual = x if self.use_residual else None
+            
+            x = conv(x)
+            x = self.bn_layers[i](x)
+            
+            if self.use_residual:
+                if self.residual_projections[i] is not None:
+                    residual = self.residual_projections[i](residual)
+                    residual = residual * mask_4d
+                x = x + residual
+            
+            x = self.activation(x)
+            x = x * mask_4d
+            
+            # 特征图使用2D池化
+            x = self.pool(x)
+            
+            # --- MODIFIED: 使用正确的1D池化来缩减掩码 ---
+            # 1. 将1D掩码扩展为3D以适应MaxPool1d的输入: (B, W) -> (B, 1, W)
+            mask_for_pooling = time_mask.unsqueeze(1).float()
+            # 2. 应用1D池化操作
+            pooled_mask = self.mask_pool(mask_for_pooling)
+            # 3. 移除临时的通道维度，恢复为1D掩码: (B, 1, W_new) -> (B, W_new)
+            time_mask = pooled_mask.squeeze(1)
+            
+        x = self.final_pool(x)
+        output = x.view(x.size(0), -1) 
+        
+        return output
+    
+
 class TemporalEncoder(nn.Module):
     """
     A unified temporal encoder that supports both LSTM and Transformer architectures.
@@ -316,18 +400,6 @@ class TOF2DCNN(nn.Module):
         x = x.view(x.size(0), -1)  # (batch, last_conv_channels)
         
         return x
-    
-    def get_model_info(self):
-        """Get model parameter information"""
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        return {
-            'total_params': total_params,
-            'trainable_params': trainable_params,
-            'model_size_mb': total_params * 4 / 1024 / 1024  # Assuming float32
-        }
-
 
 
 @MODELS.register_module()
@@ -455,14 +527,3 @@ class TemporalTOF2DCNN(nn.Module):
         temporal_features = self.temporal_encoder(spatial_features, mask)  # (B, output_dim)
         
         return temporal_features
-    
-    def get_model_info(self):
-        """Get model parameter information"""
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        return {
-            'total_params': total_params,
-            'trainable_params': trainable_params,
-            'model_size_mb': total_params * 4 / 1024 / 1024  # Assuming float32
-        }

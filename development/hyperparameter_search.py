@@ -18,7 +18,7 @@ import train
 
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
-CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
+CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
 # 你想要运行的试验次数
 N_TRIALS = 100
 # 初始随机搜索的次数
@@ -71,9 +71,11 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
 
         # --- NEW LOGIC: Copy from trial artifacts to the final weights directory ---
         # Define a list of files to copy to handle missing files gracefully
+        # MODIFIED: Add spec_stats to the list of files to copy
         files_to_copy = (
             [f'model_fold_{i}_{variant}.pth' for i in range(1, 6)] +
             [f'scaler_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
+            [f'spec_stats_fold_{i}_{variant}.pkl' for i in range(1, 6)] + # ADDED
             [f'label_encoder_{variant}.pkl', f'kfold_summary_{variant}.json', f'oof_predictions_{variant}.csv']
         )
 
@@ -125,6 +127,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     MAX_THM_LAYERS = 4
     MAX_TOF_CNN_LAYERS = 3
     MAX_FUSION_LAYERS = 3
+    MAX_SPEC_LAYERS = 3
 
     # --- 1. 定义通用超参数 ---
     cfg.training['epochs'] = trial.suggest_int('epochs', 20, 150)
@@ -155,6 +158,22 @@ def objective(trial: optuna.trial.Trial) -> float:
     layer_lrs['imu'] = trial.suggest_float('lr_imu', 1e-5, 1e-2, log=True)
     layer_lrs['mlp'] = trial.suggest_float('lr_mlp', 1e-5, 1e-2, log=True)
     layer_lrs['fusion'] = trial.suggest_float('lr_fusion', 1e-5, 1e-2, log=True)
+    layer_lrs['spec'] = trial.suggest_float('lr_spec', 1e-5, 1e-2, log=True)
+    
+    # --- NEW: Spectrogram 数据生成超参数 ---
+    spec_params = {}
+    spec_params['nperseg'] = trial.suggest_int('spec_nperseg', 16, 64, step=4)
+    spec_params['noverlap_ratio'] = trial.suggest_float('spec_noverlap_ratio', 0.5, 0.95)
+    spec_params['fs'] = 10.0
+
+    # --- Spectrogram (Spec) 分支架构 ---
+    if 'spec_branch_cfg' in cfg.model:
+        num_spec_layers = trial.suggest_int('num_spec_layers', 2, MAX_SPEC_LAYERS)
+        spec_filters_all = [trial.suggest_int(f'spec_filter_{i}', 16, 512, step=16) for i in range(MAX_SPEC_LAYERS)]
+        spec_kernel_sizes_all = [trial.suggest_categorical(f'spec_kernel_{i}', [3, 5]) for i in range(MAX_SPEC_LAYERS)]
+        cfg.model['spec_branch_cfg']['filters'] = spec_filters_all[:num_spec_layers]
+        cfg.model['spec_branch_cfg']['kernel_sizes'] = spec_kernel_sizes_all[:num_spec_layers]
+        cfg.model['spec_branch_cfg']['use_residual'] = trial.suggest_categorical('spec_use_residual', [True, False])
 
     # IMU 分支 (扁平化)
     num_imu_layers = trial.suggest_int('num_imu_layers', 2, MAX_IMU_LAYERS)
@@ -168,18 +187,11 @@ def objective(trial: optuna.trial.Trial) -> float:
     cfg.model['imu_branch_cfg']['se_reduction'] = trial.suggest_categorical('imu_se_reduction', [8, 16, 32])
 
     # --- IMU Temporal Aggregation (正确、无条件地定义所有相关参数) ---
-
-    # 首先，定义顶层选择
     imu_temporal_aggregation = trial.suggest_categorical('imu_temporal_aggregation', ['global_pool', 'temporal_encoder'])
     imu_temporal_mode = trial.suggest_categorical('imu_temporal_mode', ['lstm', 'transformer'])
-
-    # 其次，无条件定义 'temporal_encoder' 分支下的所有子参数
-    # LSTM 参数
     imu_lstm_hidden = trial.suggest_int('imu_lstm_hidden', 128, 512, step=64)
     imu_lstm_layers = trial.suggest_int('imu_lstm_layers', 1, 2)
     imu_bidirectional = trial.suggest_categorical('imu_bidirectional', [True, False])
-
-    # Transformer 参数 (包含 ff_dim)
     imu_transformer_heads = trial.suggest_categorical('imu_num_heads', [4, 8, 16])
     imu_transformer_layers = trial.suggest_int('imu_num_layers', 1, 3)
     imu_transformer_ff_dim = trial.suggest_int('imu_ff_dim', 256, 1024, step=128)
@@ -187,12 +199,8 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     cfg.model['imu_branch_cfg']['temporal_aggregation'] = imu_temporal_aggregation
 
-    # 只有当选择了 'temporal_encoder' 时，才继续组装其内部配置
     if imu_temporal_aggregation == 'temporal_encoder':
-        # 将模式选择赋给 cfg
         cfg.model['imu_branch_cfg']['temporal_mode'] = imu_temporal_mode
-        
-        # 根据模式选择，组装 LSTM 或 Transformer 的具体配置
         if imu_temporal_mode == 'lstm':
             cfg.model['imu_branch_cfg']['lstm_hidden'] = imu_lstm_hidden
             cfg.model['imu_branch_cfg']['lstm_layers'] = imu_lstm_layers
@@ -200,8 +208,8 @@ def objective(trial: optuna.trial.Trial) -> float:
         else:  # transformer
             cfg.model['imu_branch_cfg']['num_heads'] = imu_transformer_heads
             cfg.model['imu_branch_cfg']['num_layers'] = imu_transformer_layers
-            cfg.model['imu_branch_cfg']['ff_dim'] = imu_transformer_ff_dim # 组装 ff_dim
-            cfg.model['imu_branch_cfg']['dropout'] = imu_transformer_dropout  # 组装 dropout
+            cfg.model['imu_branch_cfg']['ff_dim'] = imu_transformer_ff_dim
+            cfg.model['imu_branch_cfg']['dropout'] = imu_transformer_dropout
     
     # MLP 分支 (扁平化)
     num_mlp_hidden_layers = trial.suggest_int('num_mlp_hidden_layers', 1, MAX_MLP_LAYERS)
@@ -226,7 +234,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         cfg.model['thm_branch_cfg']['use_se'] = trial.suggest_categorical('thm_use_se', [True, False])
         cfg.model['thm_branch_cfg']['se_reduction'] = trial.suggest_categorical('thm_se_reduction', [8, 16, 32])
         
-        # THM Temporal Aggregation (正确、无条件地定义所有相关参数)
+        # THM Temporal Aggregation
         thm_temporal_aggregation = trial.suggest_categorical('thm_temporal_aggregation', ['global_pool', 'temporal_encoder'])
         thm_temporal_mode = trial.suggest_categorical('thm_temporal_mode', ['lstm', 'transformer'])
 
@@ -238,13 +246,11 @@ def objective(trial: optuna.trial.Trial) -> float:
         # THM Transformer 参数
         thm_transformer_heads = trial.suggest_categorical('thm_num_heads', [4, 8, 16])
         thm_transformer_layers = trial.suggest_int('thm_num_layers', 1, 2)
-        # 这里也应该有一个 ff_dim
         thm_transformer_ff_dim = trial.suggest_int('thm_ff_dim', 256, 1024, step=128)
         thm_transformer_dropout = trial.suggest_float('thm_dropout', 0.1, 0.4)
 
         # --- 组装 THM 分支配置 ---
         cfg.model['thm_branch_cfg']['temporal_aggregation'] = thm_temporal_aggregation
-
         if thm_temporal_aggregation == 'temporal_encoder':
             cfg.model['thm_branch_cfg']['temporal_mode'] = thm_temporal_mode
             if thm_temporal_mode == 'lstm':
@@ -266,7 +272,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         use_tof_sensor_gate = trial.suggest_categorical('tof_use_sensor_gate', [False, True])
         cfg.model['tof_branch_cfg']['use_sensor_gate'] = use_tof_sensor_gate
 
-        # Suggest sub-parameters UNCONDITIONALLY to keep a static search space for multivariate TPE
+        # Suggest sub-parameters UNCONDITIONALLY to keep a static search space
         is_adaptive = trial.suggest_categorical('tof_sensor_gate_adaptive', [False, True])
         sensor_gate_init = trial.suggest_float('tof_sensor_gate_init', 0.5, 1.5)
 
@@ -292,7 +298,6 @@ def objective(trial: optuna.trial.Trial) -> float:
         
         tof_channels_assembled = [min(ch, max_ch) for ch in tof_conv_channels_all]
         cfg.model['tof_branch_cfg']['conv_channels'] = tof_channels_assembled[:num_tof_cnn_layers]
-
         # TOF Temporal (扁平化)
         tof_temporal_mode = trial.suggest_categorical('tof_temporal_mode', ['lstm', 'transformer'])
         cfg.model['tof_branch_cfg']['temporal_mode'] = tof_temporal_mode
@@ -319,7 +324,6 @@ def objective(trial: optuna.trial.Trial) -> float:
     # 将最终确定的学习率配置赋给 cfg
     scheduler_cfg['layer_lrs'] = layer_lrs
     cfg.training['scheduler_cfg'] = scheduler_cfg
-    
     # --- 3. 定义 Fusion Head ---
     # 清理旧的或不相关的键
     for key in ['hidden_dims', 'dropout_rates', 'branch_dims', 'embed_dim', 'num_heads', 'depth', 'dropout']:
@@ -337,7 +341,6 @@ def objective(trial: optuna.trial.Trial) -> float:
         # ===================================================================
         #                          4. 运行训练流程
         # ===================================================================
-        # study 对象应该从主脚本中获取，这里为了代码能运行先假设它存在
         study_name = trial.study.study_name
         log_dir = os.path.join(LOG_DIR, study_name)
         os.makedirs(log_dir, exist_ok=True)
@@ -505,14 +508,12 @@ def objective(trial: optuna.trial.Trial) -> float:
                 mixup_enabled=cfg.training['mixup_enabled'], 
                 mixup_alpha=cfg.training['mixup_alpha'],
                 scheduler_cfg=cfg.training['scheduler_cfg'],
-                device=device, 
-                show_stratification=False, 
-                loss_function='ce',  # Hardcoded as requested
-                focal_gamma=2.0,     # Default, not used for 'ce'
-                focal_alpha=1.0,     # Default, not used for 'ce'
+                spec_params=spec_params,
+                device=device,
+                show_stratification=False,
+                loss_function='ce',
                 output_dir=TRIAL_ARTIFACTS_DIR,
                 num_workers=cfg.environment['num_workers'],
-                max_length=cfg.data['max_length']
             )
         
         torch.cuda.empty_cache()
@@ -533,26 +534,51 @@ if __name__ == "__main__":
     print(f"Study Name: {STUDY_NAME}")
     print("="*60)
 
-    print("Preparing and pre-loading data... This will happen only once.")
-    # Pass max_length to the pre-loading function
-    preloaded_data_tuple = train.prepare_data_kfold_multimodal(
-        show_stratification=False, 
-        variant=variant,
-        max_length=base_cfg.data['max_length']
+    # --- Pre-load base data instead of full data ---
+    print("Preparing and pre-loading base data (without spectrograms)... This will happen only once.")
+    # 调用新的基础数据准备函数
+    base_fold_data, label_encoder, y_all, sequence_ids_all = train.prepare_base_data_kfold(
+        variant=variant
     )
-    print("Data has been pre-loaded into memory.")
+    print("Base data has been pre-loaded into memory.")
     print("="*60)
-
+    
+    # 保存原始函数以便后续恢复
     original_prepare_data_func = train.prepare_data_kfold_multimodal
 
+    # --- MODIFIED: Create a new monkey-patch function ---
     def mock_prepare_data_kfold_multimodal(*args, **kwargs):
         """
-        使用猴子补丁替换原始的函数，以避免每次试验都重新加载数据，加快试验速度。
+        猴子补丁函数: 使用预加载的基础数据和当前试验的频谱图参数，
+        动态生成完整的K-Fold数据，避免重复加载和特征工程。
         """
-        return preloaded_data_tuple
+        print("--> Monkey patch activated: Generating spectrograms for new trial...")
+        # 从调用中提取 spec_params
+        spec_params = kwargs.get('spec_params')
+        if spec_params is None:
+             raise ValueError("spec_params not provided to mocked function!")
 
+        # Normalize 'noverlap' strictly
+        if 'noverlap' not in spec_params:
+            if 'noverlap_ratio' not in spec_params:
+                raise ValueError("spec_params must include either 'noverlap' or 'noverlap_ratio'.")
+            noverlap = int(spec_params['nperseg'] * spec_params['noverlap_ratio'])
+            if noverlap >= spec_params['nperseg']:
+                raise ValueError("Computed noverlap from noverlap_ratio must be < nperseg.")
+            spec_params = {**spec_params, 'noverlap': noverlap}
+
+        # 使用预加载的基础数据，动态生成频谱图
+        full_fold_data = train.generate_and_attach_spectrograms(
+            base_fold_data=base_fold_data,
+            spec_params=spec_params,
+            variant=variant
+        )
+        print("--> Spectrograms generated. Returning full dataset for trial.")
+        return full_fold_data, label_encoder, y_all, sequence_ids_all
+
+    # 应用猴子补丁
     train.prepare_data_kfold_multimodal = mock_prepare_data_kfold_multimodal
-    print("Monkey patch applied.")
+    print("Monkey patch applied. `prepare_data_kfold_multimodal` will now use pre-loaded data.")
 
     try:
         sampler = TPESampler(multivariate=True, n_startup_trials=N_STARTUP_TRIALS, seed=42)
@@ -571,12 +597,13 @@ if __name__ == "__main__":
         print(f"Best Trial Score (OOF Competition Metric): {best_trial.value:.4f}")
         print("\nBest parameters:")
         for key, value in best_trial.params.items():
-            print(f"    {key}: {value}")
+            print(f"      {key}: {value}")
 
     finally:
         if os.path.exists(TRIAL_ARTIFACTS_DIR):
             shutil.rmtree(TRIAL_ARTIFACTS_DIR)
             print(f"\nCleaned up temporary artifacts directory: {TRIAL_ARTIFACTS_DIR}")
 
+        # 恢复原始函数
         train.prepare_data_kfold_multimodal = original_prepare_data_func
-        print("\nMonkey patch restored. Original functions are back.")
+        print("\nMonkey patch restored. Original function is back.")

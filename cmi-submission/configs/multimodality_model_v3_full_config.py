@@ -21,7 +21,7 @@ model = dict(
         input_channels=None,  # will be filled dynamically from data
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
-        kernel_sizes=[7, 5, 3],
+        kernel_sizes=[5, 5, 3],
         # NEW: Temporal aggregation options
         temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
         temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
@@ -30,7 +30,7 @@ model = dict(
         bidirectional=False,
         # NEW: ResNet-style residual connections
         use_residual=True,
-        # NEW: Channel attention
+        # NEW: Channel attention (SE)
         use_se=True,
         se_reduction=16
     ),
@@ -50,7 +50,7 @@ model = dict(
         bidirectional=False,
         # NEW: ResNet-style residual connections
         use_residual=True,
-        # NEW: Channel attention
+        # NEW: Channel attention (SE)
         use_se=True,
         se_reduction=16
     ),
@@ -86,6 +86,14 @@ model = dict(
         dropout_rate=0.5
     ),
 
+    spec_branch_cfg=dict(
+        type='SpectrogramCNN',
+        in_channels=6,
+        filters=[32, 64, 128],
+        kernel_sizes=[3, 3, 3],
+        use_residual=True,
+    ),
+
     # Enable THM and TOF branch processing
     use_thm=True,
     use_tof=True,
@@ -112,20 +120,14 @@ training = dict(
     # --- NEW: Learning Rate Scheduler Configuration ---
     # Choose 'cosine' or 'reduce_on_plateau'
     scheduler_cfg=dict(
-        type='cosine',  # Default is cosine annealing
-        # type='reduce_on_plateau',
-        # --- Settings for 'reduce_on_plateau' ---
-        # factor=0.2,   # Factor to reduce LR by (e.g., new_lr = lr * factor)
-        # patience=5,   # Epochs to wait for improvement before reducing LR
-        # min_lr=1e-6,  # Minimum learning rate
-        warmup_ratio=0.1, # 10% of total epochs for warmup before plateau scheduler takes over
-
-        # --- NEW: Specific Learning Rates per Branch ---
+        type='cosine',
+        warmup_ratio=0.1,
         layer_lrs=dict(
             imu=1e-3,
             thm=1e-3,
             tof=5e-4,
             mlp=2e-3,
+            spec=2e-3,
             fusion=2e-3,
         )
     ),
@@ -133,3 +135,11 @@ training = dict(
 
 # -------------------------- Environment ------------------------------
 environment = dict(gpu_id=None, seed=42, num_workers=4) 
+
+# -------------------------- Spectrogram Params ------------------------
+spec_params = dict(
+    fs=10.0,
+    nperseg=20,
+    noverlap_ratio=0.75,
+    max_length=data['max_length'],
+)
