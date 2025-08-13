@@ -13,7 +13,7 @@ class MLP(nn.Module):
                  input_features: int,
                  hidden_dims: list,
                  output_dim: int,
-                 dropout_rate: float = 0.5):
+                 dropout_rate: float):
         """
         Strict constructor for an MLP. All architectural parameters are required.
         """

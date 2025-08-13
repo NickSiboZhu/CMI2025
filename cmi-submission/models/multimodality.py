@@ -28,14 +28,14 @@ class MultimodalityModel(nn.Module):
                  imu_branch_cfg: dict,
                  mlp_branch_cfg: dict,
                  fusion_head_cfg: dict,
+                 # --- modality toggles (required, no defaults) ---
+                 use_tof: bool,
+                 use_thm: bool,
+                 use_spec: bool,
                  # --- optional branch configs ---
                  tof_branch_cfg: dict = None,
                  thm_branch_cfg: dict = None,
                  spec_branch_cfg: dict = None,
-                 # --- modality toggles ---
-                 use_tof: bool = True,
-                 use_thm: bool = True,
-                 use_spec: bool = True,
                  ):
         super(MultimodalityModel, self).__init__()
 

@@ -35,24 +35,26 @@ class CNN1D(nn.Module):
                  input_channels: int,
                  filters: list,
                  kernel_sizes: list,
-                 temporal_aggregation: str,
-                 # --- Optional params for temporal encoder ---
-                 sequence_length: int = None,
-                 temporal_mode: str = None,
-                 lstm_hidden: int = None,
-                 lstm_layers: int = None,
-                 bidirectional: bool = None,
-                 num_heads: int = None,
-                 num_layers: int = None,
-                 ff_dim: int = None,
-                 dropout: float = 0.1,
-                 # --- Other optional features ---
-                 use_residual: bool = False,
-                 use_se: bool = False,
-                 se_reduction: int = 16):
+                  temporal_aggregation: str,
+                  # --- Other optional features (required flags; no defaults) ---
+                  use_residual: bool,
+                  use_se: bool,
+                  # --- Optional params for temporal encoder ---
+                  sequence_length: int = None,
+                  temporal_mode: str = None,
+                  lstm_hidden: int = None,
+                  lstm_layers: int = None,
+                  bidirectional: bool = None,
+                  num_heads: int = None,
+                  num_layers: int = None,
+                  ff_dim: int = None,
+                  dropout: float = None,
+                  se_reduction: int = None):
         super(CNN1D, self).__init__()
         
         assert len(filters) == len(kernel_sizes), "filters and kernel_sizes length mismatch"
+        if use_se and (se_reduction is None):
+            raise ValueError("'se_reduction' must be provided when 'use_se' is True.")
 
         layers = []
         self.bn_layers = nn.ModuleList()
@@ -91,6 +93,8 @@ class CNN1D(nn.Module):
             # --- Strict configuration check ---
             if not all([sequence_length, temporal_mode]):
                 raise ValueError("`sequence_length` and `temporal_mode` must be provided for temporal_encoder.")
+            if temporal_mode == 'transformer' and dropout is None:
+                raise ValueError("`dropout` must be provided when `temporal_mode` is 'transformer'.")
             
             # Import and setup temporal encoder (reuse from cnn2d.py)
             from .cnn2d import TemporalEncoder
@@ -112,7 +116,7 @@ class CNN1D(nn.Module):
                 num_heads=num_heads,
                 num_layers=num_layers,
                 ff_dim=ff_dim,
-                dropout=dropout
+                 dropout=dropout
             )
             self.cnn_output_size = self.temporal_encoder.output_dim
         elif temporal_aggregation == 'global_pool':

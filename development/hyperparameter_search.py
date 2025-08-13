@@ -18,11 +18,11 @@ import train
 
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
-CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
+CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
 # 你想要运行的试验次数
-N_TRIALS = 100
+N_TRIALS = 30
 # 初始随机搜索的次数
-N_STARTUP_TRIALS = 30
+N_STARTUP_TRIALS = 10
 # Get variant from config to dynamically set paths and study names
 base_cfg = train.load_py_config(CONFIG_FILE_PATH)
 variant = base_cfg.data['variant']
@@ -165,6 +165,8 @@ def objective(trial: optuna.trial.Trial) -> float:
     spec_params['nperseg'] = trial.suggest_int('spec_nperseg', 16, 64, step=4)
     spec_params['noverlap_ratio'] = trial.suggest_float('spec_noverlap_ratio', 0.5, 0.95)
     spec_params['fs'] = 10.0
+    # Strict: provide max_length from config to data pipeline
+    spec_params['max_length'] = cfg.data['max_length']
 
     # --- Spectrogram (Spec) 分支架构 ---
     if 'spec_branch_cfg' in cfg.model:
@@ -406,6 +408,30 @@ def objective(trial: optuna.trial.Trial) -> float:
             'hidden_dims': cfg.model['mlp_branch_cfg']['hidden_dims'],
             'output_dim': cfg.model['mlp_branch_cfg']['output_dim'],
             'dropout_rate': cfg.model['mlp_branch_cfg']['dropout_rate']
+        }
+
+        # Spec branch effective configuration (if present)
+        if 'spec_branch_cfg' in cfg.model:
+            effective_params['spec_branch'] = {
+                'filters': cfg.model['spec_branch_cfg']['filters'],
+                'kernel_sizes': cfg.model['spec_branch_cfg']['kernel_sizes'],
+                'use_residual': cfg.model['spec_branch_cfg']['use_residual']
+            }
+                    # Compute noverlap early if needed, so it's included in effective_params
+        if 'noverlap' not in spec_params and 'noverlap_ratio' in spec_params:
+            computed_noverlap = int(spec_params['nperseg'] * spec_params['noverlap_ratio'])
+        else:
+            computed_noverlap = spec_params.get('noverlap')
+        
+        # Also record spectrogram generation parameters actually used this trial
+        effective_params['spec_params'] = {
+            'fs': spec_params['fs'],
+            'nperseg': spec_params['nperseg'],
+            'max_length': spec_params['max_length'],
+            # Log ratio if provided
+            'noverlap_ratio': spec_params.get('noverlap_ratio'),
+            # Log the actual noverlap that will be used
+            'noverlap': computed_noverlap
         }
 
         if variant == 'full':

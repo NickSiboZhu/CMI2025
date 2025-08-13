@@ -51,7 +51,8 @@ model = dict(
         kernel_sizes=[3, 3, 3],
         use_residual=True,
     ),
-    # use_spec=False,
+    # Explicitly enable Spectrogram branch
+    use_spec=True,
     # Disable TOF and THM branches entirely for IMU variant
     use_tof=False,
     use_thm=False,

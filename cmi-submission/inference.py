@@ -50,9 +50,14 @@ def _load_preprocessing_objects(variant: str):
     return le
 
 def _load_models(device, variant: str):
-    """Load models, their scalers, spectrogram stats, and capture model config (once)."""
+    """Load models, their scalers, spectrogram stats, and capture model config (once).
+
+    Additionally, if spec_params were saved during training as
+    'spec_params_fold_{i}_{variant}.pkl', load them and return one set.
+    """
     triplets = []
     model_cfg_once = None
+    spec_params_once = None
     fold_paths = [os.path.join(WEIGHT_DIR, f"model_fold_{i}_{variant}.pth") for i in range(1, 6)]
     fold_paths = [p for p in fold_paths if os.path.exists(p)]
 
@@ -77,6 +82,12 @@ def _load_models(device, variant: str):
         with open(spec_stats_path, "rb") as f:
             spec_stats = pickle.load(f)
 
+        # Try to load spectrogram generation params used in training for this fold
+        spec_params_path = os.path.join(WEIGHT_DIR, f"spec_params_fold_{fold_num}_{variant}.pkl")
+        if spec_params_once is None and os.path.exists(spec_params_path):
+            with open(spec_params_path, "rb") as f:
+                spec_params_once = pickle.load(f)
+
         ckpt = torch.load(p, map_location=device)
         if 'model_cfg' not in ckpt:
             raise ValueError(f"Checkpoint for {p} is missing 'model_cfg'. Please retrain.")
@@ -91,7 +102,7 @@ def _load_models(device, variant: str):
         if is_compiled:
             from collections import OrderedDict
             state_dict = OrderedDict((k.replace('_orig_mod.', '', 1), v) for k, v in state_dict.items())
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=True)
 
         model.to(device).eval()
         try:
@@ -100,32 +111,10 @@ def _load_models(device, variant: str):
             print(f"⚠️  torch.compile failed during inference setup: {e}")
 
         triplets.append((model, scaler, spec_stats))
-    return triplets, model_cfg_once
+    return triplets, model_cfg_once, spec_params_once
 
-def _load_spec_params_for_variant(variant: str):
-    """Load spec_params from the corresponding config module for the given variant."""
-    if variant == 'full':
-        from configs import multimodality_model_v3_full_config as cfg_mod
-    elif variant == 'imu':
-        from configs import multimodality_model_v2_imu_config as cfg_mod
-    else:
-        raise ValueError(f"Unknown variant '{variant}' for spec_params loading.")
-
-    if not hasattr(cfg_mod, 'spec_params'):
-        raise ValueError(f"Config module for variant '{variant}' has no 'spec_params'.")
-    sp = dict(cfg_mod.spec_params)
-    # Normalize noverlap
-    if 'noverlap' in sp:
-        if sp['noverlap'] >= sp['nperseg']:
-            raise ValueError("spec_params['noverlap'] must be < spec_params['nperseg'].")
-        return sp
-    if 'noverlap_ratio' in sp:
-        noverlap = int(sp['nperseg'] * sp['noverlap_ratio'])
-        if noverlap >= sp['nperseg']:
-            raise ValueError("Computed noverlap from noverlap_ratio must be < nperseg.")
-        sp['noverlap'] = noverlap
-        return sp
-    raise ValueError("spec_params must include either 'noverlap' or 'noverlap_ratio'.")
+# REMOVED: _load_spec_params_for_variant function
+# We now strictly require spec_params to be loaded from weights directory
 
 print("🔧  Initialising inference resources …")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -137,9 +126,15 @@ RESOURCES = {}
 for v in VARIANTS:
     try:
         le = _load_preprocessing_objects(v)
-        model_scaler_stats_triplets, model_cfg_once = _load_models(DEVICE, v)
+        model_scaler_stats_triplets, model_cfg_once, spec_params_from_model = _load_models(DEVICE, v)
         if model_scaler_stats_triplets:
-            spec_params = _load_spec_params_for_variant(v)
+            # STRICT: Require spec_params from weights (no config fallback)
+            if spec_params_from_model is None:
+                raise FileNotFoundError(
+                    f"spec_params not found in weights for variant '{v}'. "
+                    f"Please retrain with the updated train.py that saves spec_params."
+                )
+            spec_params = spec_params_from_model
             # Ensure sequence length used for padding matches the trained model
             seq_len_from_model = model_cfg_once['sequence_length'] if model_cfg_once and 'sequence_length' in model_cfg_once else spec_params['max_length']
             spec_params['max_length'] = seq_len_from_model
@@ -150,6 +145,7 @@ for v in VARIANTS:
                 "sequence_length": seq_len_from_model,
             }
             print(f"✅  Resources for '{v}' variant loaded successfully.")
+            print(f"    Using spec_params from training: nperseg={spec_params['nperseg']}, noverlap={spec_params['noverlap']}")
     except FileNotFoundError as e:
         print(f"⚠️  Could not load resources for '{v}' variant: {e}.")
 

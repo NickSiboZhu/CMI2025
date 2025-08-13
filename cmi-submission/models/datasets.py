@@ -98,7 +98,8 @@ class MultimodalDataset(Dataset):
         
         # 4. Handle sample weight
         if self.sample_weights is not None:
-            weight = torch.tensor(self.sample_weights[idx], dtype=torch.float32)
+            # Avoid re-wrapping a tensor to prevent copy-construct warning
+            weight = self.sample_weights[idx]
         else:
             # Strict: require weights to be provided by caller
             raise RuntimeError("Sample weights were not provided. Provide class_weight_dict when creating the dataset.")

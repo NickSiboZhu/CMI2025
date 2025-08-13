@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from . import MODELS
 from torch.nn.utils.rnn import pack_padded_sequence
@@ -16,13 +17,11 @@ class SpectrogramCNN(nn.Module):
     """
     def __init__(self,
                  in_channels: int,
-                 filters: list = None,
-                 kernel_sizes: list = None,
-                 use_residual: bool = True):
+                 filters: list,
+                 kernel_sizes: list,
+                 use_residual: bool):
         super().__init__()
 
-        if filters is None: filters = [32, 64, 128]
-        if kernel_sizes is None: kernel_sizes = [3, 3, 3]
         assert len(filters) == len(kernel_sizes), "filters and kernel_sizes length mismatch"
 
         self.use_residual = use_residual
@@ -75,16 +74,18 @@ class SpectrogramCNN(nn.Module):
             x = self.activation(x)
             x = x * mask_4d
             
-            # 特征图使用2D池化
-            x = self.pool(x)
+            # 特征图使用2D池化（动态保护：在时间维度过短时不再沿时间降采样）
+            h, w = x.shape[2], x.shape[3]
+            kh = 2 if h >= 2 else 1
+            kw = 2 if w >= 2 else 1
+            if kh > 1 or kw > 1:
+                x = F.max_pool2d(x, kernel_size=(kh, kw), stride=(kh, kw))
             
-            # --- MODIFIED: 使用正确的1D池化来缩减掩码 ---
-            # 1. 将1D掩码扩展为3D以适应MaxPool1d的输入: (B, W) -> (B, 1, W)
-            mask_for_pooling = time_mask.unsqueeze(1).float()
-            # 2. 应用1D池化操作
-            pooled_mask = self.mask_pool(mask_for_pooling)
-            # 3. 移除临时的通道维度，恢复为1D掩码: (B, 1, W_new) -> (B, W_new)
-            time_mask = pooled_mask.squeeze(1)
+            # --- MODIFIED: 使用正确的1D池化来缩减掩码（仅当时间维长度>=2时） ---
+            if kw > 1:
+                mask_for_pooling = time_mask.unsqueeze(1).float()
+                pooled_mask = self.mask_pool(mask_for_pooling)
+                time_mask = pooled_mask.squeeze(1)
             
         x = self.final_pool(x)
         output = x.view(x.size(0), -1) 
@@ -156,10 +157,10 @@ class TemporalEncoder(nn.Module):
 
             # Learnable [CLS] token
             self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim))
-            
-            # Positional encoding will be dynamically generated in the forward pass
-            # to handle variable sequence lengths from the CNN pooling.
-            self.pos_encoding = None
+
+            # Register positional encoding at init so it exists for strict state_dict loading
+            # Shape: (1, seq_len + 1 [CLS], input_dim)
+            self.pos_encoding = nn.Parameter(torch.randn(1, seq_len + 1, self.input_dim))
             self.dropout = nn.Dropout(dropout)
             
             # Transformer encoder
@@ -223,14 +224,20 @@ class TemporalEncoder(nn.Module):
             cls_tokens = self.cls_token.expand(batch_size, -1, -1)
             transformer_input = torch.cat([cls_tokens, features], dim=1)
             
-            # Dynamically create positional encoding for the current sequence length
-            current_seq_len = transformer_input.size(1) # seq_len + 1 for CLS
-            if self.pos_encoding is None or self.pos_encoding.size(1) != current_seq_len:
-                # Create it on the correct device
-                self.pos_encoding = nn.Parameter(torch.randn(1, current_seq_len, self.input_dim, device=features.device), requires_grad=True)
-            
-            # Add positional encoding
-            transformer_input = transformer_input + self.pos_encoding
+            # Add positional encoding (resize on-the-fly without replacing the registered parameter)
+            current_seq_len = transformer_input.size(1)  # seq_len + 1 for CLS
+            if self.pos_encoding.size(1) != current_seq_len:
+                # Safely adapt by slicing or padding the existing encoding tensor
+                if self.pos_encoding.size(1) > current_seq_len:
+                    pos_enc = self.pos_encoding[:, :current_seq_len]
+                else:
+                    pad_len = current_seq_len - self.pos_encoding.size(1)
+                    pad = self.pos_encoding[:, -1:].repeat(1, pad_len, 1)
+                    pos_enc = torch.cat([self.pos_encoding, pad], dim=1)
+            else:
+                pos_enc = self.pos_encoding
+
+            transformer_input = transformer_input + pos_enc
             transformer_input = self.dropout(transformer_input)
             
             # Create attention mask
@@ -258,15 +265,15 @@ class TOF2DCNN(nn.Module):
     This module processes multiple TOF sensors and extracts spatial features.
     """
     
-    def __init__(self, input_channels=5, out_features=128, 
-                 conv_channels=None, kernel_sizes=None,
-                 use_residual=False,
+    def __init__(self, input_channels: int,
+                 conv_channels: list, kernel_sizes: list,
+                 use_residual: bool,
                  # NEW: Channel attention and pre-conv sensor gate
-                 use_se: bool = False,
-                 se_reduction: int = 16,
+                 use_se: bool,
+                 se_reduction: int = None,
                  use_sensor_gate: bool = False,
-                 sensor_gate_adaptive: bool = False,
-                 sensor_gate_init: float = 1.0):
+                 sensor_gate_adaptive: bool = None,
+                 sensor_gate_init: float = None):
         super(TOF2DCNN, self).__init__()
         
         self.input_channels = input_channels
@@ -277,12 +284,16 @@ class TOF2DCNN(nn.Module):
         # Note: out_features parameter kept for compatibility, but actual output
         # will be determined by the last conv channel
         
-        # Dynamic 2D conv stack
-        if conv_channels is None:
-            conv_channels = [32, 64, 128]
-        if kernel_sizes is None:
-            kernel_sizes = [3, 3, 2]
+        # Strict config: require conv_channels and kernel_sizes
         assert len(conv_channels) == len(kernel_sizes), "conv_channels and kernel_sizes length mismatch"
+
+        # Strict config: require related params based on toggles
+        if self.use_se and se_reduction is None:
+            raise ValueError("'se_reduction' must be provided when 'use_se' is True.")
+        if self.use_sensor_gate and sensor_gate_adaptive is None:
+            raise ValueError("'sensor_gate_adaptive' must be provided when 'use_sensor_gate' is True.")
+        if self.use_sensor_gate and (not sensor_gate_adaptive) and sensor_gate_init is None:
+            raise ValueError("'sensor_gate_init' must be provided when 'use_sensor_gate' is True and not adaptive.")
 
         # Build conv layers manually for residual connections
         self.conv_blocks = nn.ModuleList()
@@ -438,13 +449,13 @@ class TemporalTOF2DCNN(nn.Module):
                  conv_channels: list,
                  kernel_sizes: list,
                  temporal_mode: str,
-                 # --- Optional Features for Spatial CNN ---
-                 use_residual: bool = False,
-                 use_se: bool = False,
-                 se_reduction: int = 16,
-                 use_sensor_gate: bool = False,
-                 sensor_gate_adaptive: bool = False,
-                 sensor_gate_init: float = 1.0,
+                 # --- Optional Features for Spatial CNN (required flags, strict) ---
+                 use_residual: bool,
+                 use_se: bool,
+                 use_sensor_gate: bool,
+                 se_reduction: int = None,
+                 sensor_gate_adaptive: bool = None,
+                 sensor_gate_init: float = None,
                  # --- Temporal Encoder Params (required based on mode) ---
                  lstm_hidden: int = None,
                  lstm_layers: int = None,
@@ -452,7 +463,7 @@ class TemporalTOF2DCNN(nn.Module):
                  num_heads: int = None,
                  num_layers: int = None,
                  ff_dim: int = None,
-                 dropout: float = 0.1):
+                 dropout: float = None):
         super(TemporalTOF2DCNN, self).__init__()
 
         self.input_channels = input_channels
@@ -461,8 +472,7 @@ class TemporalTOF2DCNN(nn.Module):
 
         # ------------- Spatial CNN applied per-frame -------------
         self.spatial_cnn = TOF2DCNN(
-            input_channels,
-            # out_features is determined by conv_channels, so no longer needed here
+            input_channels=input_channels,
             conv_channels=conv_channels,
             kernel_sizes=kernel_sizes,
             use_residual=use_residual,
@@ -477,6 +487,12 @@ class TemporalTOF2DCNN(nn.Module):
         self.spatial_out_dim = self.spatial_cnn.out_features
         
         # ------------- Temporal Encoder ---------------------
+        # Strict requirements for temporal params
+        if temporal_mode == 'lstm' and (lstm_hidden is None or lstm_layers is None or bidirectional is None):
+            raise ValueError("For LSTM temporal_mode, provide lstm_hidden, lstm_layers, bidirectional.")
+        if temporal_mode == 'transformer' and (num_heads is None or num_layers is None or ff_dim is None or dropout is None):
+            raise ValueError("For transformer temporal_mode, provide num_heads, num_layers, ff_dim, dropout.")
+
         self.temporal_encoder = TemporalEncoder(
             mode=temporal_mode,
             input_dim=self.spatial_out_dim,

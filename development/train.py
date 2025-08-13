@@ -555,6 +555,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             fold['X_val_static'],
             fold['y_val'],
             mask=fold['val_mask'],
+            class_weight_dict=class_weight_dict,
             spec_stats=spec_stats
         )
 
@@ -615,6 +616,13 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         with open(spec_stats_filename, 'wb') as f:
             pickle.dump(spec_stats, f)
         print(f"Spectrogram stats saved as '{spec_stats_filename}'")
+        
+        # CRITICAL: Also save spec_params used for this training
+        if spec_params is not None:
+            spec_params_filename = os.path.join(output_dir, f'spec_params_fold_{fold_idx + 1}_{variant}.pkl')
+            with open(spec_params_filename, 'wb') as f:
+                pickle.dump(spec_params, f)
+            print(f"Spectrogram params saved as '{spec_params_filename}'")
         
         fold_results.append({'fold': fold_idx + 1, 'best_val_score': best_val_score})
         fold_models.append(model)
@@ -714,6 +722,11 @@ def main():
         print("   Please ensure all required parameters are defined.")
         sys.exit(1)
     
+    # Extract spec_params from config (required for spectrogram generation)
+    spec_params = cfg.spec_params if hasattr(cfg, 'spec_params') else None
+    if spec_params is None:
+        raise ValueError("spec_params must be defined in config file for training")
+    
     print(f"\nTraining Configuration from {args.config}:")
     print(f"  Epochs: {epochs}")
     print(f"  Batch Size: {batch_size}")
@@ -731,6 +744,7 @@ def main():
     print(f"  GPU ID: {gpu_id}")
     # --- NEW: Print scheduler config ---
     print(f"  Scheduler Config: {scheduler_cfg}")
+    print(f"  Spec Params: nperseg={spec_params['nperseg']}, noverlap={spec_params.get('noverlap', 'computed from ratio')}")
     
     # Print layer-specific learning rates if configured
     layer_lrs = scheduler_cfg['layer_lrs'] if 'layer_lrs' in scheduler_cfg else None
@@ -759,6 +773,7 @@ def main():
         mixup_enabled=mixup_enabled,
         mixup_alpha=mixup_alpha,
         scheduler_cfg=scheduler_cfg,
+        spec_params=spec_params,  # Pass spec_params from config
         output_dir=WEIGHT_DIR,  # Explicitly pass the default
         num_workers=num_workers,
         max_length=max_length

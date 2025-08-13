@@ -94,9 +94,10 @@ model = dict(
         use_residual=True,
     ),
 
-    # Enable THM and TOF branch processing
+    # Enable THM, TOF, and Spectrogram branch processing
     use_thm=True,
     use_tof=True,
+    use_spec=True,
 
     # Fusion head blueprint
     fusion_head_cfg=dict(
