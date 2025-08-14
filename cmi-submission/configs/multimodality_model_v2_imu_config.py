@@ -23,12 +23,12 @@ model = dict(
         filters=[64, 128, 256],
         kernel_sizes=[5, 5, 3],
         # NEW: Temporal aggregation options
-        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
-        temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
-        lstm_hidden=128,
-        lstm_layers=1,
-        bidirectional=False,
-        # NEW: ResNet-style residual connections
+        temporal_aggregation='global_pool',  # 'global_pool' or 'temporal_encoder'
+        # temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
+        # lstm_hidden=128,
+        # lstm_layers=1,
+        # bidirectional=False,
+        # # NEW: ResNet-style residual connections
         use_residual=True,
         # NEW: Channel attention (SE)
         use_se=True,
@@ -83,10 +83,10 @@ training = dict(
         warmup_ratio=0.1, # Optional warmup for ReduceLROnPlateau
         # --- NEW: Specific Learning Rates per Branch ---
         layer_lrs=dict(
-            imu=1e-3,
+            imu=5e-4,
             mlp=1e-3,
             fusion=1e-3,
-            spec=1e-3,
+            spec=5e-4,
         )
     ),
 )

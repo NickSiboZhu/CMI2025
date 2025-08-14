@@ -1,26 +1,54 @@
 import torch
 import torch.nn as nn
 from . import MODELS  # Import registry
-from timm.layers import SqueezeExcite as TimmSE
 
- 
-
-class TimmSE1DWrapper(nn.Module):
+class MaskedSE1D(nn.Module):
     """
-    Wrap timm's 2D SqueezeExcite so it can be applied on 1D tensors (N, C, L).
-    We temporarily add a singleton spatial dim and remove it after SE.
+    A self-contained Squeeze-and-Excite block for 1D tensors that correctly handles masking.
+    This version uses only 1D operations (Conv1d) to avoid any 3D/4D dimension conflicts.
     """
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
-        # timm 1.0.15 signature: SqueezeExcite(channels, rd_ratio=1/16, rd_channels=None, ...)
-        rd_ratio = 1.0 / max(1, reduction)
-        self.se2d = TimmSE(channels=channels, rd_ratio=rd_ratio)
+        # 使用 Conv1d 来模拟全连接层，这是在通道上操作的标准做法
+        reduced_channels = max(1, channels // reduction)
+        self.fc1 = nn.Conv1d(channels, reduced_channels, kernel_size=1)
+        self.act = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv1d(reduced_channels, channels, kernel_size=1)
+        self.gate = nn.Sigmoid()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (N, C, L)
-        x_expanded = x.unsqueeze(-1)      # (N, C, L, 1)
-        x_se = self.se2d(x_expanded)      # (N, C, L, 1)
-        return x_se.squeeze(-1)           # (N, C, L)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (Tensor): Input tensor of shape (B, C, L).
+            mask (Tensor): Mask tensor of shape (B, L).
+        
+        Returns:
+            Tensor: Output tensor of shape (B, C, L).
+        """
+        # Squeeze: Masked Global Average Pooling
+        # x 的形状: (B, C, L)
+        # mask 的形状: (B, L)
+        mask_expanded = mask.unsqueeze(1).to(x.dtype)  # -> (B, 1, L)
+        
+        # 分子: 对有效区域求和，保持维度以便后续Conv1d操作
+        numerator = torch.sum(x * mask_expanded, dim=2, keepdim=True)  # -> (B, C, 1)
+        
+        # 分母: 计算有效长度
+        denominator = mask_expanded.sum(dim=2, keepdim=True).clamp(min=1e-9)  # -> (B, 1, 1)
+        
+        # 平均值
+        squeezed = numerator / denominator  # -> (B, C, 1)
+
+        # Excitation: 使用1D卷积作为FC层
+        excited = self.fc1(squeezed)  # -> (B, C_reduced, 1)
+        excited = self.act(excited)
+        excited = self.fc2(excited)   # -> (B, C, 1)
+        
+        attention_scores = self.gate(excited) # -> (B, C, 1)
+
+        # Scale: 将注意力分数广播到整个序列上
+        # (B, C, L) * (B, C, 1) -> (B, C, L)
+        return x * attention_scores
 
 @MODELS.register_module()
 class CNN1D(nn.Module):
@@ -35,21 +63,21 @@ class CNN1D(nn.Module):
                  input_channels: int,
                  filters: list,
                  kernel_sizes: list,
-                  temporal_aggregation: str,
-                  # --- Other optional features (required flags; no defaults) ---
-                  use_residual: bool,
-                  use_se: bool,
-                  # --- Optional params for temporal encoder ---
-                  sequence_length: int = None,
-                  temporal_mode: str = None,
-                  lstm_hidden: int = None,
-                  lstm_layers: int = None,
-                  bidirectional: bool = None,
-                  num_heads: int = None,
-                  num_layers: int = None,
-                  ff_dim: int = None,
-                  dropout: float = None,
-                  se_reduction: int = None):
+                 temporal_aggregation: str,
+                 # --- Other optional features (required flags; no defaults) ---
+                 use_residual: bool,
+                 use_se: bool,
+                 # --- Optional params for temporal encoder ---
+                 sequence_length: int = None,
+                 temporal_mode: str = None,
+                 lstm_hidden: int = None,
+                 lstm_layers: int = None,
+                 bidirectional: bool = None,
+                 num_heads: int = None,
+                 num_layers: int = None,
+                 ff_dim: int = None,
+                 dropout: float = None,
+                 se_reduction: int = None):
         super(CNN1D, self).__init__()
         
         assert len(filters) == len(kernel_sizes), "filters and kernel_sizes length mismatch"
@@ -71,7 +99,8 @@ class CNN1D(nn.Module):
 
             # Optional SE per block
             if self.se_layers is not None:
-                self.se_layers.append(TimmSE1DWrapper(out_c, se_reduction))
+                # <<< 修改: 使用新的MaskedSE1D替换原有的Wrapper >>>
+                self.se_layers.append(MaskedSE1D(out_c, se_reduction))
             
             # Add 1x1 projection for residual connections when dimensions don't match
             if use_residual and in_channels != out_c:
@@ -116,7 +145,7 @@ class CNN1D(nn.Module):
                 num_heads=num_heads,
                 num_layers=num_layers,
                 ff_dim=ff_dim,
-                 dropout=dropout
+                dropout=dropout
             )
             self.cnn_output_size = self.temporal_encoder.output_dim
         elif temporal_aggregation == 'global_pool':
@@ -154,7 +183,8 @@ class CNN1D(nn.Module):
 
             # Apply SE before residual addition (SENet-style)
             if self.se_layers is not None:
-                x = self.se_layers[i](x)
+                # <<< 修改: 调用SE层时传入mask，以进行正确的、带掩码的池化 >>>
+                x = self.se_layers[i](x, mask)
             
             # Apply residual connection if enabled
             if self.use_residual:
@@ -177,10 +207,9 @@ class CNN1D(nn.Module):
                 x = self.pool(x)
                 # ✨ 核心步骤 3: MaxPool后，mask的长度也必须相应缩减
                 mask_for_pooling = mask.unsqueeze(1).float() 
-                # 2. 应用池化操作
                 pooled_mask = self.pool(mask_for_pooling)
-                # 3. 移除临时的通道维度 (B, 1, L_new) -> (B, L_new)
-                mask = pooled_mask.squeeze(1)
+                # 将mask中小于1的值（池化后的结果可能不是严格的0或1）重新变为1，保持其二进制特性
+                mask = (pooled_mask > 0).squeeze(1)
 
         # --- Choose temporal aggregation method ---
         if self.temporal_aggregation == 'temporal_encoder':

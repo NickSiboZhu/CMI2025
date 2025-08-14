@@ -13,7 +13,8 @@ from timm.layers import SqueezeExcite as TimmSE
 class SpectrogramCNN(nn.Module):
     """
     A highly configurable 2D CNN for processing spectrograms.
-    MODIFIED: Fixed a bug by using MaxPool1d for mask downsampling.
+    MODIFIED: Fixed a bug by using MaxPool1d for mask downsampling and
+              implementing a mask-aware final global average pooling.
     """
     def __init__(self,
                  in_channels: int,
@@ -45,18 +46,22 @@ class SpectrogramCNN(nn.Module):
         # 2D池化层，用于处理特征图
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2) 
         
-        # --- NEW: 为1D掩码专门定义一个1D池化层 ---
+        # --- 为1D掩码专门定义一个1D池化层 ---
         self.mask_pool = nn.MaxPool1d(kernel_size=2, stride=2)
         
-        self.final_pool = nn.AdaptiveAvgPool2d((1, 1))
+        # <<< 修改: 移除了不支持mask的AdaptiveAvgPool2d >>>
+        # self.final_pool = nn.AdaptiveAvgPool2d((1, 1))
 
     def forward(self, x: torch.Tensor, time_mask: torch.Tensor = None) -> torch.Tensor:
         if time_mask is None:
-            time_mask = torch.ones(x.shape[0], x.shape[3], device=x.device)
+            time_mask = torch.ones(x.shape[0], x.shape[3], device=x.device, dtype=torch.float)
+
+        # 确保 time_mask 是浮点型以便乘法和池化
+        time_mask = time_mask.float()
 
         for i, conv in enumerate(self.conv_layers):
-            # 将1D时间掩码扩展为4D以便广播
-            mask_4d = time_mask.view(x.shape[0], 1, 1, x.shape[3])
+            # 将1D时间掩码扩展为4D以便广播 (B, 1, 1, T)
+            mask_4d = time_mask.view(x.shape[0], 1, 1, time_mask.shape[1])
 
             x = x * mask_4d
             
@@ -74,21 +79,40 @@ class SpectrogramCNN(nn.Module):
             x = self.activation(x)
             x = x * mask_4d
             
-            # 特征图使用2D池化（动态保护：在时间维度过短时不再沿时间降采样）
+            # 特征图使用2D池化（动态保护：在时间或频率维度过短时不再降采样）
             h, w = x.shape[2], x.shape[3]
             kh = 2 if h >= 2 else 1
             kw = 2 if w >= 2 else 1
             if kh > 1 or kw > 1:
                 x = F.max_pool2d(x, kernel_size=(kh, kw), stride=(kh, kw))
             
-            # --- MODIFIED: 使用正确的1D池化来缩减掩码（仅当时间维长度>=2时） ---
+            # 使用正确的1D池化来缩减掩码（仅当时间维长度>=2时）
             if kw > 1:
-                mask_for_pooling = time_mask.unsqueeze(1).float()
+                mask_for_pooling = time_mask.unsqueeze(1) # (B, 1, T)
                 pooled_mask = self.mask_pool(mask_for_pooling)
-                time_mask = pooled_mask.squeeze(1)
-            
-        x = self.final_pool(x)
-        output = x.view(x.size(0), -1) 
+                time_mask = pooled_mask.squeeze(1) # (B, T_new)
+        
+        # <<< 修改: 使用手动实现的、支持mask的全局平均池化替换原有的 final_pool >>>
+        # 这是为了修复原代码中 `AdaptiveAvgPool2d` 会错误地将填充区域计入平均值的问题。
+        
+        # 1. 再次将最终的掩码扩展为4D，以确保广播正确
+        final_mask_4d = time_mask.view(x.shape[0], 1, 1, time_mask.shape[1])
+
+        # 2. 计算分子：对特征图的有效区域求和 (在H和W维度上)
+        #    乘以 final_mask_4d 是一个安全的冗余操作，确保填充区为零
+        numerator = torch.sum(x * final_mask_4d, dim=(2, 3)) # 结果形状: (B, C)
+
+        # 3. 计算分母：计算每个样本的有效面积
+        #    有效面积 = 特征图高度 * 每个样本的有效时间步数
+        feature_height = x.shape[2]
+        valid_time_steps = torch.sum(time_mask, dim=1) # 结果形状: (B)
+        
+        # 分母形状: (B, 1)，以便和 (B, C) 的分子进行广播
+        denominator = (feature_height * valid_time_steps).unsqueeze(1).clamp(min=1e-9)
+
+        # 4. 计算正确的、带掩码的平均值
+        output = numerator / denominator
+        # <<< 修改结束 >>>
         
         return output
     
