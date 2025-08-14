@@ -545,7 +545,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         train_dataset = MultimodalDataset(
             fold['X_train_imu'], fold['X_train_thm'], fold['X_train_tof'], fold['X_train_spec'],
             fold['X_train_static'], fold['y_train'], mask=fold['train_mask'],
-            class_weight_dict=class_weight_dict, spec_stats=spec_stats
+            class_weight_dict=class_weight_dict, spec_stats=spec_stats, augment=True,
         )
         val_dataset = MultimodalDataset(
             fold['X_val_imu'],
@@ -578,7 +578,6 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         
         print(f"\nBuilding model for fold {fold_idx + 1}...")
         model = build_from_cfg(model_cfg, MODELS)
-        
         criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none') if loss_function == 'focal' else nn.CrossEntropyLoss(reduction='none')
         
         model = model.to(device)
