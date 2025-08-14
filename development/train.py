@@ -726,6 +726,18 @@ def main():
     spec_params = cfg.spec_params if hasattr(cfg, 'spec_params') else None
     if spec_params is None:
         raise ValueError("spec_params must be defined in config file for training")
+    # Normalize spectrogram parameters to explicit values (config-driven, no runtime fallbacks)
+    if 'noverlap' not in spec_params:
+        if 'noverlap_ratio' not in spec_params:
+            raise ValueError("spec_params must include either 'noverlap' or 'noverlap_ratio'.")
+        nperseg_int = int(spec_params['nperseg'])
+        noverlap_int = int(nperseg_int * float(spec_params['noverlap_ratio']))
+        if not (0 <= noverlap_int < nperseg_int):
+            raise ValueError(f"Computed noverlap({noverlap_int}) must satisfy 0 <= noverlap < nperseg({nperseg_int}).")
+        spec_params['noverlap'] = noverlap_int
+    # Ensure max_length present for downstream consumers
+    if 'max_length' not in spec_params:
+        spec_params['max_length'] = max_length
     
     print(f"\nTraining Configuration from {args.config}:")
     print(f"  Epochs: {epochs}")
@@ -744,7 +756,7 @@ def main():
     print(f"  GPU ID: {gpu_id}")
     # --- NEW: Print scheduler config ---
     print(f"  Scheduler Config: {scheduler_cfg}")
-    print(f"  Spec Params: nperseg={spec_params['nperseg']}, noverlap={spec_params.get('noverlap', 'computed from ratio')}")
+    print(f"  Spec Params: nperseg={spec_params['nperseg']}, noverlap={spec_params['noverlap']}")
     
     # Print layer-specific learning rates if configured
     layer_lrs = scheduler_cfg['layer_lrs'] if 'layer_lrs' in scheduler_cfg else None
