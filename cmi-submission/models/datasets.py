@@ -111,16 +111,29 @@ class MultimodalDataset(Dataset):
         mask_fill_value = spec_data.mean()
 
         # 1. 频率掩码
-        for _ in range(num_freq_masks):
-            f = np.random.randint(0, freq_mask_param)
-            f0 = np.random.randint(0, num_freq_bins - f)
-            spec_data[:, f0:f0 + f, :] = mask_fill_value
+        # Clamp mask width to valid range based on actual bins
+        max_freq_width = min(int(freq_mask_param), max(0, num_freq_bins - 1))
+        if max_freq_width > 0 and num_freq_bins > 1:
+            for _ in range(int(num_freq_masks)):
+                # Choose a positive width in [1, max_freq_width]
+                f = np.random.randint(1, max_freq_width + 1)
+                # Start index in [0, num_freq_bins - f] inclusive
+                start_high = num_freq_bins - f
+                if start_high <= 0:
+                    continue
+                f0 = np.random.randint(0, start_high + 1)
+                spec_data[:, f0:f0 + f, :] = mask_fill_value
             
         # 2. 时间掩码
-        for _ in range(num_time_masks):
-            t = np.random.randint(0, time_mask_param)
-            t0 = np.random.randint(0, num_time_bins - t)
-            spec_data[:, :, t0:t0 + t] = mask_fill_value
+        max_time_width = min(int(time_mask_param), max(0, num_time_bins - 1))
+        if max_time_width > 0 and num_time_bins > 1:
+            for _ in range(int(num_time_masks)):
+                t = np.random.randint(1, max_time_width + 1)
+                start_high = num_time_bins - t
+                if start_high <= 0:
+                    continue
+                t0 = np.random.randint(0, start_high + 1)
+                spec_data[:, :, t0:t0 + t] = mask_fill_value
             
         return spec_data
 

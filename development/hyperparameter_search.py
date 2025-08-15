@@ -75,7 +75,8 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
         files_to_copy = (
             [f'model_fold_{i}_{variant}.pth' for i in range(1, 6)] +
             [f'scaler_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
-            [f'spec_stats_fold_{i}_{variant}.pkl' for i in range(1, 6)] + # ADDED
+            [f'spec_stats_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
+            [f'spec_params_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
             [f'label_encoder_{variant}.pkl', f'kfold_summary_{variant}.json', f'oof_predictions_{variant}.csv']
         )
 
@@ -167,6 +168,13 @@ def objective(trial: optuna.trial.Trial) -> float:
     spec_params['fs'] = 10.0
     # Strict: provide max_length from config to data pipeline
     spec_params['max_length'] = cfg.data['max_length']
+    # Normalize to explicit noverlap for downstream consumers (config-driven, no fallback later)
+    _np = int(spec_params['nperseg'])
+    _ratio = float(spec_params['noverlap_ratio'])
+    _no = int(_np * _ratio)
+    if not (0 <= _no < _np):
+        raise ValueError(f"Computed noverlap({_no}) must satisfy 0 <= noverlap < nperseg({_np}).")
+    spec_params['noverlap'] = _no
 
     # --- Spectrogram (Spec) 分支架构 ---
     if 'spec_branch_cfg' in cfg.model:
