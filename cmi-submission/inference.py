@@ -34,7 +34,7 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
 from models.multimodality import MultimodalityModel
-from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS, generate_spectrogram
+from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS, generate_spectrogram, generate_feature_columns
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
@@ -218,21 +218,23 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             # --- MODIFIED: 在此处添加 .astype(np.float32) 来确保数据类型一致 ---
             X_scaled_unpadded = scaler.transform(features_df).astype(np.float32)
             
-            scaled_feature_names = scaler.get_feature_names_out()
+            scaled_feature_names = scaler.get_feature_names_out().tolist()
 
-            # 2. 拆分多模态数据
+            # 2. 拆分多模态数据（使用与训练一致的列顺序）
             static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS]
-            tof_cols = [c for c in scaled_feature_names if c.startswith('tof_')]
-            thm_cols = [c for c in scaled_feature_names if c.startswith('thm_')]
+            thm_cols, tof_cols = generate_feature_columns(scaled_feature_names)
+            # 仅保留当前实际存在于特征中的列（稳健性）
+            thm_cols = [c for c in thm_cols if c in scaled_feature_names]
+            tof_cols = [c for c in tof_cols if c in scaled_feature_names]
             spec_source_cols = ['linear_acc_x', 'linear_acc_y', 'linear_acc_z', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z']
             spec_source_cols = [c for c in spec_source_cols if c in scaled_feature_names]
             imu_cols = [c for c in scaled_feature_names if c not in static_cols + tof_cols + thm_cols]
 
-            static_idx = [list(scaled_feature_names).index(c) for c in static_cols]
-            tof_idx = [list(scaled_feature_names).index(c) for c in tof_cols]
-            thm_idx = [list(scaled_feature_names).index(c) for c in thm_cols]
-            imu_idx = [list(scaled_feature_names).index(c) for c in imu_cols]
-            spec_idx = [list(scaled_feature_names).index(c) for c in spec_source_cols]
+            static_idx = [scaled_feature_names.index(c) for c in static_cols]
+            tof_idx = [scaled_feature_names.index(c) for c in tof_cols]
+            thm_idx = [scaled_feature_names.index(c) for c in thm_cols]
+            imu_idx = [scaled_feature_names.index(c) for c in imu_cols]
+            spec_idx = [scaled_feature_names.index(c) for c in spec_source_cols]
 
             static_arr = X_scaled_unpadded[0:1, static_idx]
             tof_arr, thm_arr, imu_arr = X_scaled_unpadded[:, tof_idx], X_scaled_unpadded[:, thm_idx], X_scaled_unpadded[:, imu_idx]
