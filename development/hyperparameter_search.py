@@ -106,6 +106,8 @@ def objective(trial: optuna.trial.Trial) -> float:
     Optuna 的目标函数。
     为支持多变量采样，已对内部动态依赖进行扁平化处理。
     """
+    # 清除dynamo缓存防止模型多次编译占据缓存
+    torch._dynamo.reset()
     cfg = train.load_py_config(CONFIG_FILE_PATH)
     variant = cfg.data['variant']
     

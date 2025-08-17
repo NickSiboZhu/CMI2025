@@ -219,29 +219,34 @@ class TemporalEncoder(nn.Module):
             mask = torch.ones(batch_size, seq_len, device=features.device)
             
         if self.mode == 'lstm':
-            # LSTM processing with proper sequence packing
-            lengths = mask.sum(dim=1).to(torch.int64)
-            
-            # Align sequences (assuming padding at beginning)
-            aligned_features = torch.zeros_like(features)
-            for i in range(batch_size):
-                L = lengths[i]
-                if L > 0:
-                    aligned_features[i, :L] = features[i, -L:]
-            
-            # Pack sequences
-            packed_input = pack_padded_sequence(
-                aligned_features, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-            
-            # LSTM forward
-            _, (h_n, _) = self.lstm(packed_input)
-            
-            # Extract final hidden state
+            # features: (B, S, C), mask: (B, S)  —— 假设原始是“左填充”（padding 在序列左侧）
+            B, S, C = features.shape
+            lengths = mask.sum(dim=1).to(torch.int64).clamp(min=0, max=S)  # [B]
+
+            # 计算每个样本有效片段的起点（在原序列的右端）
+            start = (S - lengths).clamp(min=0)                              # [B]
+
+            # 构造按样本的索引矩阵：idx[i, t] = start[i] + t（超过 S-1 的 clamp 回 S-1）
+            t = torch.arange(S, device=features.device).unsqueeze(0).expand(B, S)  # [B, S]
+            src_idx = (start.unsqueeze(1) + t).clamp(max=S - 1)                     # [B, S]
+
+            # 按序 gather，把“最后 L 个有效步”移到最前面（保持时间顺序），其余位置先临时复制边界
+            aligned = torch.gather(features, dim=1, index=src_idx.unsqueeze(-1).expand(-1, -1, C))  # [B, S, C]
+
+            # 将前 L 之外的位置清零（得到右侧零填充）
+            keep = (t < lengths.unsqueeze(1)).unsqueeze(-1)  # [B, S, 1]
+            aligned = aligned * keep
+
+            # 现在 aligned 是“右填充”的序列，可以直接 pack
+            packed = pack_padded_sequence(aligned, lengths.cpu(), batch_first=True, enforce_sorted=False)
+
+            # LSTM 前向
+            _, (h_n, _) = self.lstm(packed)
             if self.bidirectional:
-                output = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
+                output = torch.cat((h_n[-2], h_n[-1]), dim=1)
             else:
-                output = h_n[-1,:,:]
+                output = h_n[-1]
+            return output
                 
         elif self.mode == 'transformer':
             # Transformer processing with [CLS] token
