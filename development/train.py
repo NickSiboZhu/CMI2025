@@ -1,5 +1,3 @@
-# train.py
-
 # ... (所有 imports 保持不变) ...
 import torch
 import torch.nn as nn
@@ -24,6 +22,7 @@ import pandas as pd
 import importlib.util, runpy
 from torch import amp  
 
+torch._dynamo.reset()
 
 def set_seed(seed_value=42):
     """Set seed for reproducibility."""
@@ -32,8 +31,8 @@ def set_seed(seed_value=42):
     torch.cuda.manual_seed(seed_value)
     torch.cuda.manual_seed_all(seed_value)  # if you are using multi-GPU.
     os.environ['PYTHONHASHSEED'] = str(seed_value)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
     print(f"Random seed set to {seed_value}")
 
 
@@ -280,11 +279,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
     
     # --- MODIFIED: Unpack spec_data from dataloader ---
     for (imu_data, thm_data, tof_data, spec_data, static_data, mask), target, sample_weights in dataloader:
-        imu_data, thm_data, tof_data = imu_data.to(device), thm_data.to(device), tof_data.to(device)
-        spec_data, static_data, mask = spec_data.to(device), static_data.to(device), mask.to(device)
-        target, sample_weights = target.to(device), sample_weights.to(device)
-        
-        optimizer.zero_grad()
+        imu_data  = imu_data.to(device, non_blocking=True)
+        thm_data  = thm_data.to(device, non_blocking=True)
+        tof_data  = tof_data.to(device, non_blocking=True)
+        spec_data = spec_data.to(device, non_blocking=True)
+        static_data = static_data.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
+        sample_weights = sample_weights.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
 
         with amp.autocast(device_type=device.type, enabled=use_amp):
             if mixup_enabled and mixup_alpha > 0.0:
@@ -336,9 +340,13 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     with torch.no_grad():
         # --- MODIFIED: Unpack spec_data from dataloader ---
         for (imu_data, thm_data, tof_data, spec_data, static_data, mask), target, _ in dataloader:
-            imu_data, thm_data, tof_data = imu_data.to(device), thm_data.to(device), tof_data.to(device)
-            spec_data, static_data, mask = spec_data.to(device), static_data.to(device), mask.to(device)
-            target = target.to(device)
+            imu_data  = imu_data.to(device, non_blocking=True)
+            thm_data  = thm_data.to(device, non_blocking=True)
+            tof_data  = tof_data.to(device, non_blocking=True)
+            spec_data = spec_data.to(device, non_blocking=True)
+            static_data = static_data.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
             
             with amp.autocast(device_type=device.type, enabled=use_amp):
                 # --- MODIFIED: Pass spec_data to the model ---
@@ -399,7 +407,10 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         print("Using a single learning rate for the entire model.")
         # Strict: require start_lr in scheduler_cfg if single LR path is used
         start_lr = scheduler_cfg['start_lr']
-        optimizer = optim.AdamW(model.parameters(), lr=start_lr, weight_decay=weight_decay)
+        try:
+            optimizer = optim.AdamW(param_groups, weight_decay=weight_decay, fused=True)
+        except TypeError:
+            optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
 
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
     print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
@@ -565,7 +576,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
+            pin_memory_device="cuda",
             persistent_workers=True,
+            prefetch_factor=4,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -573,7 +586,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
+            pin_memory_device="cuda",
             persistent_workers=True,
+            prefetch_factor=4,
         )
         
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -581,6 +596,12 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none') if loss_function == 'focal' else nn.CrossEntropyLoss(reduction='none')
         
         model = model.to(device)
+        # 编译模型以加快速度
+        try:
+            # 最后一个batch不满，数据形状不固定，启用dynamic
+            model = torch.compile(model, mode='default', dynamic=True)
+        except Exception as e:
+            print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
         
@@ -594,7 +615,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         )
         
         print(f"\nEvaluating fold {fold_idx + 1}...")
-        _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder)
+        _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
         oof_preds[fold['val_idx']] = all_preds_val
         best_val_score = max(history['val_competition_score'])
         

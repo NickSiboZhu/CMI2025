@@ -2,6 +2,59 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 
+
+import numpy as np
+import torch
+
+def apply_time_series_augmentations(imu_data, thm_data, tof_data, aug_params, rng):
+    scale_low, scale_high = aug_params.get('scale_range', (0.9, 1.1))
+    noise_low, noise_high = aug_params.get('noise_std_range', (0.01, 0.05))
+
+    scale = rng.uniform(scale_low, scale_high)
+    imu_data = imu_data * scale
+    thm_data = thm_data * scale
+
+    noise_std = rng.uniform(noise_low, noise_high)
+    imu_data = imu_data + rng.normal(0, noise_std, imu_data.shape)
+    thm_data = thm_data + rng.normal(0, noise_std, thm_data.shape)
+    return imu_data, thm_data, tof_data
+
+
+def apply_spec_augment(spec_data, aug_params, rng):
+    # spec_data: (C, F, T)
+    C, F, T = spec_data.shape
+    freq_param = int(aug_params.get('freq_mask_param', 5))
+    n_f = int(aug_params.get('num_freq_masks', 2))
+    time_param = int(aug_params.get('time_mask_param', 7))
+    n_t = int(aug_params.get('num_time_masks', 2))
+
+    fill = spec_data.mean()
+
+    # 频率掩码
+    max_f = min(freq_param, max(0, F - 1))
+    if max_f > 0 and F > 1:
+        for _ in range(n_f):
+            w = rng.integers(1, max_f + 1)
+            hi = F - w
+            if hi <= 0: break
+            s = rng.integers(0, hi + 1)
+            spec_data[:, s:s + w, :] = fill
+
+    # 时间掩码
+    max_t = min(time_param, max(0, T - 1))
+    if max_t > 0 and T > 1:
+        for _ in range(n_t):
+            w = rng.integers(1, max_t + 1)
+            hi = T - w
+            if hi <= 0: break
+            s = rng.integers(0, hi + 1)
+            spec_data[:, :, s:s + w] = fill
+
+    return spec_data
+
+
+
+
 class MultimodalDataset(Dataset):
     """
     一个内存高效的多模态手势识别数据集类，集成了数据增强功能。
@@ -83,60 +136,6 @@ class MultimodalDataset(Dataset):
     def __len__(self):
         return len(self.X_imu)
 
-    def _apply_time_series_augmentations(self, imu_data, thm_data, tof_data):
-        """应用时序数据增强"""
-        # 幅度缩放
-        scale = np.random.uniform(*self.aug_params.get('scale_range', (0.9, 1.1)))
-        imu_data *= scale
-        thm_data *= scale
-
-        # 高斯噪声
-        noise_std = np.random.uniform(*self.aug_params.get('noise_std_range', (0.01, 0.05)))
-        imu_data += np.random.normal(0, noise_std, imu_data.shape)
-        thm_data += np.random.normal(0, noise_std, thm_data.shape)
-
-        return imu_data, thm_data, tof_data
-
-    def _apply_spec_augment(self, spec_data):
-        """应用 SpecAugment"""
-        freq_mask_param = self.aug_params.get('freq_mask_param', 5)
-        num_freq_masks = self.aug_params.get('num_freq_masks', 2)
-        time_mask_param = self.aug_params.get('time_mask_param', 7)
-        num_time_masks = self.aug_params.get('num_time_masks', 2)
-        
-        # 语谱图形状: (Channels, Freq_bins, Time_bins)
-        _, num_freq_bins, num_time_bins = spec_data.shape
-        
-        # 使用语谱图自身的均值进行填充，这比用0填充更好
-        mask_fill_value = spec_data.mean()
-
-        # 1. 频率掩码
-        # Clamp mask width to valid range based on actual bins
-        max_freq_width = min(int(freq_mask_param), max(0, num_freq_bins - 1))
-        if max_freq_width > 0 and num_freq_bins > 1:
-            for _ in range(int(num_freq_masks)):
-                # Choose a positive width in [1, max_freq_width]
-                f = np.random.randint(1, max_freq_width + 1)
-                # Start index in [0, num_freq_bins - f] inclusive
-                start_high = num_freq_bins - f
-                if start_high <= 0:
-                    continue
-                f0 = np.random.randint(0, start_high + 1)
-                spec_data[:, f0:f0 + f, :] = mask_fill_value
-            
-        # 2. 时间掩码
-        max_time_width = min(int(time_mask_param), max(0, num_time_bins - 1))
-        if max_time_width > 0 and num_time_bins > 1:
-            for _ in range(int(num_time_masks)):
-                t = np.random.randint(1, max_time_width + 1)
-                start_high = num_time_bins - t
-                if start_high <= 0:
-                    continue
-                t0 = np.random.randint(0, start_high + 1)
-                spec_data[:, :, t0:t0 + t] = mask_fill_value
-            
-        return spec_data
-
     def __getitem__(self, idx):
         # 1. 获取原始数据，并使用 .copy() 以免在增强时修改原始数据
         imu_data = self.X_imu[idx].copy()
@@ -147,15 +146,21 @@ class MultimodalDataset(Dataset):
         mask_data = self.mask[idx].copy()
         label = self.y[idx]
 
+        rng = getattr(self, "_rng", None)
+        if rng is None:
+            # 退化：没有 worker_init_fn 时也能工作
+            rng = np.random.default_rng()
+
         # 2. <<< 应用数据增强 (仅在训练时) >>>
         if self.augment and self.aug_params:
-            # 应用时序增强
-            # if np.random.rand() < self.aug_params.get('time_series_augment_prob', 0.0):
-            #     imu_data, thm_data, tof_data = self._apply_time_series_augmentations(imu_data, thm_data, tof_data)
-            
-            # 应用语谱图增强
-            if np.random.rand() < self.aug_params.get('spec_augment_prob', 0.0):
-                spec_data = self._apply_spec_augment(spec_data)
+            # 若需要时序增强，打开下一行
+            # if rng.random() < self.aug_params.get('time_series_augment_prob', 0.0):
+            #     imu_data, thm_data, tof_data = apply_time_series_augmentations(
+            #         imu_data, thm_data, tof_data, self.aug_params, rng
+            #     )
+
+            if rng.random() < self.aug_params.get('spec_augment_prob', 0.0):
+                spec_data = apply_spec_augment(spec_data, self.aug_params, rng)
 
         # 3. 对语谱图进行即时标准化
         if self.spec_stats:
