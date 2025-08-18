@@ -183,6 +183,12 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
         if col not in feature_cols:
             feature_cols.append(col)
 
+    # 动态添加所有 *_missing 静态标志列到特征列表
+    dynamic_missing_flags = [c for c in processed_df.columns if c.endswith('_missing')]
+    for col in dynamic_missing_flags:
+        if col not in feature_cols:
+            feature_cols.append(col)
+
     if variant == "imu":
         feature_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
 
@@ -221,7 +227,8 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             scaled_feature_names = scaler.get_feature_names_out().tolist()
 
             # 2. 拆分多模态数据（使用与训练一致的列顺序）
-            static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS]
+            # Treat any *_missing flags as static features alongside STATIC_FEATURE_COLS
+            static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS or c.endswith('_missing')]
             thm_cols, tof_cols = generate_feature_columns(scaled_feature_names)
             # 仅保留当前实际存在于特征中的列（稳健性）
             thm_cols = [c for c in thm_cols if c in scaled_feature_names]

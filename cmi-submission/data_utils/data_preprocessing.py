@@ -220,6 +220,27 @@ def feature_engineering(train_df: pd.DataFrame):
         (pl.col('linear_acc_x')**2 + pl.col('linear_acc_y')**2 + pl.col('linear_acc_z')**2).sqrt().alias('linear_acc_mag')
     )
 
+    # --- NEW: Thermopile (THM) per-sensor and overall missingness flags (computed before THM interpolation) ---
+    thm_cols = [c for c in pl_df.columns if c.startswith('thm_') and len(c.split('_')) == 2]
+    if thm_cols:
+        # Per-sequence, per-sensor all-null flags
+        thm_missing_agg = pl_df.group_by('sequence_id', maintain_order=True).agg(
+            [pl.col(col).is_null().all().alias(f"{col}_missing") for col in thm_cols]
+        )
+        # Overall THM missing: all sensors missing within the sequence
+        sum_expr = None
+        for col in thm_cols:
+            expr = pl.col(f"{col}_missing").cast(pl.Int8)
+            sum_expr = expr if sum_expr is None else (sum_expr + expr)
+        thm_missing_agg = thm_missing_agg.with_columns(
+            (sum_expr == pl.lit(len(thm_cols))).alias('thm_missing')
+        )
+        # Cast flags to Float32 for consistency
+        cast_exprs = [pl.col(f"{col}_missing").cast(pl.Float32) for col in thm_cols] + [pl.col('thm_missing').cast(pl.Float32)]
+        thm_missing_agg = thm_missing_agg.with_columns(cast_exprs)
+        # Join back per-row
+        pl_df = pl_df.join(thm_missing_agg, on='sequence_id', how='left')
+
     angular_vel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_velocity_from_quat_polars)
     pl_df = pl.concat([pl_df, angular_vel_results], how='horizontal')
 
@@ -236,7 +257,11 @@ def feature_engineering(train_df: pd.DataFrame):
         'angular_vel_x', 'angular_vel_y', 'angular_vel_z',  
         'angular_distance'
     ] 
-    tof_thm_cols = [c for c in pl_df.columns if c.startswith('tof_') or c.startswith('thm_')] 
+    # Exclude *_missing flags from time-series feature list
+    tof_thm_cols = [
+        c for c in pl_df.columns
+        if (c.startswith('tof_') or c.startswith('thm_')) and not c.endswith('_missing')
+    ] 
     final_feature_cols.extend(tof_thm_cols) 
     final_feature_cols = [c for c in final_feature_cols if c in pl_df.columns] 
 
@@ -257,7 +282,9 @@ def feature_engineering(train_df: pd.DataFrame):
 STATIC_FEATURE_COLS = [
     'adult_child', 'age', 'sex', 'handedness', 'height_cm', 
     'shoulder_to_wrist_cm', 'elbow_to_wrist_cm',
-    'rot_missing'
+    'rot_missing',
+    # Per-sensor THM missing flags will be dynamically present if THM exists
+    # We'll treat any *_missing columns as static by selection in downstream code
 ]
 
 # Function to dynamically detect sensor configuration from data columns
@@ -405,6 +432,12 @@ def load_and_preprocess_data(variant: str = "full"):
     for col in existing_static_cols:
         if col not in feature_cols:
             feature_cols.append(col)
+
+    # 3. 动态添加所有 *_missing 静态标志列到特征列表（静态分支专用）
+    dynamic_missing_flags = [c for c in train_df.columns if c.endswith('_missing')]
+    for col in dynamic_missing_flags:
+        if col not in feature_cols:
+            feature_cols.append(col)
     
     # --- Filter features based on variant if necessary ---
     if variant == "imu":
@@ -512,8 +545,9 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
         col for col in X_train.columns 
         if any(col.startswith(p) for p in zscore_prefixes) and not col.endswith('_failed')
     ]
-    # Do not standardize binary indicators like rot_missing
-    zscore_cols = [col for col in zscore_cols if col != 'rot_missing']
+    # Do not standardize binary indicators like *_missing
+    all_missing_flags = [c for c in X_train.columns if c.endswith('_missing')]
+    zscore_cols = [col for col in zscore_cols if col not in all_missing_flags]
     
     demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm']
     existing_demographic_cols = [col for col in demographic_cols if col in X_train.columns]
@@ -629,7 +663,8 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
     sample_fold = base_fold_data[0]
     all_feature_cols = sample_fold['all_feature_cols']
     
-    static_cols = [c for c in STATIC_FEATURE_COLS if c in all_feature_cols]
+    # Treat any *_missing flags as static features alongside STATIC_FEATURE_COLS
+    static_cols = [c for c in all_feature_cols if (c in STATIC_FEATURE_COLS) or c.endswith('_missing')]
     thm_cols, tof_cols = generate_feature_columns(all_feature_cols)
     thm_cols = [c for c in thm_cols if c in all_feature_cols]
     tof_cols = [c for c in tof_cols if c in all_feature_cols]
