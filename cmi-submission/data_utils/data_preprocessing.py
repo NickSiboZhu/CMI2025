@@ -67,26 +67,53 @@ def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
     acc_values = group_df.select(['acc_x', 'acc_y', 'acc_z']).to_numpy()
     quat_values = group_df.select(['rot_x', 'rot_y', 'rot_z', 'rot_w']).to_numpy()
-    
+
+    # Detect sequences where all quaternions are effectively identity [0,0,0,1]
+    # This typically indicates originally-missing rot_* that were imputed.
+    if quat_values.size == 0:
+        all_missing_seq = False
+    else:
+        identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+        per_row_identity = np.all(np.isclose(quat_values, identity_quat, atol=1e-6), axis=1)
+        all_missing_seq = bool(per_row_identity.all())
+
     linear_accel = np.zeros_like(acc_values)
-    gravity_world = np.array([0, 0, 9.81])
-    
-    for i in range(acc_values.shape[0]):
-        if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
-            linear_accel[i, :] = acc_values[i, :]
-            continue
-        try:
-            rotation = R.from_quat(quat_values[i])
-            gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
-            linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
-        except (ValueError, IndexError):
-            linear_accel[i, :] = acc_values[i, :]
-            
+    rot_missing_col = np.zeros((acc_values.shape[0],), dtype=np.float32)
+
+    if all_missing_seq:
+        # Fallback: estimate gravity from accelerometer via EMA low-pass, then subtract
+        # Sampling ~10 Hz → choose cutoff ~0.3 Hz
+        dt = 0.1
+        fc = 0.3
+        tau = 1.0 / (2.0 * np.pi * fc)
+        alpha = dt / (tau + dt)
+
+        gravity = np.zeros_like(acc_values, dtype=np.float32)
+        if acc_values.shape[0] > 0:
+            gravity[0] = acc_values[0]
+            for t in range(1, acc_values.shape[0]):
+                gravity[t] = (1.0 - alpha) * gravity[t - 1] + alpha * acc_values[t]
+        linear_accel = (acc_values - gravity).astype(np.float32)
+        rot_missing_col[:] = 1.0
+    else:
+        gravity_world = np.array([0, 0, 9.81])
+        for i in range(acc_values.shape[0]):
+            if np.all(np.isnan(quat_values[i])) or np.all(np.isclose(quat_values[i], 0)):
+                linear_accel[i, :] = acc_values[i, :]
+                continue
+            try:
+                rotation = R.from_quat(quat_values[i])
+                gravity_sensor_frame = rotation.apply(gravity_world, inverse=True)
+                linear_accel[i, :] = acc_values[i, :] - gravity_sensor_frame
+            except (ValueError, IndexError):
+                linear_accel[i, :] = acc_values[i, :]
+
     return pl.DataFrame({
         'linear_acc_x': linear_accel[:, 0],
         'linear_acc_y': linear_accel[:, 1],
         'linear_acc_z': linear_accel[:, 2],
-    }).cast(pl.Float32)
+        'rot_missing': rot_missing_col,
+    }).cast({'linear_acc_x': pl.Float32, 'linear_acc_y': pl.Float32, 'linear_acc_z': pl.Float32, 'rot_missing': pl.Float32})
 
 def _calculate_angular_velocity_from_quat_polars(group_df: pl.DataFrame, time_delta=1/10) -> pl.DataFrame:
     """
@@ -99,6 +126,16 @@ def _calculate_angular_velocity_from_quat_polars(group_df: pl.DataFrame, time_de
             'angular_vel_x': np.zeros(len(quat_values)),
             'angular_vel_y': np.zeros(len(quat_values)),
             'angular_vel_z': np.zeros(len(quat_values)),
+        }, schema={'angular_vel_x': pl.Float32, 'angular_vel_y': pl.Float32, 'angular_vel_z': pl.Float32})
+
+    # If the entire sequence quaternions are identity (imputed), zero angular velocity
+    identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+    if np.all(np.isclose(quat_values, identity_quat, atol=1e-6)):
+        zeros = np.zeros((len(quat_values),), dtype=np.float32)
+        return pl.DataFrame({
+            'angular_vel_x': zeros,
+            'angular_vel_y': zeros,
+            'angular_vel_z': zeros,
         }, schema={'angular_vel_x': pl.Float32, 'angular_vel_y': pl.Float32, 'angular_vel_z': pl.Float32})
 
     q_t_plus_dt = R.from_quat(quat_values)
@@ -127,6 +164,12 @@ def _calculate_angular_distance_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     if len(quat_values) < 2:
         return pl.DataFrame({'angular_distance': np.zeros(len(quat_values))}, schema={'angular_distance': pl.Float64})
         
+    # Identity-only sequences → zero angular distance
+    identity_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+    if np.all(np.isclose(quat_values, identity_quat, atol=1e-6)):
+        zeros = np.zeros((len(quat_values),), dtype=np.float32)
+        return pl.DataFrame({'angular_distance': zeros}).cast(pl.Float32)
+
     q2 = R.from_quat(quat_values)
     q1 = R.from_quat(np.roll(quat_values, 1, axis=0))
     q1.as_quat()[0] = q2.as_quat()[0]
@@ -213,7 +256,8 @@ def feature_engineering(train_df: pd.DataFrame):
 # Static feature columns (shared between training and inference)
 STATIC_FEATURE_COLS = [
     'adult_child', 'age', 'sex', 'handedness', 'height_cm', 
-    'shoulder_to_wrist_cm', 'elbow_to_wrist_cm'
+    'shoulder_to_wrist_cm', 'elbow_to_wrist_cm',
+    'rot_missing'
 ]
 
 # Function to dynamically detect sensor configuration from data columns
@@ -468,6 +512,8 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
         col for col in X_train.columns 
         if any(col.startswith(p) for p in zscore_prefixes) and not col.endswith('_failed')
     ]
+    # Do not standardize binary indicators like rot_missing
+    zscore_cols = [col for col in zscore_cols if col != 'rot_missing']
     
     demographic_cols = ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm']
     existing_demographic_cols = [col for col in demographic_cols if col in X_train.columns]

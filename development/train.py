@@ -597,11 +597,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         
         model = model.to(device)
         # 编译模型以加快速度
-        try:
-            # 最后一个batch不满，数据形状不固定，启用dynamic
-            model = torch.compile(model, mode='default', dynamic=True)
-        except Exception as e:
-            print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
+        # try:
+        #     # 最后一个batch不满，数据形状不固定，启用dynamic
+        #     model = torch.compile(model, mode='default', dynamic=True)
+        # except Exception as e:
+        #     print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
         criterion = criterion.to(device)
         print(f"Model and criterion loaded to {device}")
         
