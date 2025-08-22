@@ -7,7 +7,73 @@ from torch.nn.utils.rnn import pack_padded_sequence
 
 from timm.layers import SqueezeExcite as TimmSE
 
-    
+
+class MaskedBatchNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1,
+                 affine=True, track_running_stats=True):
+        super().__init__()
+        self.eps, self.momentum = eps, momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+
+        if affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias   = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+        if track_running_stats:
+            # 运行统计固定 float32，更抗抖动
+            self.register_buffer("running_mean", torch.zeros(num_features, dtype=torch.float32))
+            self.register_buffer("running_var",  torch.ones(num_features,  dtype=torch.float32))
+            self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
+        else:
+            self.register_parameter("running_mean", None)
+            self.register_parameter("running_var",  None)
+            self.register_parameter("num_batches_tracked", None)
+
+    def forward(self, x: torch.Tensor, time_mask: torch.Tensor = None):
+        # x: (N, C, H, W); time_mask: (N, W) 取值{0,1}
+        N, C, H, W = x.shape
+        if time_mask is None:
+            m = torch.ones(N, 1, 1, W, device=x.device, dtype=torch.float32)
+        else:
+            m = time_mask.view(N, 1, 1, W).to(torch.float32)   # 统计固定 float32
+
+        # 有效元素个数（标量张量）：时间掩码的有效步数 × H
+        denom = (m.sum() * float(H)).clamp_(min=1.0)           # 仍为张量，不用 .item()
+
+        x_f32 = x.to(torch.float32)
+        sum_  = (x_f32 * m).sum(dim=(0, 2, 3))                 # (C,)
+        mean  = sum_ / denom                                   # (C,)
+        var   = ((x_f32 - mean.view(1, C, 1, 1))**2 * m).sum(dim=(0, 2, 3)) / denom
+
+        if self.training and self.track_running_stats:
+            # 纯张量条件：有效比例 = denom / (N*H*W)
+            total_pos   = torch.tensor(N * H * W, dtype=torch.float32, device=x.device)
+            valid_ratio = (denom / total_pos)                  # 标量张量
+            cond        = (valid_ratio > 1e-3).to(torch.float32)   # 0/1
+
+            # 纯张量更新，避免 Python 调用导致的 CALL 字节码
+            with torch.no_grad():
+                mom = torch.tensor(self.momentum, dtype=torch.float32, device=x.device)
+                new_rm = self.running_mean * (1 - mom) + mean * mom
+                new_rv = self.running_var  * (1 - mom) + var  * mom
+                # cond==0 时保持原值；cond==1 时更新
+                self.running_mean.copy_(torch.lerp(self.running_mean, new_rm, cond))
+                self.running_var.copy_( torch.lerp(self.running_var,  new_rv, cond))
+                self.num_batches_tracked.add_(cond.to(torch.long))
+
+        ref_mean = mean if (self.training or not self.track_running_stats) else self.running_mean
+        ref_var  = var  if (self.training or not self.track_running_stats) else self.running_var
+
+        x_hat = (x_f32 - ref_mean.view(1, C, 1, 1)) / torch.sqrt(ref_var.view(1, C, 1, 1) + self.eps)
+        if self.affine:
+            x_hat = x_hat * self.weight.view(1, C, 1, 1).to(x_hat.dtype) + self.bias.view(1, C, 1, 1).to(x_hat.dtype)
+
+        # cast 回输入 dtype，并零掉无效时间位
+        return x_hat.to(x.dtype) * m.to(x.dtype)
 
 @MODELS.register_module()
 class SpectrogramCNN(nn.Module):
@@ -34,10 +100,10 @@ class SpectrogramCNN(nn.Module):
 
         current_channels = in_channels
         for i, (out_c, k) in enumerate(zip(filters, kernel_sizes)):
-            self.conv_layers.append(nn.Conv2d(current_channels, out_c, kernel_size=k, padding='same'))
-            self.bn_layers.append(nn.BatchNorm2d(out_c))
+            self.conv_layers.append(nn.Conv2d(current_channels, out_c, kernel_size=k, padding='same', bias=True))
+            self.bn_layers.append(MaskedBatchNorm2d(out_c))
             if use_residual and current_channels != out_c:
-                self.residual_projections.append(nn.Conv2d(current_channels, out_c, kernel_size=1))
+                self.residual_projections.append(nn.Conv2d(current_channels, out_c, kernel_size=1, stride=1, padding=0, bias=True))
             else:
                 self.residual_projections.append(None)
             current_channels = out_c
@@ -68,7 +134,7 @@ class SpectrogramCNN(nn.Module):
             residual = x if self.use_residual else None
             
             x = conv(x)
-            x = self.bn_layers[i](x)
+            x = self.bn_layers[i](x, time_mask)
             
             if self.use_residual:
                 if self.residual_projections[i] is not None:
@@ -324,19 +390,16 @@ class TOF2DCNN(nn.Module):
         if self.use_sensor_gate and (not sensor_gate_adaptive) and sensor_gate_init is None:
             raise ValueError("'sensor_gate_init' must be provided when 'use_sensor_gate' is True and not adaptive.")
 
-        # Build conv layers manually for residual connections
-        self.conv_blocks = nn.ModuleList()
-        self.se_layers = nn.ModuleList() if use_se else None
+        # --- 修改：将 Conv+BN 拆开，BN 改为 MaskedBatchNorm2d ---
+        self.conv_layers = nn.ModuleList()
+        self.bn_layers   = nn.ModuleList()
+        self.se_layers   = nn.ModuleList() if use_se else None
         self.residual_projections = nn.ModuleList()
         
         in_channels = input_channels
         for i, (out_c, k) in enumerate(zip(conv_channels, kernel_sizes)):
-            # Create conv block
-            conv_block = nn.Sequential(
-                nn.Conv2d(in_channels, out_c, kernel_size=k, padding='same'),
-                nn.BatchNorm2d(out_c)
-            )
-            self.conv_blocks.append(conv_block)
+            self.conv_layers.append(nn.Conv2d(in_channels, out_c, kernel_size=k, padding='same', bias=True))  # bias=True
+            self.bn_layers.append(MaskedBatchNorm2d(out_c))  # ← 关键替换
 
             if self.se_layers is not None:
                 # timm 1.0.15 signature: SqueezeExcite(channels, rd_ratio=1/16, rd_channels=None, ...)
@@ -345,7 +408,7 @@ class TOF2DCNN(nn.Module):
             
             # Add residual projection if needed
             if use_residual and in_channels != out_c:
-                self.residual_projections.append(nn.Conv2d(in_channels, out_c, kernel_size=1))
+                self.residual_projections.append(nn.Conv2d(in_channels, out_c, kernel_size=1, bias=True))  # bias=True
             else:
                 self.residual_projections.append(None)
             
@@ -387,18 +450,18 @@ class TOF2DCNN(nn.Module):
         # Store the actual output dimension
         self.out_features = self.last_conv_channels  # Use last conv channel count as output
     
-    def forward(self, tof_grids):
+    def forward(self, tof_grids, frame_mask: torch.Tensor = None):
         """
         Forward pass for TOF 2D CNN with optional residual connections.
         
         Args:
             tof_grids: Tensor of shape (batch_size, num_sensors, 8, 8)
                       Each 8x8 grid represents one TOF sensor's depth map
-        
+            frame_mask: (batch_size,) or (batch_size, 1) —— 1 表示该帧有效，0 表示该帧是 padding
         Returns:
             Tensor of shape (batch_size, last_conv_channels)
         """
-        x = tof_grids
+        x = tof_grids  # (BL, C, 8, 8)
 
         # Apply optional pre-conv sensor gate
         if self.use_sensor_gate:
@@ -409,12 +472,23 @@ class TOF2DCNN(nn.Module):
                 x = x * self.sensor_gate
         
         # Process through conv blocks with optional residual connections
-        for i, conv_block in enumerate(self.conv_blocks):
+        for i in range(len(self.conv_layers)):
             if self.use_residual:
                 residual = x
             
-            # Apply conv block
-            x = conv_block(x)
+            # Apply conv
+            x = self.conv_layers[i](x)
+
+            # <<< 关键：将帧级 mask 扩展到当前 W 维，作为时间掩码传入 BN >>>
+            if frame_mask is None:
+                tm = None
+            else:
+                # frame_mask: (N,) or (N,1) -> (N, W)
+                W = x.size(3)
+                tm = frame_mask.view(-1, 1).float().expand(-1, W)
+
+            # Apply masked BN
+            x = self.bn_layers[i](x, tm)
 
             # Apply SE before residual addition (SENet-style)
             if self.se_layers is not None:
@@ -430,7 +504,7 @@ class TOF2DCNN(nn.Module):
             x = self.activation(x)
             
             # Apply pooling (except for last layer)
-            if i < len(self.conv_blocks) - 1:
+            if i < len(self.conv_layers) - 1:
                 x = self.pool(x)
         
         # Global pooling
@@ -440,7 +514,6 @@ class TOF2DCNN(nn.Module):
         x = x.view(x.size(0), -1)  # (batch, last_conv_channels)
         
         return x
-
 
 @MODELS.register_module()
 class TemporalTOF2DCNN(nn.Module):
@@ -516,7 +589,9 @@ class TemporalTOF2DCNN(nn.Module):
         self.spatial_out_dim = self.spatial_cnn.out_features
         
         # ------------- Temporal Encoder ---------------------
-        # Strict requirements for temporal params
+        # 严格校验保持不变（此处略，复用你已有的 TemporalEncoder 实现）
+        from .cnn2d import TemporalEncoder  # 复用你现有的实现
+
         if temporal_mode == 'lstm' and (lstm_hidden is None or lstm_layers is None or bidirectional is None):
             raise ValueError("For LSTM temporal_mode, provide lstm_hidden, lstm_layers, bidirectional.")
         if temporal_mode == 'transformer' and (num_heads is None or num_layers is None or ff_dim is None or dropout is None):
@@ -561,9 +636,12 @@ class TemporalTOF2DCNN(nn.Module):
         # --- Spatial feature extraction ---
         # Reshape to (batch_size * seq_len, num_sensors, 8, 8) for 2D CNN processing
         tof_grids_flat = tof_sequence.view(batch_size * seq_len, self.input_channels, 8, 8)
-        
-        # Apply 2D CNN to all timesteps
-        spatial_features = self.spatial_cnn(tof_grids_flat)  # (batch_size * seq_len, out_features)
+
+        # <<< 将时序 mask 展平为帧级 mask，传入 spatial_cnn 的 BN >>>
+        frame_mask = mask.reshape(batch_size * seq_len)  # (BL,)
+
+        # Apply 2D CNN to all timesteps (masked BN inside)
+        spatial_features = self.spatial_cnn(tof_grids_flat, frame_mask=frame_mask)  # (BL, out_features)
         
         # Reshape back to sequential format
         spatial_features = spatial_features.view(batch_size, seq_len, self.spatial_out_dim)  # (B, L, C)
