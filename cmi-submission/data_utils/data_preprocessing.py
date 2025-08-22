@@ -417,6 +417,10 @@ def load_and_preprocess_data(variant: str = "full"):
     label_encoder = LabelEncoder()
     train_df['gesture_encoded'] = label_encoder.fit_transform(train_df['gesture'])
 
+    # --- Add TOF missing flags BEFORE interpolation ---
+    if variant != "imu":
+        train_df = add_tof_missing_flags(train_df)
+
     # --- Spatial interpolation for TOF sensors ---
     if variant != "imu":
         train_df = interpolate_tof(train_df)
@@ -532,6 +536,215 @@ class TofScaler(BaseEstimator, TransformerMixin):
             raise ValueError("input_features is required for get_feature_names_out.")
         return np.asarray(input_features, dtype=object)
 
+class MaskedStandardAndMinMaxScaler(BaseEstimator, TransformerMixin):
+    """
+    A custom scaler that:
+    - Applies Z-score standardization to IMU/ROT/THM/engineered features while IGNORING invalid entries
+      for ROT and THM using their corresponding missing flags.
+    - Applies Min-Max scaling to TOF features with masking by per-sensor flags `tof_{sid}_missing`.
+      TOF values for rows where the corresponding sensor flag == 1 are excluded from min/max statistics
+      and assigned a sentinel value after scaling.
+    - Leaves *_missing flags and other passthrough columns unchanged.
+
+    Invalid definitions used during fit/transform:
+    - ROT columns (prefix 'rot_'): invalid where 'rot_missing' == 1 (sequence-level flag)
+    - THM sensor columns (pattern 'thm_{id}'): invalid where 'thm_{id}_missing' == 1 (sequence-level flag)
+
+    Notes:
+    - Feature order is preserved. get_feature_names_out() returns the input column order.
+    - Outputs float32 arrays to match the rest of the pipeline.
+    """
+
+    def __init__(self, zscore_prefixes=None, demographic_cols=None, invalid_fill_value: float = -12.0, invalid_fill_value_tof: float = -1.0):
+        self.zscore_prefixes = zscore_prefixes or ['acc_', 'rot_', 'thm_', 'linear_', 'angular_']
+        self.demographic_cols = demographic_cols or ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm']
+        self.invalid_fill_value = float(invalid_fill_value)
+        self.invalid_fill_value_tof = float(invalid_fill_value_tof)
+        self.feature_names_ = None
+        self.zscore_cols_ = None
+        self.tof_cols_ = None
+        self.passthrough_cols_ = None
+        self.mean_ = {}
+        self.std_ = {}
+        self.min_ = {}
+        self.max_ = {}
+
+    def _is_thm_sensor_col(self, col_name: str) -> bool:
+        return col_name.startswith('thm_') and (len(col_name.split('_')) == 2)
+
+    def _build_valid_mask(self, X_df: pd.DataFrame, col: str):
+        # Default: all valid
+        valid_mask = np.ones((len(X_df),), dtype=bool)
+        if col.startswith('rot_'):
+            if 'rot_missing' in X_df.columns:
+                valid_mask = (X_df['rot_missing'].values == 0)
+        elif self._is_thm_sensor_col(col):
+            sensor_id = col.split('_')[1]
+            flag_col = f"thm_{sensor_id}_missing"
+            if flag_col in X_df.columns:
+                valid_mask = (X_df[flag_col].values == 0)
+        elif col.startswith('tof_') and '_v' in col and not col.endswith('_missing'):
+            # Map tof_{sid}_v{pix} -> tof_{sid}_missing
+            parts = col.split('_')
+            if len(parts) >= 3:
+                sensor_id = parts[1]
+                flag_col = f"tof_{sensor_id}_missing"
+                if flag_col in X_df.columns:
+                    valid_mask = (X_df[flag_col].values == 0)
+        return valid_mask
+
+    def fit(self, X: pd.DataFrame, y=None):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("MaskedStandardAndMinMaxScaler expects a pandas DataFrame.")
+
+        self.feature_names_ = list(X.columns)
+
+        # Identify columns
+        all_missing_flags = [c for c in X.columns if c.endswith('_missing')]
+        # z-score candidates: prefixes + demographics, excluding *_missing and tof_
+        zscore_cols = [
+            c for c in X.columns
+            if (any(c.startswith(p) for p in self.zscore_prefixes) or c in self.demographic_cols)
+            and not c.endswith('_missing')
+            and not c.startswith('tof_')
+        ]
+        self.zscore_cols_ = zscore_cols
+        self.tof_cols_ = [c for c in X.columns if c.startswith('tof_') and not c.endswith('_missing')]
+        # passthrough is everything else
+        self.passthrough_cols_ = [
+            c for c in X.columns
+            if c not in set(self.zscore_cols_).union(self.tof_cols_)
+        ]
+
+        # Compute Z-score stats with masking
+        for col in self.zscore_cols_:
+            values = X[col].values.astype(np.float64)
+            valid_mask = self._build_valid_mask(X, col)
+            valid_values = values[valid_mask]
+            if valid_values.size == 0:
+                mean_val, std_val = 0.0, 1.0
+            else:
+                mean_val = float(np.mean(valid_values))
+                std_val = float(np.std(valid_values))
+                if std_val == 0.0:
+                    std_val = 1.0
+            self.mean_[col] = mean_val
+            self.std_[col] = std_val
+
+        # Compute Min-Max stats for TOF (masked by per-sensor flags tof_{sid}_missing)
+        for col in self.tof_cols_:
+            values = X[col].values.astype(np.float64)
+            valid_mask = self._build_valid_mask(X, col)
+            valid_values = values[valid_mask]
+            if valid_values.size == 0:
+                self.min_[col], self.max_[col] = 0.0, 1.0
+            else:
+                min_val = float(np.min(valid_values))
+                max_val = float(np.max(valid_values))
+                if max_val == min_val:
+                    max_val = min_val + 1.0
+                self.min_[col], self.max_[col] = min_val, max_val
+
+        return self
+
+    def transform(self, X: pd.DataFrame):
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("MaskedStandardAndMinMaxScaler expects a pandas DataFrame.")
+        if self.feature_names_ is None:
+            raise RuntimeError("This scaler instance is not fitted yet.")
+
+        # Ensure same columns/order
+        X = X[self.feature_names_]
+
+        n_rows = len(X)
+        n_cols = len(self.feature_names_)
+        out = np.zeros((n_rows, n_cols), dtype=np.float32)
+
+        for j, col in enumerate(self.feature_names_):
+            col_vals = X[col].values.astype(np.float32)
+            if col in self.zscore_cols_:
+                mean_val = self.mean_.get(col, 0.0)
+                std_val = self.std_.get(col, 1.0)
+                scaled = (col_vals - mean_val) / std_val
+                # Assign sentinel to invalid entries for ROT/THM so they are distinguishable from mean-zero
+                valid_mask = self._build_valid_mask(X, col)
+                scaled[~valid_mask] = self.invalid_fill_value
+                out[:, j] = scaled.astype(np.float32)
+            elif col in self.tof_cols_:
+                min_val = self.min_.get(col, 0.0)
+                max_val = self.max_.get(col, 1.0)
+                denom = max_val - min_val
+                if denom == 0.0:
+                    scaled = np.zeros_like(col_vals, dtype=np.float32)
+                else:
+                    scaled = ((col_vals - min_val) / denom).astype(np.float32)
+                # Set invalid rows (where sensor is missing) to sentinel
+                valid_mask = self._build_valid_mask(X, col)
+                scaled[~valid_mask] = self.invalid_fill_value_tof
+                out[:, j] = scaled
+            else:
+                # Passthrough (e.g., *_missing flags)
+                out[:, j] = col_vals
+
+        return out.astype(np.float32)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.feature_names_, dtype=object)
+
+# --- NEW: Compute TOF missing flags BEFORE any interpolation/fill ---
+def add_tof_missing_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add per-sequence, per-sensor TOF missing flags named `tof_{sid}_missing`.
+    A sensor is considered missing for a sequence if ALL its 64 pixel columns
+    are NaN for ALL rows in that sequence.
+
+    Must be called BEFORE any TOF interpolation/fill so flags reflect true
+    missingness. Flags are cast to Float32 to be consistent with other *_missing.
+    """
+    if df is None or df.empty:
+        return df
+
+    config = get_sensor_config(df.columns)
+    tof_sensor_ids = config['tof_sensor_ids']
+    if not tof_sensor_ids:
+        return df
+
+    pl_df = pl.from_pandas(df)
+
+    # Build per-row all-null indicators per sensor
+    row_null_cols = []
+    for sid in tof_sensor_ids:
+        sensor_cols = [c for c in df.columns if c.startswith(f"tof_{sid}_v")]
+        if not sensor_cols:
+            continue
+        row_flag_col = f"_row_all_null_tof_{sid}"
+        row_null_cols.append(row_flag_col)
+        pl_df = pl_df.with_columns(
+            pl.all_horizontal([pl.col(c).is_null() for c in sensor_cols]).alias(row_flag_col)
+        )
+
+    if not row_null_cols:
+        return df
+
+    # Aggregate to sequence-level missing flags (True if all rows are all-null)
+    agg_exprs = []
+    for col in row_null_cols:
+        # col pattern: _row_all_null_tof_{sid}
+        sid = col.split('_')[-1]
+        agg_exprs.append(pl.col(col).all().alias(f"tof_{sid}_missing"))
+
+    flags_df = pl_df.group_by('sequence_id', maintain_order=True).agg(agg_exprs)
+
+    # Cast flags to Float32 (0.0/1.0)
+    cast_map = {c: pl.Float32 for c in flags_df.columns if c != 'sequence_id'}
+    flags_df = flags_df.cast(cast_map)
+
+    # Join back per-row and drop temps
+    pl_df = pl_df.join(flags_df, on='sequence_id', how='left')
+    pl_df = pl_df.drop(row_null_cols)
+
+    return pl_df.to_pandas()
+
 def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     """
     根据指定的接口，使用统一的预处理器对训练集和验证集进行标准化。
@@ -556,37 +769,24 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
         if col not in zscore_cols:
             zscore_cols.append(col)
 
-    # 2. 识别需要自定义ToF缩放的特征
-    tof_cols = [col for col in X_train.columns if col.startswith('tof_')]
-    
-    # 3. 创建单一的、统一的预处理器 (ColumnTransformer)
-    transformer_list = []
-    
-    final_zscore_cols = [c for c in zscore_cols if c in X_train.columns]
-    if final_zscore_cols:
-        transformer_list.append(('zscore', StandardScaler(), final_zscore_cols))
-        
-    final_tof_cols = [c for c in tof_cols if c in X_train.columns]
-    if final_tof_cols:
-        transformer_list.append(('minmax', MinMaxScaler(), final_tof_cols))
-
-    scaler = ColumnTransformer(
-        transformers=transformer_list,
-        remainder='passthrough',
-        verbose_feature_names_out=False
+    # 2. 构建自定义带掩码的缩放器（Z-score 忽略无效 ROT/THM；TOF 使用 Min-Max 与之前一致）
+    scaler = MaskedStandardAndMinMaxScaler(
+        zscore_prefixes=zscore_prefixes,
+        demographic_cols=existing_demographic_cols,
     )
 
-    # 4. 在训练数据上拟合scaler
+    # 3. 在训练数据上拟合scaler
     print(f"\nNormalizing features...")
-    print(f"Applying Z-score to {len(final_zscore_cols)} columns.")
-    print(f"Applying custom ToF scale to {len(final_tof_cols)} columns.")
+    # 统计信息仅用于日志，实际列选择在自定义scaler内部完成
+    print(f"Applying Z-score (masked) to ~{len(zscore_cols)} columns (prefix based, excluding *_missing & tof_).")
+    print(f"Applying Min-Max to TOF columns (unchanged from previous training).")
     scaler.fit(X_train)
 
-    # 5. 使用已拟合的scaler转换训练集和验证集
+    # 4. 使用已拟合的scaler转换训练集和验证集
     X_train_transformed_np = scaler.transform(X_train).astype(np.float32)
     X_val_transformed_np = scaler.transform(X_val).astype(np.float32)
 
-    # 6. 获取新顺序的列名并重建DataFrame
+    # 5. 获取列名并重建DataFrame（顺序保持不变）
     feature_names = scaler.get_feature_names_out()
     X_train_normalized = pd.DataFrame(X_train_transformed_np, index=X_train.index, columns=feature_names)
     X_val_normalized = pd.DataFrame(X_val_transformed_np, index=X_val.index, columns=feature_names)
