@@ -1,6 +1,64 @@
 import torch
 import torch.nn as nn
 from . import MODELS  # Import registry
+import torch.nn.functional as F
+
+class MaskedBatchNorm1d(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1,
+                 affine=True, track_running_stats=True):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias   = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+        if self.track_running_stats:
+            self.register_buffer("running_mean", torch.zeros(num_features))
+            self.register_buffer("running_var",  torch.ones(num_features))
+            self.register_buffer("num_batches_tracked", torch.tensor(0, dtype=torch.long))
+        else:
+            self.register_parameter("running_mean", None)
+            self.register_parameter("running_var",  None)
+            self.register_parameter("num_batches_tracked", None)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
+        # x: (N, C, L), mask: (N, L) with 1 for valid, 0 for pad
+        m = mask.unsqueeze(1).to(x.dtype)                     # (N,1,L)
+        # 统计有效元素个数（对每个通道相同）
+        count = m.sum(dim=(0, 2))                              # (1,) scalar per-batch, but broadcast ok
+        count = count.clamp(min=1.0)
+
+        if self.training or not self.track_running_stats:
+            # 按通道在 N×L 的有效位置上统计
+            sum_ = (x * m).sum(dim=(0, 2))                    # (C,)
+            mean = sum_ / count
+
+            var = ((x - mean[None, :, None])**2 * m).sum(dim=(0, 2)) / count  # (C,)
+
+            if self.track_running_stats:
+                with torch.no_grad():
+                    self.running_mean.mul_(1 - self.momentum).add_(mean.detach(), alpha=self.momentum)
+                    self.running_var.mul_(1 - self.momentum).add_(var.detach(),   alpha=self.momentum)
+                    self.num_batches_tracked.add_(1)
+        else:
+            mean = self.running_mean
+            var  = self.running_var
+
+        x_hat = (x - mean[None, :, None]) / torch.sqrt(var[None, :, None] + self.eps)
+        if self.affine:
+            x_hat = x_hat * self.weight[None, :, None] + self.bias[None, :, None]
+
+        # 仍然把无效位置置零，防止后续层看到垃圾数值
+        return x_hat * m
+
 
 class MaskedSE1D(nn.Module):
     """
@@ -94,8 +152,8 @@ class CNN1D(nn.Module):
         in_channels = input_channels
         for i, (out_c, k) in enumerate(zip(filters, kernel_sizes)):
             # 使用 'same' padding 可以在不缩减序列长度的情况下更容易处理mask
-            layers.append(nn.Conv1d(in_channels, out_c, kernel_size=k, padding='same'))
-            self.bn_layers.append(nn.BatchNorm1d(out_c))
+            layers.append(nn.Conv1d(in_channels, out_c, kernel_size=k, padding='same', bias=False))
+            self.bn_layers.append(MaskedBatchNorm1d(out_c))
 
             # Optional SE per block
             if self.se_layers is not None:
@@ -104,7 +162,7 @@ class CNN1D(nn.Module):
             
             # Add 1x1 projection for residual connections when dimensions don't match
             if use_residual and in_channels != out_c:
-                self.residual_projections.append(nn.Conv1d(in_channels, out_c, kernel_size=1))
+                self.residual_projections.append(nn.Conv1d(in_channels, out_c, kernel_size=1, stride=1, padding=0, bias=False))
             else:
                 self.residual_projections.append(None)
             
@@ -179,7 +237,7 @@ class CNN1D(nn.Module):
                 residual = x
             
             x = conv(x)
-            x = self.bn_layers[i](x)
+            x = self.bn_layers[i](x, mask)
 
             # Apply SE before residual addition (SENet-style)
             if self.se_layers is not None:

@@ -72,6 +72,64 @@ from data_utils.data_preprocessing import prepare_data_kfold_multimodal, prepare
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
 os.makedirs(WEIGHT_DIR, exist_ok=True)
 # ... (calculate_composite_weights_18_class 和 competition_metric 保持不变) ...
+
+from models.cnn1d import MaskedBatchNorm1d
+from models.cnn2d import MaskedBatchNorm2d
+
+def build_param_groups(model, base_wd, layer_lrs=None):
+    # 1) 归类需要 no_decay 的模块类型 + 名称关键字
+    no_decay_mods = (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm,
+                     MaskedBatchNorm1d, MaskedBatchNorm2d)
+    no_decay_name_keys = ("bias", "bn.weight", "BatchNorm.weight",
+                          "LayerNorm.weight", "layer_norm.weight",
+                          "pos_embed", "pos_encoding", "position", "embeddings",
+                          "cls_token", "sensor_gate")  # 视情况保留 sensor_gate
+
+    # 2) 收集 no_decay 参数集合（按对象身份判断）
+    no_decay_params = set()
+    for m in model.modules():
+        if isinstance(m, no_decay_mods):
+            for p in m.parameters(recurse=False):
+                if p.requires_grad:
+                    no_decay_params.add(p)
+    for n, p in model.named_parameters():
+        if p.requires_grad and any(k in n for k in no_decay_name_keys):
+            no_decay_params.add(p)
+
+    # 3) 分支映射（保持你原有的命名）
+    branch_map = {
+        'imu': model.imu_branch,
+        'thm': getattr(model, 'thm_branch', None),
+        'tof': getattr(model, 'tof_branch', None),
+        'spec': getattr(model, 'spec_branch', None),
+        'mlp': model.mlp_branch,
+        'fusion': model.classifier_head,
+    }
+
+    groups = {}
+
+    def add_param(p, lr, wd, key):
+        if key not in groups:
+            groups[key] = {'params': [], 'lr': lr, 'weight_decay': wd, 'name': key}
+        groups[key]['params'].append(p)
+
+    if layer_lrs:
+        for name, module in branch_map.items():
+            if module is None:
+                continue
+            if name not in layer_lrs:
+                raise ValueError(f"Learning rate for active branch '{name}' not specified in 'layer_lrs'.")
+            lr = layer_lrs[name]
+            for p in module.parameters():
+                if not p.requires_grad:
+                    continue
+                wd = 0.0 if p in no_decay_params else base_wd
+                key = f"{name}_{'no_decay' if wd == 0.0 else 'decay'}"
+                add_param(p, lr, wd, key)
+
+    return list(groups.values())
+
+
 def calculate_composite_weights_18_class(y_18_class_series: pd.Series, 
                                          label_encoder_18_class: LabelEncoder, 
                                          target_gesture_names: list):
@@ -400,17 +458,11 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
                     # This is a safeguard. If a branch exists but its LR is not specified, raise an error.
                     raise ValueError(f"Learning rate for active branch '{name}' not specified in 'layer_lrs'.")
         
-        optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
-
-    else:
-        # Fallback for backward compatibility or simple training runs
-        print("Using a single learning rate for the entire model.")
-        # Strict: require start_lr in scheduler_cfg if single LR path is used
-        start_lr = scheduler_cfg['start_lr']
+        param_groups = build_param_groups(model, base_wd=weight_decay, layer_lrs=layer_lrs if layer_lrs else None)
         try:
-            optimizer = optim.AdamW(param_groups, weight_decay=weight_decay, fused=True)
+            optimizer = optim.AdamW(param_groups, foreach=True)
         except TypeError:
-            optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+            optimizer = optim.AdamW(param_groups)
 
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
     print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
@@ -475,10 +527,30 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         history['learning_rate'].append([g['lr'] for g in optimizer.param_groups])
         
         epoch_time = time.time() - start_time
-        
-        if 'name' not in optimizer.param_groups[0]: lr_info = f"LR: {optimizer.param_groups[0]['lr']:.6f}"
-        else: lr_info = "LRs: " + ", ".join([f"{group['name']}={group['lr']:.2e}" for group in optimizer.param_groups])
-        
+
+
+        def _format_lr_info(optimizer):
+            # 没有命名分组时，退化为单LR显示
+            first = optimizer.param_groups[0]
+            if 'name' not in first:
+                return f"LR: {first['lr']:.6f}"
+
+            # 仅展示 decay 组（隐藏 *_no_decay），并按“分支名”去重
+            visible = {}
+            for g in optimizer.param_groups:
+                name = g.get('name')
+                if not name:
+                    continue
+                if 'no_decay' in name:   # 关键：隐藏 no_decay
+                    continue
+                branch = name.rsplit('_', 1)[0]  # 去掉结尾的 "_decay"
+                visible[branch] = g['lr']        # 同一分支只保留一个LR
+
+            if not visible:  # 兜底
+                return f"LR: {first['lr']:.6f}"
+            return "LRs: " + ", ".join([f"{b}={lr:.2e}" for b, lr in visible.items()])
+        lr_info = _format_lr_info(optimizer)
+
         print(f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): Train Loss: {train_loss:.4f}, Train Score: {train_score:.4f} | Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | {lr_info}')
         
         if patience_counter >= patience:
@@ -582,7 +654,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=512,
             shuffle=False,
             num_workers=num_workers,
             pin_memory=True,
@@ -599,7 +671,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         # 编译模型以加快速度
         # try:
         #     # 最后一个batch不满，数据形状不固定，启用dynamic
-        #     model = torch.compile(model, mode='default', dynamic=True)
+        #     model = torch.compile(model, mode='reduce-overhead', dynamic=True)
         # except Exception as e:
         #     print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
         criterion = criterion.to(device)
