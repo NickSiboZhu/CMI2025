@@ -34,7 +34,7 @@ WEIGHT_DIR = os.path.join(BASE_DIR, "weights")
 
 # ------------------ 自定义模块 ------------------
 from models.multimodality import MultimodalityModel
-from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS, generate_spectrogram, generate_feature_columns
+from data_utils.data_preprocessing import pad_sequences, feature_engineering, STATIC_FEATURE_COLS, generate_spectrogram, generate_feature_columns, add_tof_missing_flags
 from data_utils.tof_utils import interpolate_tof
 
 # ------------------ 全局资源加载 ------------------
@@ -174,6 +174,8 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
         print(f"🧬 Preprocessing with variant: {variant}")
 
     if variant != "imu":
+        # Compute TOF missing flags BEFORE any interpolation/fill
+        seq_df = add_tof_missing_flags(seq_df)
         seq_df = interpolate_tof(seq_df)
 
     processed_df, feature_cols = feature_engineering(seq_df)
