@@ -60,6 +60,34 @@ def process_and_get_stats(group, spec_params, max_length):
             
     return count, total_sum, total_sum_sq
 
+def _calculate_jerk_and_angacc_polars(group_df: pl.DataFrame, dt=1/10) -> pl.DataFrame:
+    """
+    [Internal Helper] Compute per-row magnitudes:
+      - linear_acc_jerk_mag: d(linear_acc)/dt magnitude
+      - angular_acc_mag:     d(angular_vel)/dt magnitude
+    """
+    n = group_df.height
+    if n == 0:
+        return pl.DataFrame({
+            'linear_acc_jerk_mag': np.array([], dtype=np.float32),
+            'angular_acc_mag':     np.array([], dtype=np.float32),
+        }).cast(pl.Float32)
+
+    lin = group_df.select(['linear_acc_x', 'linear_acc_y', 'linear_acc_z']).to_numpy()
+    ang = group_df.select(['angular_vel_x', 'angular_vel_y', 'angular_vel_z']).to_numpy()
+
+    # Prepend first row so输出长度与输入一致
+    dlin = np.diff(lin, axis=0, prepend=lin[:1])
+    dang = np.diff(ang, axis=0, prepend=ang[:1])
+
+    jerk_mag = (np.linalg.norm(dlin, axis=1) / dt).astype(np.float32)
+    ang_acc_mag = (np.linalg.norm(dang, axis=1) / dt).astype(np.float32)
+
+    return pl.DataFrame({
+        'linear_acc_jerk_mag': jerk_mag,
+        'angular_acc_mag':     ang_acc_mag,
+    }).cast(pl.Float32)
+
 def _remove_gravity_from_acc_polars(group_df: pl.DataFrame) -> pl.DataFrame:
     """
     [Internal Helper] Polars-native version of remove_gravity_from_acc.
@@ -246,6 +274,8 @@ def feature_engineering(train_df: pd.DataFrame):
 
     angular_dist_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_distance_polars)
     pl_df = pl.concat([pl_df, angular_dist_results], how='horizontal')
+    jerk_angacc_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_jerk_and_angacc_polars)
+    pl_df = pl.concat([pl_df, jerk_angacc_results], how='horizontal')
     
     # --- 步骤 4: 定义最终特征列并进行最终清理 ---
     # --- MODIFIED: Removed jerk and snap features from the list ---
@@ -255,7 +285,8 @@ def feature_engineering(train_df: pd.DataFrame):
         'linear_acc_x', 'linear_acc_y', 'linear_acc_z',  
         'linear_acc_mag',
         'angular_vel_x', 'angular_vel_y', 'angular_vel_z',  
-        'angular_distance'
+        'angular_distance',
+        'linear_acc_jerk_mag', 'angular_acc_mag'
     ] 
     # Exclude *_missing flags from time-series feature list
     tof_thm_cols = [
@@ -384,6 +415,17 @@ def load_and_preprocess_data(variant: str = "full"):
     # --- Data loading and merging ---
     train_df = pd.read_csv(train_path)
     demographics_df = pd.read_csv(demographics_path)
+    BAD_SUBJECTS = {"SUBJ_045235", "SUBJ_019262"}
+    subject_col = 'subject' if 'subject' in train_df.columns else (
+        'subject_id' if 'subject_id' in train_df.columns else None
+    )
+    if subject_col is None:
+        raise KeyError("Neither 'subject' nor 'subject_id' column found; cannot filter subjects.")
+    
+    before_rows = len(train_df)
+    train_df = train_df[~train_df[subject_col].isin(BAD_SUBJECTS)].copy()
+    removed_rows = before_rows - len(train_df)
+    print(f"🧹 Removed {removed_rows} rows from bad subjects: {sorted(BAD_SUBJECTS)}")
     train_df = train_df.merge(demographics_df, on='subject', how='left')
     print(f"Train data shape before FE: {train_df.shape}")
 
