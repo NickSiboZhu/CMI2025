@@ -33,37 +33,49 @@ class MaskedBatchNorm2d(nn.Module):
             self.register_parameter("running_var",  None)
             self.register_parameter("num_batches_tracked", None)
 
-    def forward(self, x: torch.Tensor, time_mask: torch.Tensor = None):
-        # x: (N, C, H, W); time_mask: (N, W) 取值{0,1}
+    def forward(self, x: torch.Tensor, time_mask: torch.Tensor = None, channel_mask: torch.Tensor = None):
+        # x: (N, C, H, W)
+        # time_mask:    (N, W)  取值{0,1} —— 用于掩蔽 padding 的时间步
+        # channel_mask: (N, C)  取值{0,1} —— 用于掩蔽整通道（例如缺失的 TOF 传感器）
         N, C, H, W = x.shape
         if time_mask is None:
-            m = torch.ones(N, 1, 1, W, device=x.device, dtype=torch.float32)
+            m_t = torch.ones(N, 1, 1, W, device=x.device, dtype=torch.float32)
         else:
-            m = time_mask.view(N, 1, 1, W).to(torch.float32)   # 统计固定 float32
+            m_t = time_mask.view(N, 1, 1, W).to(torch.float32)
 
-        # 有效元素个数（标量张量）：时间掩码的有效步数 × H
-        denom = (m.sum() * float(H)).clamp_(min=1.0)           # 仍为张量，不用 .item()
+        if channel_mask is None:
+            m_c = torch.ones(N, C, 1, 1, device=x.device, dtype=torch.float32)
+        else:
+            m_c = channel_mask.view(N, C, 1, 1).to(torch.float32)
+
+        # 组合掩码：按样本-通道-时间的有效位置统计，空间高度 H 无掩码
+        M = m_t * m_c  # (N, C, 1, W)
+
+        # 每个通道的有效元素数（标量/通道）：sum_{N,W}(M) × H
+        denom = (M.sum(dim=(0, 2, 3)) * float(H)).clamp_(min=1.0)  # (C,)
 
         x_f32 = x.to(torch.float32)
-        sum_  = (x_f32 * m).sum(dim=(0, 2, 3))                 # (C,)
-        mean  = sum_ / denom                                   # (C,)
-        var   = ((x_f32 - mean.view(1, C, 1, 1))**2 * m).sum(dim=(0, 2, 3)) / denom
+        sum_  = (x_f32 * M).sum(dim=(0, 2, 3))                     # (C,)
+        mean  = sum_ / denom                                       # (C,)
+        var   = ((x_f32 - mean.view(1, C, 1, 1))**2 * M).sum(dim=(0, 2, 3)) / denom
 
         if self.training and self.track_running_stats:
             # 纯张量条件：有效比例 = denom / (N*H*W)
             total_pos   = torch.tensor(N * H * W, dtype=torch.float32, device=x.device)
-            valid_ratio = (denom / total_pos)                  # 标量张量
-            cond        = (valid_ratio > 1e-3).to(torch.float32)   # 0/1
+            # denom 是 (C,), 计算每通道的有效比例
+            valid_ratio = (denom / total_pos)                        # (C,)
+            cond        = (valid_ratio > 1e-3).to(torch.float32)     # (C,)
 
             # 纯张量更新，避免 Python 调用导致的 CALL 字节码
             with torch.no_grad():
                 mom = torch.tensor(self.momentum, dtype=torch.float32, device=x.device)
                 new_rm = self.running_mean * (1 - mom) + mean * mom
                 new_rv = self.running_var  * (1 - mom) + var  * mom
-                # cond==0 时保持原值；cond==1 时更新
+                # cond==0 时保持原值；cond==1 时更新（逐通道）
                 self.running_mean.copy_(torch.lerp(self.running_mean, new_rm, cond))
                 self.running_var.copy_( torch.lerp(self.running_var,  new_rv, cond))
-                self.num_batches_tracked.add_(cond.to(torch.long))
+                # 若至少一个通道有效，则计数 +1
+                self.num_batches_tracked.add_( (cond.max() > 0).to(torch.long) )
 
         ref_mean = mean if (self.training or not self.track_running_stats) else self.running_mean
         ref_var  = var  if (self.training or not self.track_running_stats) else self.running_var
@@ -73,7 +85,7 @@ class MaskedBatchNorm2d(nn.Module):
             x_hat = x_hat * self.weight.view(1, C, 1, 1).to(x_hat.dtype) + self.bias.view(1, C, 1, 1).to(x_hat.dtype)
 
         # cast 回输入 dtype，并零掉无效时间位
-        return x_hat.to(x.dtype) * m.to(x.dtype)
+        return x_hat.to(x.dtype) * M.to(x.dtype)
 
 @MODELS.register_module()
 class SpectrogramCNN(nn.Module):
@@ -134,7 +146,8 @@ class SpectrogramCNN(nn.Module):
             residual = x if self.use_residual else None
             
             x = conv(x)
-            x = self.bn_layers[i](x, time_mask)
+            # Spectrograms没有按通道的缺失掩码，这里传 None
+            x = self.bn_layers[i](x, time_mask, None)
             
             if self.use_residual:
                 if self.residual_projections[i] is not None:
@@ -450,7 +463,7 @@ class TOF2DCNN(nn.Module):
         # Store the actual output dimension
         self.out_features = self.last_conv_channels  # Use last conv channel count as output
     
-    def forward(self, tof_grids, frame_mask: torch.Tensor = None):
+    def forward(self, tof_grids, frame_mask: torch.Tensor = None, channel_mask: torch.Tensor = None):
         """
         Forward pass for TOF 2D CNN with optional residual connections.
         
@@ -471,6 +484,10 @@ class TOF2DCNN(nn.Module):
             else:
                 x = x * self.sensor_gate
         
+        # Zero-out missing sensor channels at input according to channel_mask (shape: (BL, C_in))
+        if channel_mask is not None:
+            x = x * channel_mask.view(x.size(0), self.input_channels, 1, 1)
+        
         # Process through conv blocks with optional residual connections
         for i in range(len(self.conv_layers)):
             if self.use_residual:
@@ -488,7 +505,14 @@ class TOF2DCNN(nn.Module):
                 tm = frame_mask.view(-1, 1).float().expand(-1, W)
 
             # Apply masked BN
-            x = self.bn_layers[i](x, tm)
+            # BN 仅按时间掩码统计；传感器缺失已在输入处置零
+            x = self.bn_layers[i](x, tm, None)
+
+            # 构造帧级 4D 掩码，用于在残差与激活后强制零化整帧无效样本
+            if frame_mask is None:
+                fm4d = None
+            else:
+                fm4d = frame_mask.view(-1, 1, 1, 1).float()
 
             # Apply SE before residual addition (SENet-style)
             if self.se_layers is not None:
@@ -499,9 +523,15 @@ class TOF2DCNN(nn.Module):
                 if self.residual_projections[i] is not None:
                     # Project residual to match output dimensions
                     residual = self.residual_projections[i](residual)
+                # 仅在有效帧上引入残差，避免无效帧泄漏
+                if fm4d is not None:
+                    residual = residual * fm4d
                 x = x + residual
             
             x = self.activation(x)
+            # 激活后再次施加帧级掩码，确保无效帧保持为零
+            if fm4d is not None:
+                x = x * fm4d
             
             # Apply pooling (except for last layer)
             if i < len(self.conv_layers) - 1:
@@ -617,7 +647,7 @@ class TemporalTOF2DCNN(nn.Module):
         
         # Note: No projection layer - direct temporal encoder output is used
     
-    def forward(self, tof_sequence, mask=None):
+    def forward(self, tof_sequence, mask=None, channel_mask: torch.Tensor = None):
         """
         Forward pass with unified temporal encoder.
         
@@ -641,7 +671,17 @@ class TemporalTOF2DCNN(nn.Module):
         frame_mask = mask.reshape(batch_size * seq_len)  # (BL,)
 
         # Apply 2D CNN to all timesteps (masked BN inside)
-        spatial_features = self.spatial_cnn(tof_grids_flat, frame_mask=frame_mask)  # (BL, out_features)
+        # 将 per-sample 的通道掩码复制到每个时间步： (B, C) -> (BL, C)
+        if channel_mask is not None:
+            channel_mask_flat = channel_mask.repeat_interleave(seq_len, dim=0)  # (BL, C)
+        else:
+            channel_mask_flat = None
+
+        spatial_features = self.spatial_cnn(
+            tof_grids_flat,
+            frame_mask=frame_mask,
+            channel_mask=channel_mask_flat,
+        )  # (BL, out_features)
         
         # Reshape back to sequential format
         spatial_features = spatial_features.view(batch_size, seq_len, self.spatial_out_dim)  # (B, L, C)

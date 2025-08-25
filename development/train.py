@@ -336,13 +336,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
     all_preds, all_targets = [], []
     
     # --- MODIFIED: Unpack spec_data from dataloader ---
-    for (imu_data, thm_data, tof_data, spec_data, static_data, mask), target, sample_weights in dataloader:
+    for (imu_data, thm_data, tof_data, spec_data, static_data, mask, tof_ch_mask, thm_ch_mask, imu_ch_mask), target, sample_weights in dataloader:
         imu_data  = imu_data.to(device, non_blocking=True)
         thm_data  = thm_data.to(device, non_blocking=True)
         tof_data  = tof_data.to(device, non_blocking=True)
         spec_data = spec_data.to(device, non_blocking=True)
         static_data = static_data.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
+        tof_ch_mask = tof_ch_mask.to(device, non_blocking=True)
+        thm_ch_mask = thm_ch_mask.to(device, non_blocking=True)
+        imu_ch_mask = imu_ch_mask.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
         sample_weights = sample_weights.to(device, non_blocking=True)
 
@@ -360,12 +363,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
                 spec_data = lam * spec_data + (1 - lam) * spec_data[rand_index]
                 static_data = lam * static_data + (1 - lam) * static_data[rand_index]
                 mask = torch.max(mask, mask[rand_index])
+                # OR-combine channel masks (keep a sensor/channel active if present in either)
+                tof_ch_mask = torch.max(tof_ch_mask, tof_ch_mask[rand_index])
+                if thm_ch_mask.numel() > 0:
+                    thm_ch_mask = torch.max(thm_ch_mask, thm_ch_mask[rand_index])
+                if imu_ch_mask.numel() > 0:
+                    imu_ch_mask = torch.max(imu_ch_mask, imu_ch_mask[rand_index])
 
                 target_a, target_b = target, target[rand_index]
                 weights_a, weights_b = sample_weights, sample_weights[rand_index]
 
                 # --- MODIFIED: Pass spec_data to the model ---
-                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask)
+                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask, tof_channel_mask=tof_ch_mask, thm_channel_mask=thm_ch_mask, imu_channel_mask=imu_ch_mask)
                 
                 loss_a = criterion(output, target_a) * weights_a
                 loss_b = criterion(output, target_b) * weights_b
@@ -373,7 +382,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
 
             else:
                 # --- MODIFIED: Pass spec_data to the model ---
-                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask)
+                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask, tof_channel_mask=tof_ch_mask, thm_channel_mask=thm_ch_mask, imu_channel_mask=imu_ch_mask)
                 loss = (criterion(output, target) * sample_weights).mean()
         
         scaler.scale(loss).backward()
@@ -396,19 +405,22 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     val_criterion = nn.CrossEntropyLoss().to(device)
     
     with torch.no_grad():
-        # --- MODIFIED: Unpack spec_data from dataloader ---
-        for (imu_data, thm_data, tof_data, spec_data, static_data, mask), target, _ in dataloader:
+        # --- MODIFIED: Unpack spec_data and channel masks from dataloader ---
+        for (imu_data, thm_data, tof_data, spec_data, static_data, mask, tof_ch_mask, thm_ch_mask, imu_ch_mask), target, _ in dataloader:
             imu_data  = imu_data.to(device, non_blocking=True)
             thm_data  = thm_data.to(device, non_blocking=True)
             tof_data  = tof_data.to(device, non_blocking=True)
             spec_data = spec_data.to(device, non_blocking=True)
             static_data = static_data.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
+            tof_ch_mask = tof_ch_mask.to(device, non_blocking=True)
+            thm_ch_mask = thm_ch_mask.to(device, non_blocking=True)
+            imu_ch_mask = imu_ch_mask.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             
             with amp.autocast(device_type=device.type, enabled=use_amp):
                 # --- MODIFIED: Pass spec_data to the model ---
-                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask)
+                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask, tof_channel_mask=tof_ch_mask, thm_channel_mask=thm_ch_mask, imu_channel_mask=imu_ch_mask)
                 loss = val_criterion(output, target)
             
             total_loss += loss.item()
@@ -628,6 +640,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         train_dataset = MultimodalDataset(
             fold['X_train_imu'], fold['X_train_thm'], fold['X_train_tof'], fold['X_train_spec'],
             fold['X_train_static'], fold['y_train'], mask=fold['train_mask'],
+            X_tof_channel_mask=fold.get('X_train_tof_channel_mask'),
+            X_thm_channel_mask=fold.get('X_train_thm_channel_mask'),
+            X_imu_channel_mask=fold.get('X_train_imu_channel_mask'),
             class_weight_dict=class_weight_dict, spec_stats=spec_stats, augment=True,
         )
         val_dataset = MultimodalDataset(
@@ -638,6 +653,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             fold['X_val_static'],
             fold['y_val'],
             mask=fold['val_mask'],
+            X_tof_channel_mask=fold.get('X_val_tof_channel_mask'),
+            X_thm_channel_mask=fold.get('X_val_thm_channel_mask'),
+            X_imu_channel_mask=fold.get('X_val_imu_channel_mask'),
             class_weight_dict=class_weight_dict,
             spec_stats=spec_stats
         )

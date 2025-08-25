@@ -247,6 +247,41 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 
             static_arr = X_scaled_unpadded[0:1, static_idx]
             tof_arr, thm_arr, imu_arr = X_scaled_unpadded[:, tof_idx], X_scaled_unpadded[:, thm_idx], X_scaled_unpadded[:, imu_idx]
+
+            # --- Build per-sensor TOF channel mask from *_missing flags (1=missing -> 0 valid) ---
+            tof_sensor_ids = []
+            for c in scaled_feature_names:
+                if c.startswith('tof_') and c.endswith('_missing') and c.count('_') == 2:
+                    try:
+                        sensor_id = int(c.split('_')[1])
+                        if sensor_id not in tof_sensor_ids:
+                            tof_sensor_ids.append(sensor_id)
+                    except Exception:
+                        pass
+            tof_sensor_ids = sorted(tof_sensor_ids)
+            if len(tof_sensor_ids) == 0:
+                # fallback: detect by pixels
+                seen = set()
+                for c in scaled_feature_names:
+                    if c.startswith('tof_') and '_v' in c and not c.endswith('_missing'):
+                        try:
+                            sensor_id = int(c.split('_')[1])
+                            seen.add(sensor_id)
+                        except Exception:
+                            pass
+                tof_sensor_ids = sorted(list(seen))
+
+            ch_mask_vals = []
+            for tof_sid in tof_sensor_ids:
+                flag = f"tof_{tof_sid}_missing"
+                if flag in scaled_feature_names:
+                    flag_idx = scaled_feature_names.index(flag)
+                    # flags are static per sequence; take first row
+                    valid = 1.0 - float(X_scaled_unpadded[0, flag_idx])
+                else:
+                    valid = 1.0
+                ch_mask_vals.append(valid)
+            tof_channel_mask_arr = np.array(ch_mask_vals, dtype=np.float32)[np.newaxis, :]
             spec_source_arr = X_scaled_unpadded[:, spec_idx]
 
             # 3. 对时域数据进行 Padding (strict length from trained model)
@@ -284,9 +319,49 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             xb_spec = torch.from_numpy(X_spec).to(DEVICE)
             xb_static = torch.from_numpy(static_arr).to(DEVICE)
             xb_mask = torch.from_numpy(imu_mask).to(DEVICE)
+            xb_tof_ch_mask = torch.from_numpy(tof_channel_mask_arr).to(DEVICE)
+
+            # Build THM channel mask from thm_{sid}_missing
+            thm_sensor_ids_inf = []
+            for c in scaled_feature_names:
+                if c.startswith('thm_') and c.endswith('_missing'):
+                    try:
+                        sensor_id = int(c.split('_')[1])
+                        thm_sensor_ids_inf.append(sensor_id)
+                    except Exception:
+                        pass
+            thm_sensor_ids_inf = sorted(list(set(thm_sensor_ids_inf)))
+            thm_mask_vals = []
+            for thm_sid in thm_sensor_ids_inf:
+                flag = f"thm_{thm_sid}_missing"
+                if flag in scaled_feature_names:
+                    idx_flag = scaled_feature_names.index(flag)
+                    thm_mask_vals.append(1.0 - float(X_scaled_unpadded[0, idx_flag]))
+                else:
+                    thm_mask_vals.append(1.0)
+            thm_channel_mask_arr = np.array(thm_mask_vals, dtype=np.float32)[np.newaxis, :] if len(thm_mask_vals) > 0 else np.ones((1,0), dtype=np.float32)
+            xb_thm_ch_mask = torch.from_numpy(thm_channel_mask_arr).to(DEVICE)
+
+            # Build IMU rot-only channel mask from rot_missing
+            imu_feature_names_inf = imu_cols
+            rot_fields_inf = ['rot_w','rot_x','rot_y','rot_z']
+            imu_rot_mask = np.ones((1, len(imu_feature_names_inf)), dtype=np.float32)
+            if 'rot_missing' in scaled_feature_names:
+                idx_rm = scaled_feature_names.index('rot_missing')
+                if float(X_scaled_unpadded[0, idx_rm]) == 1.0:
+                    for i, name in enumerate(imu_feature_names_inf):
+                        if name in rot_fields_inf:
+                            imu_rot_mask[0, i] = 0.0
+            xb_imu_ch_mask = torch.from_numpy(imu_rot_mask).to(DEVICE)
 
             # 6. 使用混合模型进行前向传播
-            probs = torch.softmax(model(xb_imu, xb_thm, xb_tof, xb_spec, xb_static, mask=xb_mask), dim=1).cpu().numpy()
+            probs = torch.softmax(model(
+                xb_imu, xb_thm, xb_tof, xb_spec, xb_static,
+                mask=xb_mask,
+                tof_channel_mask=xb_tof_ch_mask,
+                thm_channel_mask=xb_thm_ch_mask,
+                imu_channel_mask=xb_imu_ch_mask
+            ), dim=1).cpu().numpy()
             
             if probs_sum is None: probs_sum = probs
             else: probs_sum += probs

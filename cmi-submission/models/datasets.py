@@ -67,6 +67,7 @@ class MultimodalDataset(Dataset):
     """
     
     def __init__(self, X_imu, X_thm, X_tof, X_spec, X_static, y, mask, 
+                 X_tof_channel_mask=None, X_thm_channel_mask=None, X_imu_channel_mask=None,
                  class_weight_dict=None, spec_stats=None, augment=False, aug_params=None):
         """
         初始化数据集。
@@ -88,6 +89,10 @@ class MultimodalDataset(Dataset):
         self.X_static = X_static
         self.y = y
         self.mask = mask if mask is not None else np.ones((len(y), X_imu.shape[1]), dtype=np.float32)
+        # --- TOF per-sensor channel mask (shape: [N, C]) ---
+        self.X_tof_channel_mask = X_tof_channel_mask
+        self.X_thm_channel_mask = X_thm_channel_mask
+        self.X_imu_channel_mask = X_imu_channel_mask
         
         # --- 存储语谱图统计量 ---
         self.spec_stats = spec_stats
@@ -174,7 +179,10 @@ class MultimodalDataset(Dataset):
             torch.tensor(tof_data, dtype=torch.float32),
             torch.tensor(spec_data, dtype=torch.float32),
             torch.tensor(static_data, dtype=torch.float32),
-            torch.tensor(mask_data, dtype=torch.float32)
+            torch.tensor(mask_data, dtype=torch.float32),
+            torch.tensor(self.X_tof_channel_mask[idx] if self.X_tof_channel_mask is not None else np.ones((self.X_tof.shape[2]//64 if self.X_tof is not None else 5,), dtype=np.float32), dtype=torch.float32),
+            torch.tensor(self.X_thm_channel_mask[idx] if self.X_thm_channel_mask is not None else np.ones((self.X_thm.shape[2] if self.X_thm is not None else 0,), dtype=np.float32), dtype=torch.float32),
+            torch.tensor(self.X_imu_channel_mask[idx] if self.X_imu_channel_mask is not None else np.ones((self.X_imu.shape[2] if self.X_imu is not None else 0,), dtype=np.float32), dtype=torch.float32)
         )
         target = torch.tensor(label, dtype=torch.long)
         weight = self.sample_weights[idx]

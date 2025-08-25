@@ -141,19 +141,22 @@ class MultimodalityModel(nn.Module):
     # --- MODIFIED: Updated forward pass signature ---
     def forward(self, imu_input: torch.Tensor, thm_input: torch.Tensor, 
                 tof_input: torch.Tensor, spec_input: torch.Tensor, 
-                static_input: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+                static_input: torch.Tensor, mask: torch.Tensor = None,
+                tof_channel_mask: torch.Tensor = None,
+                thm_channel_mask: torch.Tensor = None,
+                imu_channel_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Defines the forward pass logic of the hybrid multimodal fusion model.
         """
         # 1. Process 1D time-domain data
-        imu_features = self.imu_branch(imu_input, mask=mask)
-        thm_features = self.thm_branch(thm_input, mask=mask) if self.use_thm else None
+        imu_features = self.imu_branch(imu_input, mask=mask, channel_mask=imu_channel_mask)
+        thm_features = self.thm_branch(thm_input, mask=mask, channel_mask=thm_channel_mask) if self.use_thm else None
         
         # 2. Process 2D time-frequency data (Spectrograms)
         spec_features = self.spec_branch(spec_input) if self.use_spec else None
         
         # 3. Process 2D spatial data (TOF)
-        tof_features = self.tof_branch(tof_input, mask=mask) if self.use_tof else None
+        tof_features = self.tof_branch(tof_input, mask=mask, channel_mask=tof_channel_mask) if self.use_tof else None
         
         # 4. Process static data
         mlp_features = self.mlp_branch(static_input)

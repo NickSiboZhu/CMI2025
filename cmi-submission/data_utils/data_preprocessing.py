@@ -597,7 +597,7 @@ class MaskedStandardAndMinMaxScaler(BaseEstimator, TransformerMixin):
     - Outputs float32 arrays to match the rest of the pipeline.
     """
 
-    def __init__(self, zscore_prefixes=None, demographic_cols=None, invalid_fill_value: float = -12.0, invalid_fill_value_tof: float = -1.0):
+    def __init__(self, zscore_prefixes=None, demographic_cols=None, invalid_fill_value: float = -6.0, invalid_fill_value_tof: float = -1):
         self.zscore_prefixes = zscore_prefixes or ['acc_', 'rot_', 'thm_', 'linear_', 'angular_']
         self.demographic_cols = demographic_cols or ['age', 'height_cm', 'shoulder_to_wrist_cm', 'elbow_to_wrist_cm']
         self.invalid_fill_value = float(invalid_fill_value)
@@ -942,6 +942,7 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
         # --- 处理训练集 ---
         grouped_train = X_train_norm.groupby('sequence_id')
         train_static_list, train_imu_list, train_thm_list, train_tof_list, train_spec_list = [], [], [], [], []
+        train_tof_channel_masks = []  # (num_sequences, num_sensors)
 
         for sid in train_sids:
             group = grouped_train.get_group(sid)
@@ -949,6 +950,18 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
             train_imu_list.append(group[imu_cols].values)
             train_thm_list.append(group[thm_cols].values) # [REVERTED]
             train_tof_list.append(group[tof_cols].values) # [REVERTED]
+            # --- Build per-sequence TOF channel mask from tof_{sid}_missing (1=missing -> mask=0) ---
+            tof_sensor_ids = get_sensor_config(all_feature_cols)['tof_sensor_ids']
+            ch_mask = []
+            for tof_sid in tof_sensor_ids:
+                flag_col = f"tof_{tof_sid}_missing"
+                if flag_col in group.columns:
+                    # 同一序列内该列恒定，取第一行即可
+                    valid = 1.0 - float(group[flag_col].iloc[0])
+                else:
+                    valid = 1.0
+                ch_mask.append(valid)
+            train_tof_channel_masks.append(np.array(ch_mask, dtype=np.float32))
             
             sequence_spectrograms = []
             for col in spec_source_cols:
@@ -965,11 +978,42 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
         X_train_thm, _ = pad_sequences(train_thm_list, max_length=max_length)
         X_train_tof, _ = pad_sequences(train_tof_list, max_length=max_length)
         X_train_spec = np.array(train_spec_list, dtype=np.float32)
+        X_train_tof_channel_mask = np.stack(train_tof_channel_masks, axis=0).astype(np.float32) if len(train_tof_channel_masks) > 0 else None
+        # --- Build THM per-sensor channel masks (1=valid, 0=missing) ---
+        thm_sensor_ids = get_sensor_config(all_feature_cols)['thm_sensor_ids']
+        train_thm_channel_masks = []
+        for sid in train_sids:
+            group = grouped_train.get_group(sid)
+            ch_mask = []
+            for thm_id in thm_sensor_ids:
+                flag_col = f"thm_{thm_id}_missing"
+                if flag_col in group.columns:
+                    valid = 1.0 - float(group[flag_col].iloc[0])
+                else:
+                    valid = 1.0
+                ch_mask.append(valid)
+            train_thm_channel_masks.append(np.array(ch_mask, dtype=np.float32))
+        X_train_thm_channel_mask = np.stack(train_thm_channel_masks, axis=0).astype(np.float32) if len(train_thm_channel_masks) > 0 else None
+        # --- Build IMU per-channel mask for rot_* only (1=valid, 0=missing when rot_missing==1) ---
+        imu_feature_names = [c for c in imu_cols]
+        rot_fields = ['rot_w','rot_x','rot_y','rot_z']
+        imu_rot_indices = [i for i, c in enumerate(imu_feature_names) if c in rot_fields]
+        train_imu_channel_masks = []
+        for sid in train_sids:
+            group = grouped_train.get_group(sid)
+            # default all ones
+            ch_mask = np.ones((len(imu_feature_names),), dtype=np.float32)
+            if 'rot_missing' in group.columns and float(group['rot_missing'].iloc[0]) == 1.0:
+                for idx in imu_rot_indices:
+                    ch_mask[idx] = 0.0
+            train_imu_channel_masks.append(ch_mask)
+        X_train_imu_channel_mask = np.stack(train_imu_channel_masks, axis=0).astype(np.float32)
 
 
         # --- 处理验证集 ---
         grouped_val = X_val_norm.groupby('sequence_id')
         val_static_list, val_imu_list, val_thm_list, val_tof_list, val_spec_list = [], [], [], [], []
+        val_tof_channel_masks = []
 
         for sid in val_sids:
             group = grouped_val.get_group(sid)
@@ -977,6 +1021,17 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
             val_imu_list.append(group[imu_cols].values)
             val_thm_list.append(group[thm_cols].values) # [REVERTED]
             val_tof_list.append(group[tof_cols].values) # [REVERTED]
+            # --- Build per-sequence TOF channel mask for validation ---
+            tof_sensor_ids = get_sensor_config(all_feature_cols)['tof_sensor_ids']
+            ch_mask = []
+            for tof_sid in tof_sensor_ids:
+                flag_col = f"tof_{tof_sid}_missing"
+                if flag_col in group.columns:
+                    valid = 1.0 - float(group[flag_col].iloc[0])
+                else:
+                    valid = 1.0
+                ch_mask.append(valid)
+            val_tof_channel_masks.append(np.array(ch_mask, dtype=np.float32))
 
             sequence_spectrograms = []
             for col in spec_source_cols:
@@ -993,6 +1048,31 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
         X_val_thm, _ = pad_sequences(val_thm_list, max_length=max_length)
         X_val_tof, _ = pad_sequences(val_tof_list, max_length=max_length)
         X_val_spec = np.array(val_spec_list, dtype=np.float32)
+        X_val_tof_channel_mask = np.stack(val_tof_channel_masks, axis=0).astype(np.float32) if len(val_tof_channel_masks) > 0 else None
+        # THM channel masks
+        val_thm_channel_masks = []
+        for sid in val_sids:
+            group = grouped_val.get_group(sid)
+            ch_mask = []
+            for thm_id in thm_sensor_ids:
+                flag_col = f"thm_{thm_id}_missing"
+                if flag_col in group.columns:
+                    valid = 1.0 - float(group[flag_col].iloc[0])
+                else:
+                    valid = 1.0
+                ch_mask.append(valid)
+            val_thm_channel_masks.append(np.array(ch_mask, dtype=np.float32))
+        X_val_thm_channel_mask = np.stack(val_thm_channel_masks, axis=0).astype(np.float32) if len(val_thm_channel_masks) > 0 else None
+        # IMU rot-only channel masks
+        val_imu_channel_masks = []
+        for sid in val_sids:
+            group = grouped_val.get_group(sid)
+            ch_mask = np.ones((len(imu_feature_names),), dtype=np.float32)
+            if 'rot_missing' in group.columns and float(group['rot_missing'].iloc[0]) == 1.0:
+                for idx in imu_rot_indices:
+                    ch_mask[idx] = 0.0
+            val_imu_channel_masks.append(ch_mask)
+        X_val_imu_channel_mask = np.stack(val_imu_channel_masks, axis=0).astype(np.float32)
 
         # 3. 存储该折的所有数据
         final_fold = {
@@ -1005,6 +1085,12 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
             'scaler': base_fold['scaler'],
             'spec_stats': spec_stats,
             'val_idx': base_fold['val_idx'],
+            'X_train_tof_channel_mask': X_train_tof_channel_mask,
+            'X_val_tof_channel_mask': X_val_tof_channel_mask,
+            'X_train_thm_channel_mask': X_train_thm_channel_mask,
+            'X_val_thm_channel_mask': X_val_thm_channel_mask,
+            'X_train_imu_channel_mask': X_train_imu_channel_mask,
+            'X_val_imu_channel_mask': X_val_imu_channel_mask,
         }
         final_fold_data.append(final_fold)
 

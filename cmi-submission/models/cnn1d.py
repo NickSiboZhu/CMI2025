@@ -45,9 +45,21 @@ class MaskedBatchNorm1d(nn.Module):
 
             if self.track_running_stats:
                 with torch.no_grad():
-                    self.running_mean.mul_(1 - self.momentum).add_(mean.detach(), alpha=self.momentum)
-                    self.running_var.mul_(1 - self.momentum).add_(var.detach(),   alpha=self.momentum)
-                    self.num_batches_tracked.add_(1)
+                    # 有效比例: 有效元素数 / 总元素数 (N*L)
+                    total = torch.tensor(x.size(0) * x.size(2), dtype=torch.float32, device=x.device)
+                    valid_ratio = (count.to(torch.float32) / total)
+
+                    # 计算新统计量
+                    mom = torch.tensor(self.momentum, dtype=torch.float32, device=x.device)
+                    new_rm = self.running_mean.to(torch.float32) * (1 - mom) + mean.to(torch.float32) * mom
+                    new_rv = self.running_var.to(torch.float32)  * (1 - mom) + var.to(torch.float32)  * mom
+
+                    # 当有效比例过低时（几乎全是 padding），避免更新运行统计
+                    w = (valid_ratio > 1e-3).to(torch.float32)  # 标量 (0-dim)
+                    self.running_mean.copy_(torch.lerp(self.running_mean, new_rm.to(self.running_mean.dtype), w))
+                    self.running_var.copy_( torch.lerp(self.running_var,  new_rv.to(self.running_var.dtype),  w))
+                    # 避免形状广播问题：对计数缓冲区加上 Python 标量 0/1
+                    self.num_batches_tracked.add_(int(w.item() > 0))
         else:
             mean = self.running_mean
             var  = self.running_var
@@ -212,7 +224,7 @@ class CNN1D(nn.Module):
         else:
             raise ValueError(f"Unknown temporal_aggregation: '{temporal_aggregation}'")
     
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, channel_mask: torch.Tensor = None):
         """
         Defines the forward pass with robust masking at each step.
         
@@ -226,6 +238,11 @@ class CNN1D(nn.Module):
         # ✨ 如果没有提供mask，创建一个全为1的默认mask
         if mask is None:
             mask = torch.ones(x.shape[0], x.shape[2], device=x.device)
+
+        # ✨ 可选：按通道掩码（用于 THM 或 IMU 的特定失效通道，如 rot_*）
+        # channel_mask: (B, C) —— 在卷积前将缺失通道置零，避免其影响后续统计
+        if channel_mask is not None and channel_mask.numel() > 0:
+            x = x * channel_mask.unsqueeze(-1)
 
         for i, conv in enumerate(self.conv_layers):
             # ✨ 核心步骤 1: 在卷积前，确保被mask的输入为0
