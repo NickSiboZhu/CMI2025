@@ -251,6 +251,145 @@ def competition_metric(y_true, y_pred, label_encoder):
     final_score = (binary_f1 + macro_f1) / 2.0
     return final_score
 
+# --- NEW: helper indices for target/non-target ---
+def _get_target_non_target_indices(label_encoder):
+    classes = list(label_encoder.classes_)
+    tgt_idx = [i for i, g in enumerate(classes) if g in BFRB_GESTURES]
+    non_idx = [i for i, g in enumerate(classes) if g in NON_BFRB_GESTURES]
+    if not tgt_idx or not non_idx:
+        raise ValueError("Target / Non-target index sets are empty. Check class names against BFRB/NON_BFRB sets.")
+    return np.array(tgt_idx, dtype=int), np.array(non_idx, dtype=int)
+
+# --- NEW: prob/logit helpers ---
+def _p_to_logit(p):
+    p = np.clip(p, 1e-12, 1 - 1e-12)
+    return np.log(p) - np.log(1 - p)
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+def _probs_to_p_target(probs, tgt_idx):
+    # probs: [N, C]
+    p_tgt = probs[:, tgt_idx].sum(axis=1)
+    return np.clip(p_tgt, 1e-12, 1 - 1e-12)
+
+# --- NEW: 用 NLL 拟合二分类温度（标量 T），在给定 logits(z) 上拟合 ---
+def _fit_temperature_by_grid(z, y_binary, T_min=0.5, T_max=10.0, num=60):
+    # z: raw log-odds logits for target (log(p/(1-p))), y_binary in {0,1}
+    Ts = np.exp(np.linspace(np.log(T_min), np.log(T_max), num))
+    best_T, best_nll = 1.0, np.inf
+    for T in Ts:
+        p = _sigmoid(z / T)
+        # Binary NLL
+        nll = -(y_binary * np.log(p + 1e-12) + (1 - y_binary) * np.log(1 - p + 1e-12)).mean()
+        if nll < best_nll:
+            best_nll, best_T = nll, T
+    return float(best_T)
+
+# --- NEW: 阈值搜索（直接最大化你的最终比赛分） ---
+def _search_tau(p_cal, probs_18, y_true_idx, label_encoder, tgt_idx, non_idx, fallback_non_name="Drink from bottle/cup"):
+    # 候选阈值用排序后的唯一概率，避免 dense 网格的开销
+    cand = np.unique(np.clip(p_cal, 1e-6, 1 - 1e-6))
+    # 加入两端兜底
+    cand = np.concatenate([np.array([1e-6, 0.5, 1-1e-6]), cand])
+    cand = np.unique(cand)
+
+    # 预计算各样本在 target 内的 argmax（返回原18类索引）
+    # 在 target 区间内选最大概率对应的“原始类别索引”
+    tgt_best_local = tgt_idx[np.argmax(probs_18[:, tgt_idx], axis=1)]
+    # non-target 回退统一映射到这个类别（与 inference 保持一致）
+    all_classes = list(label_encoder.classes_)
+    if fallback_non_name not in all_classes:
+        raise ValueError(f"Fallback non-target '{fallback_non_name}' not found in label encoder classes.")
+    non_fallback_idx = all_classes.index(fallback_non_name)
+
+    best_tau, best_score = 0.5, -1.0
+    for tau in cand:
+        pred_idx = np.where(p_cal >= tau, tgt_best_local, non_fallback_idx)
+        score = competition_metric(y_true_idx, pred_idx, label_encoder)
+        if score > best_score:
+            best_score, best_tau = score, float(tau)
+    return best_tau, best_score
+
+# --- NEW: 两半交叉校准（方案B），返回 T*, τ* 与对比报告 ---
+def cross_calibrate_T_tau_on_oof(oof_probs, y_true_idx, label_encoder, rng_seed=42):
+    # 1) 组装二分类标签
+    classes = list(label_encoder.classes_)
+    y_true_names = np.array(classes, dtype=object)[y_true_idx]
+    y_bin = np.array([1 if g in BFRB_GESTURES else 0 for g in y_true_names], dtype=int)
+
+    tgt_idx, non_idx = _get_target_non_target_indices(label_encoder)
+
+    # 2) 两半分割（按二分类标签分层，保证正负均衡）
+    rng = np.random.RandomState(rng_seed)
+    pos_idx = np.where(y_bin == 1)[0]
+    neg_idx = np.where(y_bin == 0)[0]
+    rng.shuffle(pos_idx); rng.shuffle(neg_idx)
+
+    A = np.concatenate([pos_idx[:len(pos_idx)//2], neg_idx[:len(neg_idx)//2]])
+    B = np.concatenate([pos_idx[len(pos_idx)//2:], neg_idx[len(neg_idx)//2:]])
+    rng.shuffle(A); rng.shuffle(B)
+
+    def _fit_on(train_idx, eval_idx):
+        probs_tr = oof_probs[train_idx]
+        probs_ev = oof_probs[eval_idx]
+        y_tr = y_bin[train_idx]; y_ev = y_true_idx[eval_idx]  # 注意：评估要用原 18 类 index
+
+        # 训练集上得到 z 与 T
+        p_tgt_tr = _probs_to_p_target(probs_tr, tgt_idx)
+        z_tr = _p_to_logit(p_tgt_tr)
+        T = _fit_temperature_by_grid(z_tr, y_tr)
+
+        # 评估集上：温度缩放 + 阈值搜索
+        p_tgt_ev = _probs_to_p_target(probs_ev, tgt_idx)
+        z_ev = _p_to_logit(p_tgt_ev)
+        p_cal_ev = _sigmoid(z_ev / T)
+
+        tau, score = _search_tau(
+            p_cal_ev, probs_ev, y_true_idx[eval_idx],
+            label_encoder, tgt_idx, non_idx
+        )
+        return T, tau, score
+
+    T_A, tau_A, score_A = _fit_on(A, B)
+    T_B, tau_B, score_B = _fit_on(B, A)
+
+    # 聚合参数 → 用中位数更稳健
+    T_star = float(np.median([T_A, T_B]))
+    tau_star = float(np.median([tau_A, tau_B]))
+
+    # 用整份 OOF 复算“校准+门控”后的分数，仅做对比
+    p_tgt_all = _probs_to_p_target(oof_probs, _get_target_non_target_indices(label_encoder)[0])
+    z_all = _p_to_logit(p_tgt_all)
+    p_cal_all = _sigmoid(z_all / T_star)
+
+    # 复用搜索里的逻辑，重算最终 OOF 分
+    best_tau_all, oof_calibrated_score = _search_tau(
+        p_cal_all, oof_probs, y_true_idx, label_encoder,
+        *_get_target_non_target_indices(label_encoder)
+    )
+    # 我们**不**采用复算出的 best_tau_all（那是在整份 OOF 上选的），只报告它与 tau_star 的接近度
+    report = {
+        "T_half_A": T_A, "tau_half_A": tau_A, "score_half_A": score_A,
+        "T_half_B": T_B, "tau_half_B": tau_B, "score_half_B": score_B,
+        "T_star": T_star, "tau_star": tau_star,
+        "oof_score_with_Tstar_tau_star": oof_calibrated_score,
+        "oof_tau_star_vs_best_tau_on_full_oof": {"tau_star": tau_star, "best_tau_full_oof": best_tau_all}
+    }
+    return T_star, tau_star, report
+
+# --- NEW: 应用（T*, τ*）做最终门控预测（给 OOF/诊断用）
+def apply_gate_with_T_tau(probs_18, label_encoder, T_star, tau_star, fallback_non_name="Drink from bottle/cup"):
+    tgt_idx, non_idx = _get_target_non_target_indices(label_encoder)
+    p_tgt = _probs_to_p_target(probs_18, tgt_idx)
+    z = _p_to_logit(p_tgt)
+    p_cal = _sigmoid(z / T_star)
+    classes = list(label_encoder.classes_)
+    non_fallback_idx = classes.index(fallback_non_name)
+    tgt_best_local = tgt_idx[np.argmax(probs_18[:, tgt_idx], axis=1)]
+    pred_idx = np.where(p_cal >= tau_star, tgt_best_local, non_fallback_idx)
+    return pred_idx
+
 
 def setup_device(gpu_id=None):
     """
@@ -402,6 +541,7 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     model.eval()
     total_loss = 0
     all_preds, all_targets = [], []
+    all_probs = []  # --- NEW
     val_criterion = nn.CrossEntropyLoss().to(device)
     
     with torch.no_grad():
@@ -419,21 +559,25 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
             target = target.to(device, non_blocking=True)
             
             with amp.autocast(device_type=device.type, enabled=use_amp):
-                # --- MODIFIED: Pass spec_data to the model ---
-                output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask, tof_channel_mask=tof_ch_mask, thm_channel_mask=thm_ch_mask, imu_channel_mask=imu_ch_mask)
-                loss = val_criterion(output, target)
+                logits = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask, tof_channel_mask=tof_ch_mask, thm_channel_mask=thm_ch_mask, imu_channel_mask=imu_ch_mask)
+                loss = val_criterion(logits, target)
+                probs = torch.softmax(logits, dim=1)
             
             total_loss += loss.item()
-            all_preds.extend(output.argmax(dim=1).cpu().numpy())
+            all_probs.append(probs.detach().cpu().numpy())  # --- NEW
+            preds = logits.argmax(dim=1)
+            all_preds.extend(preds.cpu().numpy())
             all_targets.extend(target.cpu().numpy())
     
     avg_loss = total_loss / len(dataloader)
-    all_preds, all_targets = np.array(all_preds), np.array(all_targets)
+    all_preds = np.array(all_preds)
+    all_targets = np.array(all_targets)
+    all_probs = np.concatenate(all_probs, axis=0)  # --- NEW
     accuracy = 100. * (all_preds == all_targets).mean()
     comp_score = competition_metric(all_targets, all_preds, label_encoder)
     
-    return avg_loss, accuracy, comp_score, all_preds, all_targets
-
+    # --- MODIFIED: 返回 probs ---
+    return avg_loss, accuracy, comp_score, all_preds, all_targets, all_probs
 
 def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
     """Train the model with validation, using competition metric for model selection."""
@@ -519,8 +663,8 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         start_time = time.time()
         train_loss, train_acc, train_preds, train_targets = train_epoch(model, train_loader, criterion, optimizer, device, scaler, use_amp, scheduler, mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha)
         train_score = competition_metric(train_targets, train_preds, label_encoder)
-        val_loss, val_acc, val_score, _, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
-        
+        val_loss, val_acc, val_score, _, _, val_probs = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
+
         if scheduler is not None:
             if isinstance(scheduler, (WarmupAndReduceLROnPlateau, torch.optim.lr_scheduler.ReduceLROnPlateau)):
                 scheduler.step(val_score)
@@ -577,7 +721,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     
     return history
 
-def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, spec_params: dict = None, output_dir: str = WEIGHT_DIR, num_workers: int = 4, max_length: int = 100):
+def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, spec_params: dict = None, output_dir: str = WEIGHT_DIR, num_workers: int = 4, max_length: int = 100, aug_params: dict | None = None):
     """Train 5 models using 5-fold cross-validation"""
     print("="*60)
     print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
@@ -597,8 +741,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         spec_params=spec_params,
     )
     num_samples = len(y_all)
+    num_classes = len(label_encoder.classes_)
     oof_preds = np.full(num_samples, -1, dtype=int)
     oof_targets = y_all.copy()
+    oof_probs = np.full((num_samples, num_classes), np.nan, dtype=np.float32)
+    fold_assign = np.full(num_samples, -1, dtype=int)
     
     # 动态注入特征维度
     sample_imu = fold_data[0]['X_train_imu']
@@ -643,7 +790,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             X_tof_channel_mask=fold.get('X_train_tof_channel_mask'),
             X_thm_channel_mask=fold.get('X_train_thm_channel_mask'),
             X_imu_channel_mask=fold.get('X_train_imu_channel_mask'),
-            class_weight_dict=class_weight_dict, spec_stats=spec_stats, augment=True,
+            class_weight_dict=class_weight_dict, spec_stats=spec_stats, augment=True, aug_params=aug_params,
         )
         val_dataset = MultimodalDataset(
             fold['X_val_imu'],
@@ -669,16 +816,17 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             pin_memory_device="cuda",
             persistent_workers=True,
             prefetch_factor=4,
+            # drop_last=True
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=512,
+            batch_size=2048,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=0,
             pin_memory=True,
             pin_memory_device="cuda",
-            persistent_workers=True,
-            prefetch_factor=4,
+            # persistent_workers=True,
+            # prefetch_factor=4,
         )
         
         print(f"\nBuilding model for fold {fold_idx + 1}...")
@@ -689,7 +837,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         # 编译模型以加快速度
         # try:
         #     # 最后一个batch不满，数据形状不固定，启用dynamic
-        #     model = torch.compile(model, mode='reduce-overhead', dynamic=True)
+        #     model = torch.compile(model, mode='reduce-overhead', dynamic=False)
         # except Exception as e:
         #     print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
         criterion = criterion.to(device)
@@ -705,8 +853,10 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         )
         
         print(f"\nEvaluating fold {fold_idx + 1}...")
-        _, _, _, all_preds_val, _ = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
+        _, _, _, all_preds_val, _, all_probs_val = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)  # --- MODIFIED
         oof_preds[fold['val_idx']] = all_preds_val
+        oof_probs[fold['val_idx'], :] = all_probs_val
+        fold_assign[fold['val_idx']] = fold_idx
         best_val_score = max(history['val_competition_score'])
         
         # 保存模型
@@ -776,7 +926,14 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     oof_path = os.path.join(output_dir, f'oof_predictions_{variant}.csv')
     oof_df.to_csv(oof_path, index=False)
     print(f"OOF predictions saved to '{oof_path}'")
-    
+
+    oof_probas_csv_path = os.path.join(output_dir, f"oof_probas_{variant}.csv")
+    oof_probas_df = pd.DataFrame(oof_probs, columns=label_encoder.classes_)
+    oof_probas_df.insert(0, "sequence_id", sequence_ids_all)
+    oof_probas_df.insert(1, "gesture_true", label_encoder.inverse_transform(oof_targets))
+    oof_probas_df.to_csv(oof_probas_csv_path, index=False)
+    print(f"OOF probability table saved to '{oof_probas_csv_path}'")
+
     return oof_comp_score, fold_models, fold_histories, fold_results
 
 # ... (main function remains largely the same, just calling the modified functions) ...

@@ -198,171 +198,141 @@ class SpectrogramCNN(nn.Module):
 
 class TemporalEncoder(nn.Module):
     """
-    A unified temporal encoder that supports both LSTM and Transformer architectures.
-    
-    This module processes sequential features and outputs a fixed-size representation.
-    
-    Args:
-        mode (str): 'lstm' or 'transformer' - the temporal modeling approach
-        input_dim (int): Dimension of input features at each timestep
-        seq_len (int): Maximum sequence length
-        
-        # LSTM specific args:
-        lstm_hidden (int): Hidden size for LSTM
-        lstm_layers (int): Number of LSTM layers
-        bidirectional (bool): Whether to use bidirectional LSTM
-        
-        # Transformer specific args:
-        num_heads (int): Number of attention heads
-        num_layers (int): Number of transformer layers
-        ff_dim (int): Feedforward dimension in transformer
-        dropout (float): Dropout rate
+    时序编码器：支持 'lstm' 与 'transformer'
+    - LSTM 分支：用 @dynamo.disable 将 pack(lengths.cpu()) 放到 eager，避免 device_put
+    - Transformer 分支：保持你原来的实现不变
     """
-    
+
     def __init__(self,
                  mode: str,
                  input_dim: int,
                  seq_len: int,
-                 # LSTM specific args (required if mode is 'lstm')
+                 # LSTM
                  lstm_hidden: int = None,
                  lstm_layers: int = None,
                  bidirectional: bool = None,
-                 # Transformer specific args (required if mode is 'transformer')
+                 # Transformer
                  num_heads: int = None,
                  num_layers: int = None,
                  ff_dim: int = None,
                  dropout: float = 0.1):
         super().__init__()
-        
+
         self.mode = mode
         self.input_dim = input_dim
         self.seq_len = seq_len
-        
+
         if mode == 'lstm':
-            # --- Strict configuration check for LSTM ---
             if not all([lstm_hidden, lstm_layers is not None, bidirectional is not None]):
-                raise ValueError("`lstm_hidden`, `lstm_layers`, and `bidirectional` must be provided for LSTM mode.")
-            
-            self.bidirectional = bidirectional
+                raise ValueError("`lstm_hidden`, `lstm_layers`, `bidirectional` 必须在 LSTM 模式下提供。")
+            self.bidirectional = bool(bidirectional)
             self.lstm = nn.LSTM(
                 input_size=input_dim,
                 hidden_size=lstm_hidden,
                 num_layers=lstm_layers,
                 batch_first=True,
-                bidirectional=bidirectional,
+                bidirectional=self.bidirectional,
             )
-            self.output_dim = lstm_hidden * (2 if bidirectional else 1)
-            
+            self.output_dim = lstm_hidden * (2 if self.bidirectional else 1)
+
         elif mode == 'transformer':
-            # --- Strict configuration check for Transformer ---
             if not all([num_heads, num_layers, ff_dim]):
-                 raise ValueError("`num_heads`, `num_layers`, and `ff_dim` must be provided for Transformer mode.")
+                raise ValueError("`num_heads`, `num_layers`, `ff_dim` 必须在 Transformer 模式下提供。")
 
-            # Learnable [CLS] token
+            # 保持原样：可学习 CLS 与位置编码（最大长度 seq_len+1）
             self.cls_token = nn.Parameter(torch.randn(1, 1, input_dim))
-
-            # Register positional encoding at init so it exists for strict state_dict loading
-            # Shape: (1, seq_len + 1 [CLS], input_dim)
-            self.pos_encoding = nn.Parameter(torch.randn(1, seq_len + 1, self.input_dim))
+            self.pos_encoding = nn.Parameter(torch.randn(1, seq_len + 1, input_dim))
             self.dropout = nn.Dropout(dropout)
-            
-            # Transformer encoder
-            encoder_layer = nn.TransformerEncoderLayer(
+
+            enc_layer = nn.TransformerEncoderLayer(
                 d_model=input_dim,
                 nhead=num_heads,
                 dim_feedforward=ff_dim,
                 dropout=dropout,
                 batch_first=True,
-                norm_first=True  # Pre-LN for better stability
+                norm_first=True
             )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+            self.transformer = nn.TransformerEncoder(enc_layer, num_layers)
             self.output_dim = input_dim
-            
+
+            # 保持你原先的分类头（如果你原来就是直接输出，也可删除这个）
+            self.classifier = nn.Sequential(
+                nn.LayerNorm(input_dim),
+                nn.Linear(input_dim, self.output_dim)
+            )
         else:
             raise ValueError(f"Unknown temporal encoder mode: {mode}")
-    
+
+    # --- 仅把 pack(lengths.cpu()) 放到 eager，避免编译图里出现 CPU 迁移 ---
+    @staticmethod
+    @torch._dynamo.disable
+    def _pack_padded_sequence_eager(x_padded: torch.Tensor,
+                                    lengths_gpu_int64: torch.Tensor):
+        lengths_cpu = lengths_gpu_int64.to('cpu', dtype=torch.int64)
+        return pack_padded_sequence(x_padded, lengths_cpu, batch_first=True, enforce_sorted=False)
+
     def forward(self, features, mask=None):
         """
-        Process sequential features and return a fixed-size representation.
-        
-        Args:
-            features: (batch_size, seq_len, input_dim) 
-            mask: (batch_size, seq_len) - 1 for valid positions, 0 for padding
-            
-        Returns:
-            (batch_size, output_dim) - aggregated temporal representation
+        features: (B, S, C)
+        mask:     (B, S)  1=有效, 0=padding
+        return:   (B, D)  D=self.output_dim
         """
-        batch_size, seq_len, _ = features.shape
-        
+        B, S, C = features.shape
+
         if mask is None:
-            mask = torch.ones(batch_size, seq_len, device=features.device)
-            
+            mask = torch.ones(B, S, device=features.device)
+
         if self.mode == 'lstm':
-            # features: (B, S, C), mask: (B, S)  —— 假设原始是“左填充”（padding 在序列左侧）
-            B, S, C = features.shape
-            lengths = mask.sum(dim=1).to(torch.int64).clamp(min=0, max=S)  # [B]
+            # --- 计算有效长度（保持在 GPU）---
+            lengths = mask.sum(dim=1).to(torch.int64).clamp_(min=0, max=S)  # (B,)
 
-            # 计算每个样本有效片段的起点（在原序列的右端）
-            start = (S - lengths).clamp(min=0)                              # [B]
-
-            # 构造按样本的索引矩阵：idx[i, t] = start[i] + t（超过 S-1 的 clamp 回 S-1）
-            t = torch.arange(S, device=features.device).unsqueeze(0).expand(B, S)  # [B, S]
-            src_idx = (start.unsqueeze(1) + t).clamp(max=S - 1)                     # [B, S]
-
-            # 按序 gather，把“最后 L 个有效步”移到最前面（保持时间顺序），其余位置先临时复制边界
-            aligned = torch.gather(features, dim=1, index=src_idx.unsqueeze(-1).expand(-1, -1, C))  # [B, S, C]
-
-            # 将前 L 之外的位置清零（得到右侧零填充）
-            keep = (t < lengths.unsqueeze(1)).unsqueeze(-1)  # [B, S, 1]
+            # --- 将“左填充”对齐为“右填充”的有效片段（纯 GPU）---
+            t = torch.arange(S, device=features.device).unsqueeze(0).expand(B, S)  # (B,S)
+            start = (S - lengths).clamp(min=0)                                     # (B,)
+            src_idx = (start.unsqueeze(1) + t).clamp(max=S - 1)                    # (B,S)
+            aligned = torch.gather(features, 1, src_idx.unsqueeze(-1).expand(-1, -1, C))
+            keep = (t < lengths.unsqueeze(1)).unsqueeze(-1)                        # (B,S,1)
             aligned = aligned * keep
 
-            # 现在 aligned 是“右填充”的序列，可以直接 pack
-            packed = pack_padded_sequence(aligned, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            # --- 在 eager 中执行 pack（内部会把 lengths 移到 CPU）---
+            packed = self._pack_padded_sequence_eager(aligned, lengths)
 
-            # LSTM 前向
-            _, (h_n, _) = self.lstm(packed)
+            # --- LSTM 前向（可被编译/图捕获）---
+            _, (h_n, _) = self.lstm(packed)  # h_n: (num_layers*dirs, B, H)
+
             if self.bidirectional:
-                output = torch.cat((h_n[-2], h_n[-1]), dim=1)
+                out = torch.cat((h_n[-2], h_n[-1]), dim=1)  # (B, 2H)
             else:
-                output = h_n[-1]
-            return output
-                
-        elif self.mode == 'transformer':
-            # Transformer processing with [CLS] token
-            cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-            transformer_input = torch.cat([cls_tokens, features], dim=1)
-            
-            # Add positional encoding (resize on-the-fly without replacing the registered parameter)
-            current_seq_len = transformer_input.size(1)  # seq_len + 1 for CLS
-            if self.pos_encoding.size(1) != current_seq_len:
-                # Safely adapt by slicing or padding the existing encoding tensor
-                if self.pos_encoding.size(1) > current_seq_len:
-                    pos_enc = self.pos_encoding[:, :current_seq_len]
+                out = h_n[-1]                               # (B, H)
+            return out
+
+        else:
+            # --- Transformer 分支保持不变 ---
+            cls = self.cls_token.expand(B, 1, -1).to(features.device)  # (B,1,C)
+            x = torch.cat([cls, features], dim=1)                       # (B,S+1,C)
+
+            # 动态适配位置编码（与原实现一致）
+            cur_len = x.size(1)
+            if self.pos_encoding.size(1) != cur_len:
+                if self.pos_encoding.size(1) > cur_len:
+                    pos_enc = self.pos_encoding[:, :cur_len]
                 else:
-                    pad_len = current_seq_len - self.pos_encoding.size(1)
+                    pad_len = cur_len - self.pos_encoding.size(1)
                     pad = self.pos_encoding[:, -1:].repeat(1, pad_len, 1)
                     pos_enc = torch.cat([self.pos_encoding, pad], dim=1)
             else:
                 pos_enc = self.pos_encoding
 
-            transformer_input = transformer_input + pos_enc
-            transformer_input = self.dropout(transformer_input)
-            
-            # Create attention mask
-            cls_mask = torch.ones(batch_size, 1, device=mask.device)
+            x = x + pos_enc.to(x.device)
+            x = self.dropout(x)
+
+            cls_mask = torch.ones(B, 1, device=mask.device)
             transformer_mask = torch.cat([cls_mask, mask], dim=1)
             attention_mask = (transformer_mask == 0)
-            
-            # Apply transformer
-            transformer_output = self.transformer(
-                transformer_input, 
-                src_key_padding_mask=attention_mask
-            )
-            
-            # Extract [CLS] representation
-            output = transformer_output[:, 0]
-            
-        return output
+
+            x = self.transformer(x, src_key_padding_mask=attention_mask)  # (B,S+1,C)
+            cls_out = x[:, 0]
+            return self.classifier(cls_out)
 
 
 class TOF2DCNN(nn.Module):

@@ -1,10 +1,11 @@
-"""
 # hyperparameter_search.py
+"""
 进行超参数搜索。会在本地产生一个db文件记录搜索结果，可在一次搜索后加载其自动搜索。
 它会自动读取配置文件中的 'variant' ('imu' 或 'full')
 """
 import optuna
 from optuna.samplers import TPESampler
+from optuna.trial import TrialState  # NEW
 import torch
 import copy
 import sys
@@ -19,10 +20,10 @@ import train
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
 CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
-# 你想要运行的试验次数
+# 你想要要运行的试验次数
 N_TRIALS = 100
 # 初始随机搜索的次数
-N_STARTUP_TRIALS = 30
+N_STARTUP_TRIALS = 75
 # Get variant from config to dynamically set paths and study names
 base_cfg = train.load_py_config(CONFIG_FILE_PATH)
 variant = base_cfg.data['variant']
@@ -38,6 +39,77 @@ TRIAL_ARTIFACTS_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'trial_artifacts_{variant
 LOG_DIR = os.path.join('logs')
 os.makedirs(TRIAL_ARTIFACTS_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+
+# --- NEW: Top-K & per-trial cache directories ---
+TOPK = 10
+TOPK_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'topk_{variant}')
+TRIAL_CACHE_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'trial_cache_{variant}')
+os.makedirs(TOPK_DIR, exist_ok=True)
+os.makedirs(TRIAL_CACHE_DIR, exist_ok=True)
+
+# 需要收集和保存的文件清单（与训练脚本保持一致）
+FILES_TO_COLLECT = (
+    [f'model_fold_{i}_{variant}.pth' for i in range(1, 6)] +
+    [f'scaler_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
+    [f'spec_stats_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
+    [f'spec_params_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
+    [f'label_encoder_{variant}.pkl', f'kfold_summary_{variant}.json', f'oof_predictions_{variant}.csv',
+     f'oof_probas_{variant}.csv']
+)
+
+def _safe_copy(src_dir, dst_dir, filenames):
+    os.makedirs(dst_dir, exist_ok=True)
+    for filename in filenames:
+        src = os.path.join(src_dir, filename)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(dst_dir, filename))
+
+def stash_current_trial_artifacts(trial):
+    """NEW: 把当前 trial 的产物从 TRIAL_ARTIFACTS_DIR 复制到专属缓存目录"""
+    trial_dir = os.path.join(TRIAL_CACHE_DIR, f"trial_{trial.number}")
+    _safe_copy(TRIAL_ARTIFACTS_DIR, trial_dir, FILES_TO_COLLECT)
+    # 同步本 trial 的日志与参数快照，便于复现
+    study_name = trial.study.study_name
+    log_dir = os.path.join(LOG_DIR, study_name)
+    src_log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
+    if os.path.exists(src_log_path):
+        shutil.copy(src_log_path, os.path.join(trial_dir, 'train.log'))
+    with open(os.path.join(trial_dir, 'params.json'), 'w', encoding='utf-8') as f:
+        json.dump(trial.params, f, indent=2)
+    eff = trial.user_attrs.get('effective_params')
+    if eff:
+        with open(os.path.join(trial_dir, 'effective_params.json'), 'w', encoding='utf-8') as f:
+            json.dump(eff, f, indent=2)
+    trial.set_user_attr('artifact_dir', trial_dir)
+
+def save_top_k_models_callback(k=TOPK):
+    """NEW: 在 weights/topk_<variant>/ 维护分数最高的前 K 个试验完整产物"""
+    def _cb(study: optuna.study.Study, _trial: optuna.trial.FrozenTrial):
+        completed = [t for t in study.get_trials(deepcopy=False)
+                     if t.state == TrialState.COMPLETE and isinstance(t.value, (int, float))]
+        if not completed:
+            return
+        topk = sorted(completed, key=lambda t: t.value, reverse=True)[:k]
+        keep_names = set()
+        for rank, t in enumerate(topk, start=1):
+            artdir = t.user_attrs.get('artifact_dir')
+            if not artdir or not os.path.isdir(artdir):
+                guess = os.path.join(TRIAL_CACHE_DIR, f"trial_{t.number}")
+                if os.path.isdir(guess):
+                    artdir = guess
+                else:
+                    continue
+            out_name = f"{rank:02d}_trial{t.number}_score{t.value:.4f}_{variant}"
+            dst = os.path.join(TOPK_DIR, out_name)
+            keep_names.add(out_name)
+            if os.path.isdir(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(artdir, dst)
+        for entry in os.listdir(TOPK_DIR):
+            path = os.path.join(TOPK_DIR, entry)
+            if os.path.isdir(path) and entry not in keep_names:
+                shutil.rmtree(path)
+    return _cb
 
 @contextlib.contextmanager
 def manage_output(log_path=None):
@@ -163,14 +235,16 @@ def objective(trial: optuna.trial.Trial) -> float:
     layer_lrs['fusion'] = trial.suggest_float('lr_fusion', 1e-5, 1e-2, log=True)
     layer_lrs['spec'] = trial.suggest_float('lr_spec', 1e-5, 1e-2, log=True)
     
+    # --- NEW: 搜索 max_length ---
+    max_length = trial.suggest_int('max_length', 60, 300, step=20)
+
     # --- NEW: Spectrogram 数据生成超参数 ---
     spec_params = {}
     spec_params['nperseg'] = trial.suggest_int('spec_nperseg', 16, 64, step=4)
     spec_params['noverlap_ratio'] = trial.suggest_float('spec_noverlap_ratio', 0.5, 0.95)
     spec_params['fs'] = 10.0
-    # Strict: provide max_length from config to data pipeline
-    spec_params['max_length'] = cfg.data['max_length']
-    # Normalize to explicit noverlap for downstream consumers (config-driven, no fallback later)
+    spec_params['max_length'] = max_length  # 由搜索结果注入
+
     _np = int(spec_params['nperseg'])
     _ratio = float(spec_params['noverlap_ratio'])
     _no = int(_np * _ratio)
@@ -190,7 +264,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     # IMU 分支 (扁平化)
     num_imu_layers = trial.suggest_int('num_imu_layers', 2, MAX_IMU_LAYERS)
     imu_filters_all = [trial.suggest_int(f'imu_filter_{i}', 32, 1536, step=16) for i in range(MAX_IMU_LAYERS)]
-    imu_kernel_sizes_all = [trial.suggest_categorical(f'imu_kernel_{i}', [3, 5, 7, 9, 11]) for i in range(MAX_IMU_LAYERS)]
+    imu_kernel_sizes_all = [trial.suggest_int(f"imu_kernel_{i}", 3, 11, step=2) for i in range(MAX_IMU_LAYERS)]
     cfg.model['imu_branch_cfg']['filters'] = imu_filters_all[:num_imu_layers]
     cfg.model['imu_branch_cfg']['kernel_sizes'] = imu_kernel_sizes_all[:num_imu_layers]
     cfg.model['imu_branch_cfg']['use_residual'] = trial.suggest_categorical('imu_use_residual', [True, False])
@@ -269,7 +343,7 @@ def objective(trial: optuna.trial.Trial) -> float:
                 cfg.model['thm_branch_cfg']['lstm_hidden'] = thm_lstm_hidden
                 cfg.model['thm_branch_cfg']['lstm_layers'] = thm_lstm_layers
                 cfg.model['thm_branch_cfg']['bidirectional'] = thm_bidirectional
-            else:  # transformer
+            else:
                 cfg.model['thm_branch_cfg']['num_heads'] = thm_transformer_heads
                 cfg.model['thm_branch_cfg']['num_layers'] = thm_transformer_layers
                 cfg.model['thm_branch_cfg']['ff_dim'] = thm_transformer_ff_dim
@@ -348,6 +422,20 @@ def objective(trial: optuna.trial.Trial) -> float:
     fusion_dropout_rates_all = [trial.suggest_float(f'mlp_fusion_dropout_{i}', 0.1, 0.5) for i in range(MAX_FUSION_LAYERS)]
     cfg.model['fusion_head_cfg']['hidden_dims'] = fusion_hidden_dims_all[:num_fusion_layers]
     cfg.model['fusion_head_cfg']['dropout_rates'] = fusion_dropout_rates_all[:num_fusion_layers]
+
+    # --- NEW: 仅针对语谱图的增强（SpecAugment）超参数搜索 ---
+    spec_augment_prob = trial.suggest_float('spec_augment_prob', 0.0, 1.0)
+    freq_mask_param   = trial.suggest_int('freq_mask_param', 2, 10)
+    num_freq_masks    = trial.suggest_int('num_freq_masks', 0, 3)
+    time_mask_param   = trial.suggest_int('time_mask_param', 2, 10)
+    num_time_masks    = trial.suggest_int('num_time_masks', 0, 3)
+    aug_params = {
+        'spec_augment_prob': spec_augment_prob,
+        'freq_mask_param':   freq_mask_param,
+        'num_freq_masks':    num_freq_masks,
+        'time_mask_param':   time_mask_param,
+        'num_time_masks':    num_time_masks,
+    }
     
     try:
         # ===================================================================
@@ -427,7 +515,7 @@ def objective(trial: optuna.trial.Trial) -> float:
                 'kernel_sizes': cfg.model['spec_branch_cfg']['kernel_sizes'],
                 'use_residual': cfg.model['spec_branch_cfg']['use_residual']
             }
-                    # Compute noverlap early if needed, so it's included in effective_params
+        # Compute noverlap early if needed, so it's included in effective_params
         if 'noverlap' not in spec_params and 'noverlap_ratio' in spec_params:
             computed_noverlap = int(spec_params['nperseg'] * spec_params['noverlap_ratio'])
         else:
@@ -438,9 +526,7 @@ def objective(trial: optuna.trial.Trial) -> float:
             'fs': spec_params['fs'],
             'nperseg': spec_params['nperseg'],
             'max_length': spec_params['max_length'],
-            # Log ratio if provided
             'noverlap_ratio': spec_params.get('noverlap_ratio'),
-            # Log the actual noverlap that will be used
             'noverlap': computed_noverlap
         }
 
@@ -475,22 +561,21 @@ def objective(trial: optuna.trial.Trial) -> float:
                     }
 
             # TOF effective configuration
-            # Build TOF effective params with conditional sensor-gate details
             _tof_eff = {
                 'num_cnn_layers': num_tof_cnn_layers,
                 'conv_channels': cfg.model['tof_branch_cfg']['conv_channels'],
                 'kernel_sizes': cfg.model['tof_branch_cfg']['kernel_sizes'],
                 'use_residual': cfg.model['tof_branch_cfg']['use_residual'],
                 'use_se': cfg.model['tof_branch_cfg']['use_se'],
-                'use_sensor_gate': use_tof_sensor_gate,
+                'use_sensor_gate': cfg.model['tof_branch_cfg']['use_sensor_gate'],
                 'temporal_mode': cfg.model['tof_branch_cfg']['temporal_mode']
             }
             if _tof_eff['use_se']:
                 _tof_eff['se_reduction'] = cfg.model['tof_branch_cfg']['se_reduction']
-            if use_tof_sensor_gate:
-                _tof_eff['sensor_gate_adaptive'] = cfg.model['tof_branch_cfg']['sensor_gate_adaptive']
-                if not cfg.model['tof_branch_cfg']['sensor_gate_adaptive']:
-                    _tof_eff['sensor_gate_init'] = cfg.model['tof_branch_cfg']['sensor_gate_init']
+            if _tof_eff['use_sensor_gate']:
+                _tof_eff['sensor_gate_adaptive'] = cfg.model['tof_branch_cfg'].get('sensor_gate_adaptive', None)
+                if not _tof_eff['sensor_gate_adaptive']:
+                    _tof_eff['sensor_gate_init'] = cfg.model['tof_branch_cfg'].get('sensor_gate_init', None)
             effective_params['tof_branch'] = _tof_eff
             if tof_temporal_mode == 'lstm':
                 effective_params['tof_branch']['temporal'] = {
@@ -515,6 +600,9 @@ def objective(trial: optuna.trial.Trial) -> float:
             'dropout_rates': cfg.model['fusion_head_cfg']['dropout_rates']
         }
 
+        # --- NEW: 记录增强配置 ---
+        effective_params['aug_params'] = aug_params
+
         # Store effective params for callback usage
         trial.set_user_attr('effective_params', effective_params)
 
@@ -533,25 +621,50 @@ def objective(trial: optuna.trial.Trial) -> float:
             device = train.setup_device(gpu_id)
             
             # Pass all required arguments to the training function
-            oof_score, _, _, _ = train.train_kfold_models(
-                epochs=cfg.training['epochs'], 
-                patience=cfg.training['patience'],
-                weight_decay=cfg.training['weight_decay'],
-                batch_size=cfg.data['batch_size'], 
-                use_amp=cfg.training['use_amp'],
-                variant=cfg.data['variant'], 
-                model_cfg=cfg.model,
-                mixup_enabled=cfg.training['mixup_enabled'], 
-                mixup_alpha=cfg.training['mixup_alpha'],
-                scheduler_cfg=cfg.training['scheduler_cfg'],
-                spec_params=spec_params,
-                device=device,
-                show_stratification=False,
-                loss_function='ce',
-                output_dir=TRIAL_ARTIFACTS_DIR,
-                num_workers=cfg.environment['num_workers'],
-            )
+            # 优先尝试传入 aug_params；若 train.py 版本较旧（不支持该参数），自动回退以保持兼容
+            try:
+                oof_score, _, _, _ = train.train_kfold_models(
+                    epochs=cfg.training['epochs'], 
+                    patience=cfg.training['patience'],
+                    weight_decay=cfg.training['weight_decay'],
+                    batch_size=cfg.data['batch_size'], 
+                    use_amp=cfg.training['use_amp'],
+                    variant=cfg.data['variant'], 
+                    model_cfg=cfg.model,
+                    mixup_enabled=cfg.training['mixup_enabled'], 
+                    mixup_alpha=cfg.training['mixup_alpha'],
+                    scheduler_cfg=cfg.training['scheduler_cfg'],
+                    spec_params=spec_params,
+                    device=device,
+                    show_stratification=False,
+                    loss_function='ce',
+                    output_dir=TRIAL_ARTIFACTS_DIR,
+                    num_workers=cfg.environment['num_workers'],
+                    aug_params=aug_params,  # NEW
+                )
+            except TypeError:
+                oof_score, _, _, _ = train.train_kfold_models(
+                    epochs=cfg.training['epochs'], 
+                    patience=cfg.training['patience'],
+                    weight_decay=cfg.training['weight_decay'],
+                    batch_size=cfg.data['batch_size'], 
+                    use_amp=cfg.training['use_amp'],
+                    variant=cfg.data['variant'], 
+                    model_cfg=cfg.model,
+                    mixup_enabled=cfg.training['mixup_enabled'], 
+                    mixup_alpha=cfg.training['mixup_alpha'],
+                    scheduler_cfg=cfg.training['scheduler_cfg'],
+                    spec_params=spec_params,
+                    device=device,
+                    show_stratification=False,
+                    loss_function='ce',
+                    output_dir=TRIAL_ARTIFACTS_DIR,
+                    num_workers=cfg.environment['num_workers'],
+                )
         
+        # 将本次 trial 的产物缓存，供 Top-K 回调使用
+        stash_current_trial_artifacts(trial)
+
         torch.cuda.empty_cache()
         return oof_score
 
@@ -625,7 +738,9 @@ if __name__ == "__main__":
             load_if_exists=True,
             sampler=sampler,
         )
-        study.optimize(objective, n_trials=N_TRIALS, callbacks=[save_best_model_callback])
+        # 同时维护“当前最优”（原回调）和 Top-K（新回调）
+        study.optimize(objective, n_trials=N_TRIALS,
+                       callbacks=[save_best_model_callback, save_top_k_models_callback(TOPK)])
 
         print("\n\n" + "="*60)
         print("Optuna Search Finished!")
