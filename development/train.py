@@ -822,11 +822,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             val_dataset,
             batch_size=2048,
             shuffle=False,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=True,
             pin_memory_device="cuda",
-            # persistent_workers=True,
-            # prefetch_factor=4,
+            persistent_workers=True,
+            prefetch_factor=4,
         )
         
         print(f"\nBuilding model for fold {fold_idx + 1}...")

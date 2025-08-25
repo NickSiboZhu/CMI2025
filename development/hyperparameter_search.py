@@ -13,6 +13,7 @@ import os
 import shutil
 import json
 import contextlib
+import multiprocessing as mp
 
 # Import train script AFTER basic imports to access its functions
 import train
@@ -21,13 +22,14 @@ import train
 # 脚本将自动从该文件中读取 'variant' 并调整行为
 CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
 # 你想要要运行的试验次数
-N_TRIALS = 100
+N_TRIALS = 500
 # 初始随机搜索的次数
 N_STARTUP_TRIALS = 75
 # Get variant from config to dynamically set paths and study names
 base_cfg = train.load_py_config(CONFIG_FILE_PATH)
 variant = base_cfg.data['variant']
 
+# Use SQLite for simplicity; it supports multi-process access in Optuna
 DB_PATH = f'sqlite:///{variant}-study.db'
 STUDY_NAME = f'{variant}_search'
 
@@ -65,9 +67,13 @@ def _safe_copy(src_dir, dst_dir, filenames):
             shutil.copy(src, os.path.join(dst_dir, filename))
 
 def stash_current_trial_artifacts(trial):
-    """NEW: 把当前 trial 的产物从 TRIAL_ARTIFACTS_DIR 复制到专属缓存目录"""
+    """NEW: 把当前 trial 的产物从其专属输出目录复制到专属缓存目录"""
     trial_dir = os.path.join(TRIAL_CACHE_DIR, f"trial_{trial.number}")
-    _safe_copy(TRIAL_ARTIFACTS_DIR, trial_dir, FILES_TO_COLLECT)
+    src_artifact_dir = trial.user_attrs.get('artifact_dir', None)
+    if src_artifact_dir is None:
+        # 兼容旧逻辑：从共享目录复制（非并行情况下）
+        src_artifact_dir = TRIAL_ARTIFACTS_DIR
+    _safe_copy(src_artifact_dir, trial_dir, FILES_TO_COLLECT)
     # 同步本 trial 的日志与参数快照，便于复现
     study_name = trial.study.study_name
     log_dir = os.path.join(LOG_DIR, study_name)
@@ -152,8 +158,10 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
             [f'label_encoder_{variant}.pkl', f'kfold_summary_{variant}.json', f'oof_predictions_{variant}.csv']
         )
 
+        # 源目录：优先使用本 trial 的专属 artifact 目录
+        src_dir = trial.user_attrs.get('artifact_dir', TRIAL_ARTIFACTS_DIR)
         for filename in files_to_copy:
-            src_path = os.path.join(TRIAL_ARTIFACTS_DIR, filename)
+            src_path = os.path.join(src_dir, filename)
             dst_path = os.path.join(FINAL_WEIGHTS_DIR, filename)
             if os.path.exists(src_path):
                 shutil.copy(src_path, dst_path)
@@ -616,8 +624,22 @@ def objective(trial: optuna.trial.Trial) -> float:
             f.write("="*60 + "\n")
 
         with manage_output(log_path):
-            # Use strict loading for gpu_id
-            gpu_id = cfg.environment['gpu_id']
+            # --- Assign GPU to this trial for parallel execution ---
+            # If config sets a fixed GPU, we still override here to distribute trials.
+            available = torch.cuda.device_count()
+            if available == 0:
+                gpu_id = None
+            else:
+                # Simple round-robin by trial number; users can also set via env
+                gpu_id = trial.number % available
+            trial.set_user_attr('assigned_gpu', gpu_id)
+
+            # Build a per-trial artifact directory to avoid conflicts across processes
+            trial_artifacts_dir = os.path.join(TRIAL_ARTIFACTS_DIR, f"trial_{trial.number}")
+            os.makedirs(trial_artifacts_dir, exist_ok=True)
+            trial.set_user_attr('artifact_dir', trial_artifacts_dir)
+
+            # Use selected GPU
             device = train.setup_device(gpu_id)
             
             # Pass all required arguments to the training function
@@ -638,7 +660,7 @@ def objective(trial: optuna.trial.Trial) -> float:
                     device=device,
                     show_stratification=False,
                     loss_function='ce',
-                    output_dir=TRIAL_ARTIFACTS_DIR,
+                    output_dir=trial_artifacts_dir,
                     num_workers=cfg.environment['num_workers'],
                     aug_params=aug_params,  # NEW
                 )
@@ -658,7 +680,7 @@ def objective(trial: optuna.trial.Trial) -> float:
                     device=device,
                     show_stratification=False,
                     loss_function='ce',
-                    output_dir=TRIAL_ARTIFACTS_DIR,
+                    output_dir=trial_artifacts_dir,
                     num_workers=cfg.environment['num_workers'],
                 )
         
@@ -677,6 +699,11 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 
 if __name__ == "__main__":
+    # Enable forkserver/spawn for safety with CUDA context when running multiple processes
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
     print("="*60)
     print(f"Detected variant '{variant}'.")
     print(f"Database:   {DB_PATH}")
@@ -739,8 +766,15 @@ if __name__ == "__main__":
             sampler=sampler,
         )
         # 同时维护“当前最优”（原回调）和 Top-K（新回调）
-        study.optimize(objective, n_trials=N_TRIALS,
-                       callbacks=[save_best_model_callback, save_top_k_models_callback(TOPK)])
+        # Run trials in parallel across available GPUs using Optuna's n_jobs
+        # Set n_jobs to the number of GPUs; Optuna will launch that many worker processes
+        n_jobs = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        study.optimize(
+            objective,
+            n_trials=N_TRIALS,
+            n_jobs=n_jobs,
+            callbacks=[save_best_model_callback, save_top_k_models_callback(TOPK)]
+        )
 
         print("\n\n" + "="*60)
         print("Optuna Search Finished!")
