@@ -13,10 +13,27 @@ import os
 import shutil
 import json
 import contextlib
+import logging
 import multiprocessing as mp
 
 # Import train script AFTER basic imports to access its functions
 import train
+
+# Helper to redirect prints into logger
+class LoggerWriter:
+    def __init__(self, log_func):
+        self.log_func = log_func
+    def write(self, message):
+        if not message:
+            return
+        message = message.rstrip("\n")
+        if not message:
+            return
+        for line in message.splitlines():
+            if line.strip():
+                self.log_func(line)
+    def flush(self):
+        pass
 
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
@@ -38,9 +55,8 @@ STUDY_NAME = f'{variant}_search'
 FINAL_WEIGHTS_DIR = train.WEIGHT_DIR
 # Intermediate artifacts for each trial will be stored here and cleaned up later
 TRIAL_ARTIFACTS_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'trial_artifacts_{variant}')
-LOG_DIR = os.path.join('logs')
+LOG_DIR = os.path.join('logs')  # legacy; not used for per-trial logging
 os.makedirs(TRIAL_ARTIFACTS_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
 
 # --- NEW: Top-K & per-trial cache directories ---
 TOPK = 10
@@ -48,6 +64,22 @@ TOPK_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'topk_{variant}')
 TRIAL_CACHE_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'trial_cache_{variant}')
 os.makedirs(TOPK_DIR, exist_ok=True)
 os.makedirs(TRIAL_CACHE_DIR, exist_ok=True)
+
+# Control whether to also copy the single best trial into FINAL_WEIGHTS_DIR
+# Set to False to rely solely on Top-K artifacts
+SAVE_BEST_TO_FINAL = False
+
+# Control whether to preload base data once and monkey-patch spectrogram generation only.
+# Set to False when doing a global max_length search, so data are rebuilt per trial.
+ENABLE_BASE_PRELOAD = False
+
+# Control writing global logs/<study>/trial_*.log in addition to per-trial artifact logs.
+# Disabled by default to avoid parallel-process handler contention and mixed logs.
+STUDY_LOGS_ENABLED = False
+
+# Control whether to include PID in per-trial directory names.
+# Enable to guarantee process-unique artifact dirs and avoid log mixing across parallel trials
+USE_PID_IN_DIR = True
 
 # 需要收集和保存的文件清单（与训练脚本保持一致）
 FILES_TO_COLLECT = (
@@ -68,25 +100,30 @@ def _safe_copy(src_dir, dst_dir, filenames):
 
 def stash_current_trial_artifacts(trial):
     """NEW: 把当前 trial 的产物从其专属输出目录复制到专属缓存目录"""
-    trial_dir = os.path.join(TRIAL_CACHE_DIR, f"trial_{trial.number}")
-    src_artifact_dir = trial.user_attrs.get('artifact_dir', None)
-    if src_artifact_dir is None:
-        # 兼容旧逻辑：从共享目录复制（非并行情况下）
-        src_artifact_dir = TRIAL_ARTIFACTS_DIR
-    _safe_copy(src_artifact_dir, trial_dir, FILES_TO_COLLECT)
+    src_artifact_dir = trial.user_attrs.get('artifact_dir')
+    if not src_artifact_dir or not os.path.isdir(src_artifact_dir):
+        return
+
+    if USE_PID_IN_DIR:
+        pid = trial.user_attrs.get('assigned_pid') or os.getpid()
+        cache_dir = os.path.join(TRIAL_CACHE_DIR, f"trial_{trial.number}_pid{pid}")
+    else:
+        cache_dir = os.path.join(TRIAL_CACHE_DIR, f"trial_{trial.number}")
+    _safe_copy(src_artifact_dir, cache_dir, FILES_TO_COLLECT)
+
     # 同步本 trial 的日志与参数快照，便于复现
-    study_name = trial.study.study_name
-    log_dir = os.path.join(LOG_DIR, study_name)
-    src_log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
+    src_log_path = os.path.join(src_artifact_dir, 'train.log')
     if os.path.exists(src_log_path):
-        shutil.copy(src_log_path, os.path.join(trial_dir, 'train.log'))
-    with open(os.path.join(trial_dir, 'params.json'), 'w', encoding='utf-8') as f:
+        shutil.copy(src_log_path, os.path.join(cache_dir, 'train.log'))
+    with open(os.path.join(cache_dir, 'params.json'), 'w', encoding='utf-8') as f:
         json.dump(trial.params, f, indent=2)
     eff = trial.user_attrs.get('effective_params')
     if eff:
-        with open(os.path.join(trial_dir, 'effective_params.json'), 'w', encoding='utf-8') as f:
+        with open(os.path.join(cache_dir, 'effective_params.json'), 'w', encoding='utf-8') as f:
             json.dump(eff, f, indent=2)
-    trial.set_user_attr('artifact_dir', trial_dir)
+
+    # 标记缓存目录供回调和 Top-K 使用
+    trial.set_user_attr('cache_dir', cache_dir)
 
 def save_top_k_models_callback(k=TOPK):
     """NEW: 在 weights/topk_<variant>/ 维护分数最高的前 K 个试验完整产物"""
@@ -98,13 +135,9 @@ def save_top_k_models_callback(k=TOPK):
         topk = sorted(completed, key=lambda t: t.value, reverse=True)[:k]
         keep_names = set()
         for rank, t in enumerate(topk, start=1):
-            artdir = t.user_attrs.get('artifact_dir')
+            artdir = t.user_attrs.get('cache_dir')
             if not artdir or not os.path.isdir(artdir):
-                guess = os.path.join(TRIAL_CACHE_DIR, f"trial_{t.number}")
-                if os.path.isdir(guess):
-                    artdir = guess
-                else:
-                    continue
+                continue
             out_name = f"{rank:02d}_trial{t.number}_score{t.value:.4f}_{variant}"
             dst = os.path.join(TOPK_DIR, out_name)
             keep_names.add(out_name)
@@ -117,25 +150,46 @@ def save_top_k_models_callback(k=TOPK):
                 shutil.rmtree(path)
     return _cb
 
-@contextlib.contextmanager
-def manage_output(log_path=None):
-    """
-    A context manager to redirect stdout and stderr.
-    If log_path is provided, output is written to that file.
-    Otherwise, it is suppressed.
-    """
-    if log_path:
-        target = open(log_path, 'a', encoding='utf-8')  # Use append mode 'a' to preserve header
-    else:
-        target = open(os.devnull, 'w', encoding='utf-8')
-    
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout, sys.stderr = target, target
-    try:
-        yield
-    finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
-        target.close()
+def setup_trial_logger(trial: optuna.trial.Trial) -> logging.Logger:
+    """为每个 Trial 创建独立文件日志记录器，写入其产物目录 train.log。"""
+    # Make logger name process-unique to avoid cross-process handler reuse
+    logger_name = f"optuna.trial.{trial.number}.pid{os.getpid()}"
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        return logger
+    artifact_dir = trial.user_attrs.get('artifact_dir')
+    if not artifact_dir:
+        # Choose per-trial directory name (optionally with PID)
+        if USE_PID_IN_DIR:
+            artifact_dir = os.path.join(TRIAL_ARTIFACTS_DIR, f"trial_{trial.number}_pid{os.getpid()}")
+        else:
+            artifact_dir = os.path.join(TRIAL_ARTIFACTS_DIR, f"trial_{trial.number}")
+        os.makedirs(artifact_dir, exist_ok=True)
+        trial.set_user_attr('artifact_dir', artifact_dir)
+    log_file = os.path.join(artifact_dir, 'train.log')
+    # Delay opening the file until the first emit to reduce FD inheritance risks
+    fh = logging.FileHandler(log_file, mode='w', encoding='utf-8', delay=True)
+    fmt = logging.Formatter(
+        f"%(asctime)s - TRIAL {trial.number} - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+    # Optional second handler to global logs/<study>/trial_<n>.log if provided
+    study_log_path = trial.user_attrs.get('study_log_path')
+    if study_log_path:
+        try:
+            gh = logging.FileHandler(study_log_path, mode='w', encoding='utf-8')
+            gh.setFormatter(fmt)
+            logger.addHandler(gh)
+        except Exception:
+            # If secondary log path fails, continue with primary file handler
+            pass
+    logger.propagate = False
+    return logger
+
+# Removed manage_output: all logging uses per-trial loggers
 
 def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
     """
@@ -143,57 +197,59 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
     """
     if study.best_trial.number == trial.number:
         print(f"\nNew best trial found: #{trial.number} with score {trial.value:.4f}. Saving models.")
-        
-        # Get variant from the trial's user attributes (strict)
+
         variant = trial.user_attrs['variant']
+        src_dir = trial.user_attrs.get('cache_dir')
+        if not src_dir or not os.path.isdir(src_dir):
+            print(f"[CALLBACK] ERROR: Cannot find artifact cache for best trial #{trial.number}. Models not saved.")
+            return
 
-        # --- NEW LOGIC: Copy from trial artifacts to the final weights directory ---
-        # Define a list of files to copy to handle missing files gracefully
-        # MODIFIED: Add spec_stats to the list of files to copy
-        files_to_copy = (
-            [f'model_fold_{i}_{variant}.pth' for i in range(1, 6)] +
-            [f'scaler_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
-            [f'spec_stats_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
-            [f'spec_params_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
-            [f'label_encoder_{variant}.pkl', f'kfold_summary_{variant}.json', f'oof_predictions_{variant}.csv']
-        )
+        # Copy all standard artifacts
+        _safe_copy(src_dir, FINAL_WEIGHTS_DIR, FILES_TO_COLLECT)
 
-        # 源目录：优先使用本 trial 的专属 artifact 目录
-        src_dir = trial.user_attrs.get('artifact_dir', TRIAL_ARTIFACTS_DIR)
-        for filename in files_to_copy:
-            src_path = os.path.join(src_dir, filename)
-            dst_path = os.path.join(FINAL_WEIGHTS_DIR, filename)
-            if os.path.exists(src_path):
-                shutil.copy(src_path, dst_path)
-
-        # 4. Save the best hyperparameters to a JSON file (with variant)
+        # Save the best hyperparameters
         best_params_path = os.path.join(FINAL_WEIGHTS_DIR, f'best_params_{variant}.json')
         with open(best_params_path, 'w', encoding='utf-8') as f:
             json.dump(trial.params, f, indent=4)
-            
-        # 5. Copy the best trial's log file (with variant)
-        log_dir = os.path.join(LOG_DIR, study.study_name)
-        src_log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
+
+        # Copy the per-trial log
+        src_log_path = os.path.join(src_dir, 'train.log')
         dst_log_path = os.path.join(FINAL_WEIGHTS_DIR, f'training_log_{variant}.log')
         if os.path.exists(src_log_path):
             shutil.copy(src_log_path, dst_log_path)
-        
+
         print(f"Best models and parameters for trial #{trial.number} saved to {FINAL_WEIGHTS_DIR}")
 
 
 def objective(trial: optuna.trial.Trial) -> float:
     """
-    Optuna 的目标函数。
-    为支持多变量采样，已对内部动态依赖进行扁平化处理。
+    Optuna 的目标函数（使用 logging 模块的最终版本）。
     """
+    # 1) Ensure per-trial artifact dir and logger
+    # Create per-trial artifact dir (optionally with PID suffix)
+    if USE_PID_IN_DIR:
+        trial_artifacts_dir = os.path.join(TRIAL_ARTIFACTS_DIR, f"trial_{trial.number}_pid{os.getpid()}")
+    else:
+        trial_artifacts_dir = os.path.join(TRIAL_ARTIFACTS_DIR, f"trial_{trial.number}")
+    os.makedirs(trial_artifacts_dir, exist_ok=True)
+    trial.set_user_attr('artifact_dir', trial_artifacts_dir)
+    # Optionally prepare global logs/<study>/trial_<n>.log path before creating the logger
+    if STUDY_LOGS_ENABLED:
+        study_name = trial.study.study_name
+        study_log_dir = os.path.join(LOG_DIR, study_name)
+        os.makedirs(study_log_dir, exist_ok=True)
+        study_log_path = os.path.join(study_log_dir, f'trial_{trial.number}.log')
+        trial.set_user_attr('study_log_path', study_log_path)
+    logger = setup_trial_logger(trial)
+
+    # Delayed logging of variant until after it is loaded below to avoid UnboundLocalError
+
     # 清除dynamo缓存防止模型多次编译占据缓存
     torch._dynamo.reset()
     cfg = train.load_py_config(CONFIG_FILE_PATH)
     variant = cfg.data['variant']
-    
     trial.set_user_attr('variant', variant)
-    
-    print(f"\nStarting Trial {trial.number} for '{variant}' branch")
+    logger.info(f"Loaded config for variant: {variant}")
 
     # ===================================================================
     #
@@ -245,6 +301,26 @@ def objective(trial: optuna.trial.Trial) -> float:
     
     # --- NEW: 搜索 max_length ---
     max_length = trial.suggest_int('max_length', 60, 300, step=20)
+    # Propagate sampled value to config data only
+    cfg.data['max_length'] = max_length
+
+    # Ensure model sub-configs reflect the sampled global sequence length
+    try:
+        if 'sequence_length' in cfg.model:
+            cfg.model['sequence_length'] = max_length
+        if 'imu_branch_cfg' in cfg.model:
+            cfg.model['imu_branch_cfg']['sequence_length'] = max_length
+        if 'thm_branch_cfg' in cfg.model:
+            cfg.model['thm_branch_cfg']['sequence_length'] = max_length
+        if 'tof_branch_cfg' in cfg.model:
+            # Some configs use 'seq_len' for TOF
+            if 'seq_len' in cfg.model['tof_branch_cfg']:
+                cfg.model['tof_branch_cfg']['seq_len'] = max_length
+            else:
+                cfg.model['tof_branch_cfg']['sequence_length'] = max_length
+    except Exception:
+        # Be permissive: if a key is missing in a variant, skip it
+        pass
 
     # --- NEW: Spectrogram 数据生成超参数 ---
     spec_params = {}
@@ -449,10 +525,11 @@ def objective(trial: optuna.trial.Trial) -> float:
         # ===================================================================
         #                          4. 运行训练流程
         # ===================================================================
-        study_name = trial.study.study_name
-        log_dir = os.path.join(LOG_DIR, study_name)
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f'trial_{trial.number}.log')
+        # log file for this trial is already set up in setup_trial_logger via 'study_log_path'
+        # Redirect stdout/stderr to logger to capture print-based outputs from called functions
+        stdout_backup, stderr_backup = sys.stdout, sys.stderr
+        sys.stdout = LoggerWriter(logger.info)
+        sys.stderr = LoggerWriter(logger.error)
 
         # Build a compact view of the actually used parameters to keep logs clean
         _training_eff = {
@@ -611,91 +688,111 @@ def objective(trial: optuna.trial.Trial) -> float:
         # --- NEW: 记录增强配置 ---
         effective_params['aug_params'] = aug_params
 
-        # Store effective params for callback usage
+        # Store params and log header
         trial.set_user_attr('effective_params', effective_params)
+        logger.info("="*60)
+        logger.info("EFFECTIVE PARAMETERS")
+        logger.info("="*60)
+        for line in json.dumps(effective_params, indent=4).splitlines():
+            logger.info(line)
+        logger.info("="*60)
+        logger.info("TRAINING LOG")
+        logger.info("="*60)
 
-        with open(log_path, 'w', encoding='utf-8') as f:
-            f.write("="*60 + "\n")
-            f.write(f"TRIAL {trial.number} PARAMETERS (EFFECTIVE)\n")
-            f.write("="*60 + "\n")
-            f.write(json.dumps(effective_params, indent=4))
-            f.write("\n\n" + "="*60 + "\n")
-            f.write("TRAINING LOG\n")
-            f.write("="*60 + "\n")
+        # --- Assign GPU to this trial for parallel execution ---
+        # If config sets a fixed GPU, we still override here to distribute trials.
+        available = torch.cuda.device_count()
+        if available == 0:
+            gpu_id = None
+        else:
+            # Simple round-robin by trial number; users can also set via env
+            gpu_id = trial.number % available
+        trial.set_user_attr('assigned_gpu', gpu_id)
+        trial.set_user_attr('assigned_pid', os.getpid())
 
-        with manage_output(log_path):
-            # --- Assign GPU to this trial for parallel execution ---
-            # If config sets a fixed GPU, we still override here to distribute trials.
-            available = torch.cuda.device_count()
-            if available == 0:
-                gpu_id = None
-            else:
-                # Simple round-robin by trial number; users can also set via env
-                gpu_id = trial.number % available
-            trial.set_user_attr('assigned_gpu', gpu_id)
+        # Use the process-unique artifact directory defined earlier in this function
+        # (do not override it here to avoid collisions/mixed logs)
 
-            # Build a per-trial artifact directory to avoid conflicts across processes
-            trial_artifacts_dir = os.path.join(TRIAL_ARTIFACTS_DIR, f"trial_{trial.number}")
-            os.makedirs(trial_artifacts_dir, exist_ok=True)
-            trial.set_user_attr('artifact_dir', trial_artifacts_dir)
-
-            # Use selected GPU
-            device = train.setup_device(gpu_id)
-            
-            # Pass all required arguments to the training function
-            # 优先尝试传入 aug_params；若 train.py 版本较旧（不支持该参数），自动回退以保持兼容
-            try:
-                oof_score, _, _, _ = train.train_kfold_models(
-                    epochs=cfg.training['epochs'], 
-                    patience=cfg.training['patience'],
-                    weight_decay=cfg.training['weight_decay'],
-                    batch_size=cfg.data['batch_size'], 
-                    use_amp=cfg.training['use_amp'],
-                    variant=cfg.data['variant'], 
-                    model_cfg=cfg.model,
-                    mixup_enabled=cfg.training['mixup_enabled'], 
-                    mixup_alpha=cfg.training['mixup_alpha'],
-                    scheduler_cfg=cfg.training['scheduler_cfg'],
-                    spec_params=spec_params,
-                    device=device,
-                    show_stratification=False,
-                    loss_function='ce',
-                    output_dir=trial_artifacts_dir,
-                    num_workers=cfg.environment['num_workers'],
-                    aug_params=aug_params,  # NEW
-                )
-            except TypeError:
-                oof_score, _, _, _ = train.train_kfold_models(
-                    epochs=cfg.training['epochs'], 
-                    patience=cfg.training['patience'],
-                    weight_decay=cfg.training['weight_decay'],
-                    batch_size=cfg.data['batch_size'], 
-                    use_amp=cfg.training['use_amp'],
-                    variant=cfg.data['variant'], 
-                    model_cfg=cfg.model,
-                    mixup_enabled=cfg.training['mixup_enabled'], 
-                    mixup_alpha=cfg.training['mixup_alpha'],
-                    scheduler_cfg=cfg.training['scheduler_cfg'],
-                    spec_params=spec_params,
-                    device=device,
-                    show_stratification=False,
-                    loss_function='ce',
-                    output_dir=trial_artifacts_dir,
-                    num_workers=cfg.environment['num_workers'],
-                )
+        # Use selected GPU
+        device = train.setup_device(gpu_id, logger=logger)
         
-        # 将本次 trial 的产物缓存，供 Top-K 回调使用
+        # Pass all required arguments to the training function
+        # 优先尝试传入 aug_params；若 train.py 版本较旧（不支持该参数），自动回退以保持兼容
+        try:
+            oof_score, _, _, _ = train.train_kfold_models(
+                epochs=cfg.training['epochs'], 
+                patience=cfg.training['patience'],
+                weight_decay=cfg.training['weight_decay'],
+                batch_size=cfg.data['batch_size'], 
+                use_amp=cfg.training['use_amp'],
+                variant=cfg.data['variant'], 
+                model_cfg=cfg.model,
+                mixup_enabled=cfg.training['mixup_enabled'], 
+                mixup_alpha=cfg.training['mixup_alpha'],
+                scheduler_cfg=cfg.training['scheduler_cfg'],
+                spec_params=spec_params,
+                device=device,
+                show_stratification=False,
+                loss_function='ce',
+                output_dir=trial_artifacts_dir,
+                num_workers=cfg.environment['num_workers'],
+                aug_params=aug_params,  # NEW
+                logger=logger,
+            )
+        except TypeError:
+            oof_score, _, _, _ = train.train_kfold_models(
+                epochs=cfg.training['epochs'], 
+                patience=cfg.training['patience'],
+                weight_decay=cfg.training['weight_decay'],
+                batch_size=cfg.data['batch_size'], 
+                use_amp=cfg.training['use_amp'],
+                variant=cfg.data['variant'], 
+                model_cfg=cfg.model,
+                mixup_enabled=cfg.training['mixup_enabled'], 
+                mixup_alpha=cfg.training['mixup_alpha'],
+                scheduler_cfg=cfg.training['scheduler_cfg'],
+                spec_params=spec_params,
+                device=device,
+                show_stratification=False,
+                loss_function='ce',
+                output_dir=trial_artifacts_dir,
+                num_workers=cfg.environment['num_workers'],
+            )
+        
+        # Cache trial artifacts for Top-K
         stash_current_trial_artifacts(trial)
 
         torch.cuda.empty_cache()
+        logger.info(f"Trial {trial.number} finished successfully with score: {oof_score}")
         return oof_score
-
     except Exception as e:
-        print(f"Trial {trial.number} failed with an exception: {e}")
+        logger.error(f"Trial {trial.number} crashed with an exception: {e}")
         import traceback
-        traceback.print_exc()
-        # 假设 oof_score 越大越好，返回一个很差的数字
+        logger.error(traceback.format_exc())
         return -1.0
+    finally:
+        # Restore stdout/stderr regardless of success or failure
+        try:
+            sys.stdout, sys.stderr = stdout_backup, stderr_backup
+        except Exception:
+            pass
+
+        # Explicitly close and remove all handlers attached to this trial logger
+        try:
+            if 'logger' in locals() and isinstance(logger, logging.Logger):
+                for h in list(logger.handlers):
+                    try:
+                        h.flush()
+                        h.close()
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            logger.removeHandler(h)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
@@ -710,51 +807,51 @@ if __name__ == "__main__":
     print(f"Study Name: {STUDY_NAME}")
     print("="*60)
 
-    # --- Pre-load base data instead of full data ---
-    print("Preparing and pre-loading base data (without spectrograms)... This will happen only once.")
-    # 调用新的基础数据准备函数
-    base_fold_data, label_encoder, y_all, sequence_ids_all = train.prepare_base_data_kfold(
-        variant=variant
-    )
-    print("Base data has been pre-loaded into memory.")
-    print("="*60)
-    
-    # 保存原始函数以便后续恢复
-    original_prepare_data_func = train.prepare_data_kfold_multimodal
-
-    # --- MODIFIED: Create a new monkey-patch function ---
-    def mock_prepare_data_kfold_multimodal(*args, **kwargs):
-        """
-        猴子补丁函数: 使用预加载的基础数据和当前试验的频谱图参数，
-        动态生成完整的K-Fold数据，避免重复加载和特征工程。
-        """
-        print("--> Monkey patch activated: Generating spectrograms for new trial...")
-        # 从调用中提取 spec_params
-        spec_params = kwargs.get('spec_params')
-        if spec_params is None:
-             raise ValueError("spec_params not provided to mocked function!")
-
-        # Normalize 'noverlap' strictly
-        if 'noverlap' not in spec_params:
-            if 'noverlap_ratio' not in spec_params:
-                raise ValueError("spec_params must include either 'noverlap' or 'noverlap_ratio'.")
-            noverlap = int(spec_params['nperseg'] * spec_params['noverlap_ratio'])
-            if noverlap >= spec_params['nperseg']:
-                raise ValueError("Computed noverlap from noverlap_ratio must be < nperseg.")
-            spec_params = {**spec_params, 'noverlap': noverlap}
-
-        # 使用预加载的基础数据，动态生成频谱图
-        full_fold_data = train.generate_and_attach_spectrograms(
-            base_fold_data=base_fold_data,
-            spec_params=spec_params,
+    if ENABLE_BASE_PRELOAD:
+        # --- Pre-load base data instead of full data ---
+        print("Preparing and pre-loading base data (without spectrograms)... This will happen only once.")
+        base_fold_data, label_encoder, y_all, sequence_ids_all = train.prepare_base_data_kfold(
             variant=variant
         )
-        print("--> Spectrograms generated. Returning full dataset for trial.")
-        return full_fold_data, label_encoder, y_all, sequence_ids_all
+        print("Base data has been pre-loaded into memory.")
+        print("="*60)
 
-    # 应用猴子补丁
-    train.prepare_data_kfold_multimodal = mock_prepare_data_kfold_multimodal
-    print("Monkey patch applied. `prepare_data_kfold_multimodal` will now use pre-loaded data.")
+        # 保存原始函数以便后续恢复
+        original_prepare_data_func = train.prepare_data_kfold_multimodal
+
+        # --- MODIFIED: Create a new monkey-patch function ---
+        def mock_prepare_data_kfold_multimodal(*args, **kwargs):
+            """
+            猴子补丁函数: 使用预加载的基础数据和当前试验的频谱图参数，
+            动态生成完整的K-Fold数据，避免重复加载和特征工程。
+            仅在不进行全局 max_length 搜索时使用。
+            """
+            print("--> Monkey patch activated: Generating spectrograms for new trial...")
+            spec_params = kwargs.get('spec_params')
+            if spec_params is None:
+                 raise ValueError("spec_params not provided to mocked function!")
+
+            if 'noverlap' not in spec_params:
+                if 'noverlap_ratio' not in spec_params:
+                    raise ValueError("spec_params must include either 'noverlap' or 'noverlap_ratio'.")
+                noverlap = int(spec_params['nperseg'] * spec_params['noverlap_ratio'])
+                if noverlap >= spec_params['nperseg']:
+                    raise ValueError("Computed noverlap from noverlap_ratio must be < nperseg.")
+                spec_params = {**spec_params, 'noverlap': noverlap}
+
+            full_fold_data = train.generate_and_attach_spectrograms(
+                base_fold_data=base_fold_data,
+                spec_params=spec_params,
+                variant=variant
+            )
+            print("--> Spectrograms generated. Returning full dataset for trial.")
+            return full_fold_data, label_encoder, y_all, sequence_ids_all
+
+        # 应用猴子补丁
+        train.prepare_data_kfold_multimodal = mock_prepare_data_kfold_multimodal
+        print("Monkey patch applied. `prepare_data_kfold_multimodal` will now use pre-loaded data.")
+    else:
+        print("Global max_length search enabled. Skipping base-data preload and monkey patch.")
 
     try:
         sampler = TPESampler(multivariate=True, n_startup_trials=N_STARTUP_TRIALS, seed=42)
@@ -765,15 +862,18 @@ if __name__ == "__main__":
             load_if_exists=True,
             sampler=sampler,
         )
-        # 同时维护“当前最优”（原回调）和 Top-K（新回调）
+        # 维护 Top-K（新回调）。可选：当前最优（原回调）
         # Run trials in parallel across available GPUs using Optuna's n_jobs
         # Set n_jobs to the number of GPUs; Optuna will launch that many worker processes
         n_jobs = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        _callbacks = [save_top_k_models_callback(TOPK)]
+        if SAVE_BEST_TO_FINAL:
+            _callbacks.insert(0, save_best_model_callback)
         study.optimize(
             objective,
             n_trials=N_TRIALS,
             n_jobs=n_jobs,
-            callbacks=[save_best_model_callback, save_top_k_models_callback(TOPK)]
+            callbacks=_callbacks
         )
 
         print("\n\n" + "="*60)
@@ -786,8 +886,13 @@ if __name__ == "__main__":
 
     finally:
         if os.path.exists(TRIAL_ARTIFACTS_DIR):
-            shutil.rmtree(TRIAL_ARTIFACTS_DIR)
+            shutil.rmtree(TRIAL_ARTIFACTS_DIR, ignore_errors=True)
             print(f"\nCleaned up temporary artifacts directory: {TRIAL_ARTIFACTS_DIR}")
+
+        # 清理 trial cache 目录并恢复原始函数
+        if os.path.exists(TRIAL_CACHE_DIR):
+            shutil.rmtree(TRIAL_CACHE_DIR, ignore_errors=True)
+            print(f"Cleaned up temporary cache directory: {TRIAL_CACHE_DIR}")
 
         # 恢复原始函数
         train.prepare_data_kfold_multimodal = original_prepare_data_func

@@ -391,7 +391,17 @@ def apply_gate_with_T_tau(probs_18, label_encoder, T_star, tau_star, fallback_no
     return pred_idx
 
 
-def setup_device(gpu_id=None):
+def _log(logger, message: str):
+    if logger is not None:
+        try:
+            logger.info(message)
+        except Exception:
+            print(message)
+    else:
+        print(message)
+
+
+def setup_device(gpu_id=None, logger=None):
     """
     Setup computation device with intelligent GPU selection
     
@@ -402,21 +412,21 @@ def setup_device(gpu_id=None):
         torch.device: Selected device
     """
     if not torch.cuda.is_available():
-        print("CUDA not available, using CPU")
+        _log(logger, "CUDA not available, using CPU")
         return torch.device('cpu')
     
-    print(f"Available GPUs: {torch.cuda.device_count()}")
+    _log(logger, f"Available GPUs: {torch.cuda.device_count()}")
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
-        print(f"   GPU {i}: {torch.cuda.get_device_name(i)} ({props.total_memory // 1024**3} GB)")
+        _log(logger, f"   GPU {i}: {torch.cuda.get_device_name(i)} ({props.total_memory // 1024**3} GB)")
     
     # Select GPU
     if gpu_id is not None:
         if 0 <= gpu_id < torch.cuda.device_count():
             selected_gpu = gpu_id
-            print(f"Using specified GPU {gpu_id}")
+            _log(logger, f"Using specified GPU {gpu_id}")
         else:
-            print(f"Invalid GPU ID {gpu_id}, auto-selecting...")
+            _log(logger, f"Invalid GPU ID {gpu_id}, auto-selecting...")
             selected_gpu = None
     else:
         selected_gpu = None
@@ -441,7 +451,7 @@ def setup_device(gpu_id=None):
                 best_gpu = i
         
         selected_gpu = best_gpu
-        print(f"🎯 Auto-selected GPU {selected_gpu} (most free memory: {max_free // 1024**3} GB)")
+        _log(logger, f"🎯 Auto-selected GPU {selected_gpu} (most free memory: {max_free // 1024**3} GB)")
     
     # Setup selected GPU
     device = torch.device(f'cuda:{selected_gpu}')
@@ -460,11 +470,11 @@ def setup_device(gpu_id=None):
         total_mem = props.total_memory
         free = total_mem - used
 
-    print(f"\n🎯 Using GPU {selected_gpu}: {torch.cuda.get_device_name(selected_gpu)}")
-    print(f"GPU {selected_gpu} Memory:")
-    print(f"   Total: {total_mem // 1024**3} GB")
-    print(f"   Used: {used // 1024**2} MB")
-    print(f"   Free: {free // 1024**3} GB")
+    _log(logger, f"\n🎯 Using GPU {selected_gpu}: {torch.cuda.get_device_name(selected_gpu)}")
+    _log(logger, f"GPU {selected_gpu} Memory:")
+    _log(logger, f"   Total: {total_mem // 1024**3} GB")
+    _log(logger, f"   Used: {used // 1024**2} MB")
+    _log(logger, f"   Free: {free // 1024**3} GB")
     
     return device
 
@@ -579,7 +589,7 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     # --- MODIFIED: 返回 probs ---
     return avg_loss, accuracy, comp_score, all_preds, all_targets, all_probs
 
-def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR):
+def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR, logger=None):
     """Train the model with validation, using competition metric for model selection."""
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
@@ -621,7 +631,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
             optimizer = optim.AdamW(param_groups)
 
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
-    print(f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
+    _log(logger, f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
 
     # --- NEW: Dynamic Scheduler Setup ---
     if scheduler_cfg is None:
@@ -633,7 +643,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         warmup_ratio = scheduler_cfg['warmup_ratio']
         warmup_steps = int(warmup_ratio * total_training_steps)
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
-        print(f"Using Cosine Annealing scheduler with warmup ratio: {warmup_ratio} ({warmup_steps} steps).")
+        _log(logger, f"Using Cosine Annealing scheduler with warmup ratio: {warmup_ratio} ({warmup_steps} steps).")
     elif scheduler_cfg['type'] == 'reduce_on_plateau':
         # All parameters are now required for this scheduler type
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -648,16 +658,16 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
         warmup_epochs = int(warmup_ratio * epochs) if warmup_ratio > 0 else 0
         if warmup_epochs > 0:
             scheduler = WarmupAndReduceLROnPlateau(optimizer, warmup_epochs, plateau_scheduler)
-            print(f"Using ReduceLROnPlateau with a {warmup_epochs}-epoch linear warmup.")
+            _log(logger, f"Using ReduceLROnPlateau with a {warmup_epochs}-epoch linear warmup.")
         else:
             scheduler = plateau_scheduler
-            print(f"Using standard ReduceLROnPlateau scheduler.")
+            _log(logger, f"Using standard ReduceLROnPlateau scheduler.")
     
     history = {'train_loss': [], 'train_accuracy': [], 'train_competition_score': [], 'val_loss': [], 'val_accuracy': [], 'val_competition_score': [], 'learning_rate': []}
     best_val_score = 0
     patience_counter = 0
     
-    print(f"Training on device: {device}")
+    _log(logger, f"Training on device: {device}")
     
     for epoch in range(epochs):
         start_time = time.time()
@@ -674,7 +684,7 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
             ckpt_name = os.path.join(output_dir, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
             torch.save(model.state_dict(), ckpt_name)
             patience_counter = 0
-            print(f"   🚀 New best val score: {best_val_score:.4f}. Model saved.")
+            _log(logger, f"   🚀 New best val score: {best_val_score:.4f}. Model saved.")
         else:
             patience_counter += 1
         
@@ -707,25 +717,25 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
             return "LRs: " + ", ".join([f"{b}={lr:.2e}" for b, lr in visible.items()])
         lr_info = _format_lr_info(optimizer)
 
-        print(f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): Train Loss: {train_loss:.4f}, Train Score: {train_score:.4f} | Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | {lr_info}')
+        _log(logger, f'Epoch {epoch+1}/{epochs} ({epoch_time:.1f}s): Train Loss: {train_loss:.4f}, Train Score: {train_score:.4f} | Val Loss: {val_loss:.4f}, Val Score: {val_score:.4f} | {lr_info}')
         
         if patience_counter >= patience:
-            print(f'Early stopping at epoch {epoch+1} as validation score did not improve for {patience} epochs.')
+            _log(logger, f'Early stopping at epoch {epoch+1} as validation score did not improve for {patience} epochs.')
             break
     
     ckpt_name = os.path.join(output_dir, f'best_model_tmp{("_" + variant) if variant else ""}{fold_tag}.pth')
     if os.path.exists(ckpt_name):
         model.load_state_dict(torch.load(ckpt_name))
         os.remove(ckpt_name)
-        print(f"Loaded best model and deleted temporary file '{ckpt_name}'.")
+        _log(logger, f"Loaded best model and deleted temporary file '{ckpt_name}'.")
     
     return history
 
-def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, spec_params: dict = None, output_dir: str = WEIGHT_DIR, num_workers: int = 4, max_length: int = 100, aug_params: dict | None = None):
+def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15, show_stratification=False, use_amp=True, device=None, variant: str = 'full', loss_function='ce', focal_gamma=2.0, focal_alpha=1.0, model_cfg: dict = None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, spec_params: dict = None, output_dir: str = WEIGHT_DIR, num_workers: int = 4, max_length: int = 100, aug_params: dict | None = None, logger=None):
     """Train 5 models using 5-fold cross-validation"""
-    print("="*60)
-    print("TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
-    print("="*60)
+    _log(logger, "="*60)
+    _log(logger, "TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
+    _log(logger, "="*60)
     
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -763,9 +773,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         model_cfg['spec_branch_cfg']['in_channels'] = sample_spec.shape[1]
     model_cfg['mlp_branch_cfg']['input_features'] = sample_static.shape[1]
     
-    print(f"\nModel configuration from config file:")
+    _log(logger, f"\nModel configuration from config file:")
     for k, v in (model_cfg or {}).items():
-        if k != 'type': print(f"  {k}: {v}")
+        if k != 'type': _log(logger, f"  {k}: {v}")
     
     fold_results = []
     fold_models = []
@@ -773,9 +783,9 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     
     # 训练每个折叠
     for fold_idx in range(len(fold_data)):
-        print(f"\n" + "="*60)
-        print(f"TRAINING FOLD {fold_idx + 1}/{len(fold_data)}")
-        print("="*60)
+        _log(logger, f"\n" + "="*60)
+        _log(logger, f"TRAINING FOLD {fold_idx + 1}/{len(fold_data)}")
+        _log(logger, "="*60)
         
         fold = fold_data[fold_idx]
         spec_stats = fold['spec_stats']
@@ -829,7 +839,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             prefetch_factor=4,
         )
         
-        print(f"\nBuilding model for fold {fold_idx + 1}...")
+        _log(logger, f"\nBuilding model for fold {fold_idx + 1}...")
         model = build_from_cfg(model_cfg, MODELS)
         criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none') if loss_function == 'focal' else nn.CrossEntropyLoss(reduction='none')
         
@@ -841,18 +851,19 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         # except Exception as e:
         #     print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
         criterion = criterion.to(device)
-        print(f"Model and criterion loaded to {device}")
+        _log(logger, f"Model and criterion loaded to {device}")
         
-        print(f"\nTraining fold {fold_idx + 1}...")
+        _log(logger, f"\nTraining fold {fold_idx + 1}...")
         history = train_model(
             model=model, train_loader=train_loader, val_loader=val_loader, label_encoder=label_encoder, 
             epochs=epochs, patience=patience, weight_decay=weight_decay, use_amp=use_amp, 
             device=device, variant=variant, fold_tag=f'_{fold_idx+1}', criterion=criterion, 
             mixup_enabled=mixup_enabled, mixup_alpha=mixup_alpha, scheduler_cfg=scheduler_cfg, 
-            output_dir=output_dir
+            output_dir=output_dir,
+            logger=logger
         )
         
-        print(f"\nEvaluating fold {fold_idx + 1}...")
+        _log(logger, f"\nEvaluating fold {fold_idx + 1}...")
         _, _, _, all_preds_val, _, all_probs_val = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)  # --- MODIFIED
         oof_preds[fold['val_idx']] = all_preds_val
         oof_probs[fold['val_idx'], :] = all_probs_val
@@ -862,32 +873,32 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         # 保存模型
         model_filename = os.path.join(output_dir, f'model_fold_{fold_idx + 1}_{variant}.pth')
         torch.save({'state_dict': model.state_dict(), 'model_cfg': model_cfg}, model_filename)
-        print(f"Model saved as '{model_filename}'")
+        _log(logger, f"Model saved as '{model_filename}'")
 
         # 保存 scaler
         scaler_fold = fold['scaler']
         scaler_filename = os.path.join(output_dir, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
         with open(scaler_filename, 'wb') as sf:
             pickle.dump(scaler_fold, sf)
-        print(f"Scaler saved as '{scaler_filename}'")
+        _log(logger, f"Scaler saved as '{scaler_filename}'")
         
         # 保存该折叠的频谱图统计量 (spec_stats)
         spec_stats_filename = os.path.join(output_dir, f'spec_stats_fold_{fold_idx + 1}_{variant}.pkl')
         with open(spec_stats_filename, 'wb') as f:
             pickle.dump(spec_stats, f)
-        print(f"Spectrogram stats saved as '{spec_stats_filename}'")
+        _log(logger, f"Spectrogram stats saved as '{spec_stats_filename}'")
         
         # CRITICAL: Also save spec_params used for this training
         if spec_params is not None:
             spec_params_filename = os.path.join(output_dir, f'spec_params_fold_{fold_idx + 1}_{variant}.pkl')
             with open(spec_params_filename, 'wb') as f:
                 pickle.dump(spec_params, f)
-            print(f"Spectrogram params saved as '{spec_params_filename}'")
+            _log(logger, f"Spectrogram params saved as '{spec_params_filename}'")
         
         fold_results.append({'fold': fold_idx + 1, 'best_val_score': best_val_score})
         fold_models.append(model)
         fold_histories.append(history)
-        print(f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
+        _log(logger, f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
     
     # 保存全局标签编码器
     le_filename = os.path.join(output_dir, f'label_encoder_{variant}.pkl')
@@ -896,13 +907,13 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     print(f"Label encoder saved as '{le_filename}'")
     
     # 打印和保存所有折叠的总结
-    print(f"\n" + "="*60 + "\n5-FOLD CROSS-VALIDATION SUMMARY\n" + "="*60)
+    _log(logger, f"\n" + "="*60 + "\n5-FOLD CROSS-VALIDATION SUMMARY\n" + "="*60)
     best_scores = [result['best_val_score'] for result in fold_results]
-    print(f"Best Validation Scores per Fold: {[f'{score:.4f}' for score in best_scores]}")
-    print(f"\nMean Best Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
+    _log(logger, f"Best Validation Scores per Fold: {[f'{score:.4f}' for score in best_scores]}")
+    _log(logger, f"\nMean Best Score: {np.mean(best_scores):.4f} ± {np.std(best_scores):.4f}")
     
     best_fold_idx = np.argmax(best_scores)
-    print(f"\nBest performing fold: Fold {best_fold_idx + 1} (Score: {best_scores[best_fold_idx]:.4f})")
+    _log(logger, f"\nBest performing fold: Fold {best_fold_idx + 1} (Score: {best_scores[best_fold_idx]:.4f})")
     
     summary = {
         'fold_results': fold_results,
@@ -913,11 +924,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     }
     with open(os.path.join(output_dir, f'kfold_summary_{variant}.json'), 'w') as f:
         json.dump(summary, f, indent=2)
-    print(f"Summary saved to '{os.path.join(output_dir, f'kfold_summary_{variant}.json')}'")
+    _log(logger, f"Summary saved to '{os.path.join(output_dir, f'kfold_summary_{variant}.json')}'")
     
     # 计算并保存OOF结果
     oof_comp_score = competition_metric(oof_targets, oof_preds, label_encoder)
-    print(f"\n🏆 Overall OOF Competition Score: {oof_comp_score:.4f}")
+    _log(logger, f"\n🏆 Overall OOF Competition Score: {oof_comp_score:.4f}")
     oof_df = pd.DataFrame({
         'sequence_id': sequence_ids_all,
         'gesture_true': label_encoder.inverse_transform(oof_targets),
@@ -925,14 +936,14 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     })
     oof_path = os.path.join(output_dir, f'oof_predictions_{variant}.csv')
     oof_df.to_csv(oof_path, index=False)
-    print(f"OOF predictions saved to '{oof_path}'")
+    _log(logger, f"OOF predictions saved to '{oof_path}'")
 
     oof_probas_csv_path = os.path.join(output_dir, f"oof_probas_{variant}.csv")
     oof_probas_df = pd.DataFrame(oof_probs, columns=label_encoder.classes_)
     oof_probas_df.insert(0, "sequence_id", sequence_ids_all)
     oof_probas_df.insert(1, "gesture_true", label_encoder.inverse_transform(oof_targets))
     oof_probas_df.to_csv(oof_probas_csv_path, index=False)
-    print(f"OOF probability table saved to '{oof_probas_csv_path}'")
+    _log(logger, f"OOF probability table saved to '{oof_probas_csv_path}'")
 
     return oof_comp_score, fold_models, fold_histories, fold_results
 
