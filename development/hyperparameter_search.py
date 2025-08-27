@@ -6,6 +6,7 @@
 import optuna
 from optuna.samplers import TPESampler
 from optuna.trial import TrialState  # NEW
+from optuna.exceptions import TrialPruned
 import torch
 import copy
 import sys
@@ -78,7 +79,7 @@ ENABLE_BASE_PRELOAD = False
 
 # Control writing global logs/<study>/trial_*.log in addition to per-trial artifact logs.
 # Disabled by default to avoid parallel-process handler contention and mixed logs.
-STUDY_LOGS_ENABLED = True
+STUDY_LOGS_ENABLED = False
 
 # Control whether to include PID in per-trial directory names.
 # Enable to guarantee process-unique artifact dirs and avoid log mixing across parallel trials
@@ -272,6 +273,12 @@ def objective(trial: optuna.trial.Trial) -> float:
         trial_artifacts_dir = os.path.join(TRIAL_ARTIFACTS_DIR, f"trial_{trial.number}")
     os.makedirs(trial_artifacts_dir, exist_ok=True)
     trial.set_user_attr('artifact_dir', trial_artifacts_dir)
+
+    # 让compile结果可以跨fold使用
+    inductor_cache_dir = os.path.join(trial_artifacts_dir, f"inductor_cache_pid{os.getpid()}")
+    os.makedirs(inductor_cache_dir, exist_ok=True)
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache_dir
+
     # Optionally prepare global logs/<study>/trial_<n>.log path before creating the logger
     if STUDY_LOGS_ENABLED:
         study_name = trial.study.study_name
@@ -797,11 +804,26 @@ def objective(trial: optuna.trial.Trial) -> float:
             universal_newlines=True
         )
         # Stream subprocess logs into the per-trial logger
+        oom_detected = False  # NEW
         for line in proc.stdout:
-            logger.info(line.rstrip('\n'))
+            txt = line.rstrip('\n')
+            logger.info(txt)
+            low = txt.lower()
+            # 常见 OOM 关键词（尽量宽松一些）
+            if ("cuda out of memory" in low or
+                "cuda error: out of memory" in low or
+                "cublas_status_alloc_failed" in low or
+                "cudnn" in low and "alloc" in low and "failed" in low):
+                oom_detected = True
+
         ret = proc.wait()
         if ret != 0:
-            raise RuntimeError(f"Training subprocess exited with code {ret}")
+            if oom_detected:
+                trial.set_user_attr('oom', True)     # 方便统计
+                # 直接剪枝，不返回数值，避免进入 COMPLETE
+                raise TrialPruned("CUDA OOM during training subprocess")
+            else:
+                raise RuntimeError(f"Training subprocess exited with code {ret}")
 
         # Load result score
         if not os.path.exists(result_json_path):
@@ -820,7 +842,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         logger.error(f"Trial {trial.number} crashed with an exception: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return -1.0
+        raise
     finally:
         # Restore stdout/stderr regardless of success or failure
         try:
@@ -844,6 +866,10 @@ def objective(trial: optuna.trial.Trial) -> float:
                             pass
         except Exception:
             pass
+        
+        # 删除compile缓存
+        if os.path.isdir(inductor_cache_dir):
+            shutil.rmtree(inductor_cache_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -926,7 +952,7 @@ if __name__ == "__main__":
             n_trials=N_TRIALS,
             n_jobs=n_jobs,
             callbacks=_callbacks,
-            catch=(Exception,)
+            catch=(RuntimeError,)
         )
 
         print("\n\n" + "="*60)
