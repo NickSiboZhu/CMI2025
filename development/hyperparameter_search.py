@@ -15,6 +15,9 @@ import json
 import contextlib
 import logging
 import multiprocessing as mp
+import fcntl
+import subprocess
+import tempfile
 
 # Import train script AFTER basic imports to access its functions
 import train
@@ -37,7 +40,7 @@ class LoggerWriter:
 
 # ----------------- 用户配置 -----------------
 # 脚本将自动从该文件中读取 'variant' 并调整行为
-CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v2_imu_config.py'
+CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
 # 你想要要运行的试验次数
 N_TRIALS = 500
 # 初始随机搜索的次数
@@ -75,11 +78,14 @@ ENABLE_BASE_PRELOAD = False
 
 # Control writing global logs/<study>/trial_*.log in addition to per-trial artifact logs.
 # Disabled by default to avoid parallel-process handler contention and mixed logs.
-STUDY_LOGS_ENABLED = False
+STUDY_LOGS_ENABLED = True
 
 # Control whether to include PID in per-trial directory names.
 # Enable to guarantee process-unique artifact dirs and avoid log mixing across parallel trials
 USE_PID_IN_DIR = True
+
+# Track whether we applied the monkey patch so we can safely restore it later
+MONKEY_PATCH_APPLIED = False
 
 # 需要收集和保存的文件清单（与训练脚本保持一致）
 FILES_TO_COLLECT = (
@@ -128,26 +134,59 @@ def stash_current_trial_artifacts(trial):
 def save_top_k_models_callback(k=TOPK):
     """NEW: 在 weights/topk_<variant>/ 维护分数最高的前 K 个试验完整产物"""
     def _cb(study: optuna.study.Study, _trial: optuna.trial.FrozenTrial):
-        completed = [t for t in study.get_trials(deepcopy=False)
-                     if t.state == TrialState.COMPLETE and isinstance(t.value, (int, float))]
-        if not completed:
-            return
-        topk = sorted(completed, key=lambda t: t.value, reverse=True)[:k]
-        keep_names = set()
-        for rank, t in enumerate(topk, start=1):
-            artdir = t.user_attrs.get('cache_dir')
-            if not artdir or not os.path.isdir(artdir):
-                continue
-            out_name = f"{rank:02d}_trial{t.number}_score{t.value:.4f}_{variant}"
-            dst = os.path.join(TOPK_DIR, out_name)
-            keep_names.add(out_name)
-            if os.path.isdir(dst):
-                shutil.rmtree(dst)
-            shutil.copytree(artdir, dst)
-        for entry in os.listdir(TOPK_DIR):
-            path = os.path.join(TOPK_DIR, entry)
-            if os.path.isdir(path) and entry not in keep_names:
-                shutil.rmtree(path)
+        # Serialize Top-K directory updates across worker processes to avoid races
+        lock_path = os.path.join(TOPK_DIR, ".lock")
+        try:
+            with open(lock_path, 'w') as lockf:
+                try:
+                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                except Exception:
+                    # If lock fails, continue without it but wrap ops in try/except
+                    pass
+
+                completed = [t for t in study.get_trials(deepcopy=False)
+                             if t.state == TrialState.COMPLETE and isinstance(t.value, (int, float))]
+                if not completed:
+                    return
+                topk = sorted(completed, key=lambda t: t.value, reverse=True)[:k]
+                keep_names = set()
+                for rank, t in enumerate(topk, start=1):
+                    try:
+                        artdir = t.user_attrs.get('cache_dir')
+                        if not artdir or not os.path.isdir(artdir):
+                            continue
+                        out_name = f"{rank:02d}_trial{t.number}_score{t.value:.4f}_{variant}"
+                        dst = os.path.join(TOPK_DIR, out_name)
+                        keep_names.add(out_name)
+                        if os.path.isdir(dst):
+                            shutil.rmtree(dst, ignore_errors=True)
+                        # Copy into a temp dir then atomically rename to reduce race windows
+                        tmp_dst = dst + ".tmp"
+                        if os.path.isdir(tmp_dst):
+                            shutil.rmtree(tmp_dst, ignore_errors=True)
+                        shutil.copytree(artdir, tmp_dst)
+                        try:
+                            os.replace(tmp_dst, dst)
+                        except Exception:
+                            # Fallback: if atomic replace not available, try rmtree+copytree
+                            if os.path.isdir(dst):
+                                shutil.rmtree(dst, ignore_errors=True)
+                            shutil.copytree(artdir, dst)
+                    except Exception as e:
+                        # Never let callback abort optimization
+                        print(f"[TOPK_CALLBACK] Warning: failed to update entry for trial {t.number}: {e}")
+                        continue
+                # Cleanup non-topk entries (best-effort)
+                try:
+                    for entry in os.listdir(TOPK_DIR):
+                        path = os.path.join(TOPK_DIR, entry)
+                        if os.path.isdir(path) and entry not in keep_names and entry != ".lock":
+                            shutil.rmtree(path, ignore_errors=True)
+                except Exception as e:
+                    print(f"[TOPK_CALLBACK] Warning: cleanup failed: {e}")
+        except Exception as e:
+            # Final safety net: never raise from callback
+            print(f"[TOPK_CALLBACK] Warning: callback encountered an error: {e}")
     return _cb
 
 def setup_trial_logger(trial: optuna.trial.Trial) -> logging.Logger:
@@ -716,48 +755,60 @@ def objective(trial: optuna.trial.Trial) -> float:
         # Use selected GPU
         device = train.setup_device(gpu_id, logger=logger)
         
-        # Pass all required arguments to the training function
-        # 优先尝试传入 aug_params；若 train.py 版本较旧（不支持该参数），自动回退以保持兼容
-        try:
-            oof_score, _, _, _ = train.train_kfold_models(
-                epochs=cfg.training['epochs'], 
-                patience=cfg.training['patience'],
-                weight_decay=cfg.training['weight_decay'],
-                batch_size=cfg.data['batch_size'], 
-                use_amp=cfg.training['use_amp'],
-                variant=cfg.data['variant'], 
-                model_cfg=cfg.model,
-                mixup_enabled=cfg.training['mixup_enabled'], 
-                mixup_alpha=cfg.training['mixup_alpha'],
-                scheduler_cfg=cfg.training['scheduler_cfg'],
-                spec_params=spec_params,
-                device=device,
-                show_stratification=False,
-                loss_function='ce',
-                output_dir=trial_artifacts_dir,
-                num_workers=cfg.environment['num_workers'],
-                aug_params=aug_params,  # NEW
-                logger=logger,
-            )
-        except TypeError:
-            oof_score, _, _, _ = train.train_kfold_models(
-                epochs=cfg.training['epochs'], 
-                patience=cfg.training['patience'],
-                weight_decay=cfg.training['weight_decay'],
-                batch_size=cfg.data['batch_size'], 
-                use_amp=cfg.training['use_amp'],
-                variant=cfg.data['variant'], 
-                model_cfg=cfg.model,
-                mixup_enabled=cfg.training['mixup_enabled'], 
-                mixup_alpha=cfg.training['mixup_alpha'],
-                scheduler_cfg=cfg.training['scheduler_cfg'],
-                spec_params=spec_params,
-                device=device,
-                show_stratification=False,
-                loss_function='ce',
-                output_dir=trial_artifacts_dir,
-                num_workers=cfg.environment['num_workers'],
-            )
+        # Subprocess isolation: write a temporary config file and run train.py
+        # Build a trial-specific config module content
+        tmp_cfg_dir = tempfile.mkdtemp(prefix=f"trialcfg_{trial.number}_", dir=trial_artifacts_dir)
+        tmp_cfg_path = os.path.join(tmp_cfg_dir, "trial_config.py")
+        # Dump a minimal python config that train.py can consume via --config
+        cfg_dump = {
+            'environment': cfg.environment,
+            'training': cfg.training,
+            'data': cfg.data,
+            'model': cfg.model,
+            'spec_params': spec_params,
+        }
+        with open(tmp_cfg_path, 'w', encoding='utf-8') as f:
+            f.write("# Auto-generated trial config (Python literals)\n")
+            f.write("environment = "+repr(cfg_dump['environment'])+"\n")
+            f.write("training = "+repr(cfg_dump['training'])+"\n")
+            f.write("data = "+repr(cfg_dump['data'])+"\n")
+            f.write("model = "+repr(cfg_dump['model'])+"\n")
+            f.write("spec_params = "+repr(cfg_dump['spec_params'])+"\n")
+
+        # Prepare env for subprocess
+        env = os.environ.copy()
+        if gpu_id is not None:
+            env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+        # Direct the training outputs into the per-trial artifact directory
+        env['TRAIN_OUTPUT_DIR'] = trial_artifacts_dir
+        result_json_path = os.path.join(trial_artifacts_dir, 'result.json')
+        env['RESULT_JSON_PATH'] = result_json_path
+
+        # Launch training as isolated process; pipe output to the trial logger file
+        train_script = os.path.join(os.path.dirname(__file__), 'train.py')
+        cmd = [sys.executable, train_script, '--config', tmp_cfg_path]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(train_script),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=1,
+            universal_newlines=True
+        )
+        # Stream subprocess logs into the per-trial logger
+        for line in proc.stdout:
+            logger.info(line.rstrip('\n'))
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"Training subprocess exited with code {ret}")
+
+        # Load result score
+        if not os.path.exists(result_json_path):
+            raise RuntimeError("Training subprocess did not produce result.json")
+        with open(result_json_path, 'r') as rf:
+            result_payload = json.load(rf)
+        oof_score = float(result_payload.get('oof_score', -1.0))
         
         # Cache trial artifacts for Top-K
         stash_current_trial_artifacts(trial)
@@ -849,6 +900,7 @@ if __name__ == "__main__":
 
         # 应用猴子补丁
         train.prepare_data_kfold_multimodal = mock_prepare_data_kfold_multimodal
+        MONKEY_PATCH_APPLIED = True
         print("Monkey patch applied. `prepare_data_kfold_multimodal` will now use pre-loaded data.")
     else:
         print("Global max_length search enabled. Skipping base-data preload and monkey patch.")
@@ -873,7 +925,8 @@ if __name__ == "__main__":
             objective,
             n_trials=N_TRIALS,
             n_jobs=n_jobs,
-            callbacks=_callbacks
+            callbacks=_callbacks,
+            catch=(Exception,)
         )
 
         print("\n\n" + "="*60)
@@ -894,6 +947,11 @@ if __name__ == "__main__":
             shutil.rmtree(TRIAL_CACHE_DIR, ignore_errors=True)
             print(f"Cleaned up temporary cache directory: {TRIAL_CACHE_DIR}")
 
-        # 恢复原始函数
-        train.prepare_data_kfold_multimodal = original_prepare_data_func
-        print("\nMonkey patch restored. Original function is back.")
+        # 恢复原始函数（仅当之前应用过猴子补丁）
+        try:
+            if MONKEY_PATCH_APPLIED:
+                train.prepare_data_kfold_multimodal = original_prepare_data_func
+                print("\nMonkey patch restored. Original function is back.")
+        except NameError:
+            # original_prepare_data_func 未定义时跳过恢复
+            pass

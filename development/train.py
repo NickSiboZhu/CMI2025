@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch._dynamo
+import multiprocessing as mp
 
 # 加上这行，可以在支持的硬件上提升性能
 torch.set_float32_matmul_precision('high')
@@ -826,6 +827,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             pin_memory_device="cuda",
             persistent_workers=True,
             prefetch_factor=4,
+            multiprocessing_context=mp.get_context('spawn'),
             # drop_last=True
         )
         val_loader = DataLoader(
@@ -837,6 +839,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             pin_memory_device="cuda",
             persistent_workers=True,
             prefetch_factor=4,
+            multiprocessing_context=mp.get_context('spawn'),
         )
         
         _log(logger, f"\nBuilding model for fold {fold_idx + 1}...")
@@ -1046,7 +1049,11 @@ def main():
     # Setup device
     device = setup_device(gpu_id)
     
-    # Train models using config, using the default output directory
+    # Allow overriding output directory via env for isolated trial runs
+    output_dir_env = os.environ.get("TRAIN_OUTPUT_DIR")
+    output_dir_to_use = output_dir_env if output_dir_env else WEIGHT_DIR
+
+    # Train models using config, using the chosen output directory
     oof_score, fold_models, fold_histories, fold_results = train_kfold_models(
         epochs=epochs,
         patience=patience,
@@ -1064,12 +1071,27 @@ def main():
         mixup_alpha=mixup_alpha,
         scheduler_cfg=scheduler_cfg,
         spec_params=spec_params,  # Pass spec_params from config
-        output_dir=WEIGHT_DIR,  # Explicitly pass the default
+        output_dir=output_dir_to_use,  # Can be overridden by env
         num_workers=num_workers,
         max_length=max_length
     )
     
     print("✅ Config-driven training completed!")
+
+    # If requested, write result JSON for outer orchestration
+    result_json_path = os.environ.get("RESULT_JSON_PATH")
+    if result_json_path:
+        try:
+            result_payload = {
+                "oof_score": float(oof_score),
+                "summary_path": os.path.join(output_dir_to_use, f'kfold_summary_{variant}.json'),
+                "weights_dir": output_dir_to_use,
+            }
+            with open(result_json_path, 'w') as rf:
+                json.dump(result_payload, rf)
+            print(f"Result JSON written to: {result_json_path}")
+        except Exception as e:
+            print(f"Warning: failed to write RESULT_JSON_PATH ('{result_json_path}'): {e}")
     return fold_models, fold_histories, fold_results
 
 
