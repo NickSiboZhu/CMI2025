@@ -157,6 +157,10 @@ for v in VARIANTS:
             sp0 = fold_entries[0][3]
             print(f"✅  Resources for '{v}' variant loaded successfully.")
             print(f"    Using spec_params from training (fold1): nperseg={sp0['nperseg']}, noverlap={sp0['noverlap']}")
+            # Log detected sequence lengths across folds for this variant
+            seq_lens_variant = sorted(list(set(filter(lambda x: x is not None, [fe[4] for fe in fold_entries]))))
+            if seq_lens_variant:
+                print(f"    Detected sequence_length(s) across folds: {seq_lens_variant}")
     except FileNotFoundError as e:
         print(f"⚠️  Could not load resources for '{v}' variant: {e}.")
 
