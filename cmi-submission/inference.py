@@ -50,14 +50,13 @@ def _load_preprocessing_objects(variant: str):
     return le
 
 def _load_models(device, variant: str):
-    """Load models, their scalers, spectrogram stats, and capture model config (once).
+    """Load per-fold models and their per-fold objects (scaler, spec stats, spec params).
 
-    Additionally, if spec_params were saved during training as
-    'spec_params_fold_{i}_{variant}.pkl', load them and return one set.
+    Returns a list of tuples per fold: (model, scaler, spec_stats, spec_params, seq_len_from_model),
+    and the first model's config for logging only.
     """
-    triplets = []
+    fold_entries = []
     model_cfg_once = None
-    spec_params_once = None
     fold_paths = [os.path.join(WEIGHT_DIR, f"model_fold_{i}_{variant}.pth") for i in range(1, 6)]
     fold_paths = [p for p in fold_paths if os.path.exists(p)]
 
@@ -82,11 +81,12 @@ def _load_models(device, variant: str):
         with open(spec_stats_path, "rb") as f:
             spec_stats = pickle.load(f)
 
-        # Try to load spectrogram generation params used in training for this fold
+        # Load per-fold spectrogram generation params used in training
         spec_params_path = os.path.join(WEIGHT_DIR, f"spec_params_fold_{fold_num}_{variant}.pkl")
-        if spec_params_once is None and os.path.exists(spec_params_path):
-            with open(spec_params_path, "rb") as f:
-                spec_params_once = pickle.load(f)
+        if not os.path.exists(spec_params_path):
+            raise FileNotFoundError(f"Missing spectrogram params for fold {fold_num} ({variant}): {spec_params_path}")
+        with open(spec_params_path, "rb") as f:
+            spec_params_fold = pickle.load(f)
 
         ckpt = torch.load(p, map_location=device)
         if 'model_cfg' not in ckpt:
@@ -110,8 +110,29 @@ def _load_models(device, variant: str):
         except Exception as e:
             print(f"⚠️  torch.compile failed during inference setup: {e}")
 
-        triplets.append((model, scaler, spec_stats))
-    return triplets, model_cfg_once, spec_params_once
+        # Determine the sequence length this fold expects
+        seq_len_from_model = None
+        if 'sequence_length' in model_cfg:
+            seq_len_from_model = model_cfg['sequence_length']
+        elif 'seq_len' in model_cfg:
+            seq_len_from_model = model_cfg['seq_len']
+        elif 'tof_branch_cfg' in model_cfg and 'seq_len' in model_cfg['tof_branch_cfg']:
+            seq_len_from_model = model_cfg['tof_branch_cfg']['seq_len']
+
+        # Safety net: ensure spectrogram max_length matches the model's expected sequence length
+        try:
+            max_len_from_spec = spec_params_fold.get('max_length', None)
+        except Exception:
+            max_len_from_spec = None
+        if (seq_len_from_model is not None) and (max_len_from_spec is not None):
+            if max_len_from_spec != seq_len_from_model:
+                raise ValueError(
+                    f"Fold {fold_num} ({variant}) length mismatch: model seq_len={seq_len_from_model} "
+                    f"vs spec_params.max_length={max_len_from_spec}"
+                )
+
+        fold_entries.append((model, scaler, spec_stats, spec_params_fold, seq_len_from_model))
+    return fold_entries, model_cfg_once
 
 # REMOVED: _load_spec_params_for_variant function
 # We now strictly require spec_params to be loaded from weights directory
@@ -126,26 +147,20 @@ RESOURCES = {}
 for v in VARIANTS:
     try:
         le = _load_preprocessing_objects(v)
-        model_scaler_stats_triplets, model_cfg_once, spec_params_from_model = _load_models(DEVICE, v)
-        if model_scaler_stats_triplets:
-            # STRICT: Require spec_params from weights (no config fallback)
-            if spec_params_from_model is None:
-                raise FileNotFoundError(
-                    f"spec_params not found in weights for variant '{v}'. "
-                    f"Please retrain with the updated train.py that saves spec_params."
-                )
-            spec_params = spec_params_from_model
-            # Ensure sequence length used for padding matches the trained model
-            seq_len_from_model = model_cfg_once['sequence_length'] if model_cfg_once and 'sequence_length' in model_cfg_once else spec_params['max_length']
-            spec_params['max_length'] = seq_len_from_model
+        fold_entries, model_cfg_once = _load_models(DEVICE, v)
+        if fold_entries:
             RESOURCES[v] = {
                 "label_encoder": le,
-                "model_scaler_stats_triplets": model_scaler_stats_triplets,
-                "spec_params": spec_params,
-                "sequence_length": seq_len_from_model,
+                "fold_entries": fold_entries,
             }
+            # Log some info from the first fold
+            sp0 = fold_entries[0][3]
             print(f"✅  Resources for '{v}' variant loaded successfully.")
-            print(f"    Using spec_params from training: nperseg={spec_params['nperseg']}, noverlap={spec_params['noverlap']}")
+            print(f"    Using spec_params from training (fold1): nperseg={sp0['nperseg']}, noverlap={sp0['noverlap']}")
+            # Log detected sequence lengths across folds for this variant
+            seq_lens_variant = sorted(list(set(filter(lambda x: x is not None, [fe[4] for fe in fold_entries]))))
+            if seq_lens_variant:
+                print(f"    Detected sequence_length(s) across folds: {seq_lens_variant}")
     except FileNotFoundError as e:
         print(f"⚠️  Could not load resources for '{v}' variant: {e}.")
 
@@ -213,14 +228,12 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 
     res = RESOURCES[variant]
     le = res["label_encoder"]
-    model_scaler_stats_triplets = res["model_scaler_stats_triplets"]
-    spec_params = res["spec_params"]
-    sequence_length = res["sequence_length"]
+    fold_entries = res["fold_entries"]
 
     with torch.no_grad():
         probs_sum = None
         
-        for model, scaler, spec_stats in model_scaler_stats_triplets:
+        for model, scaler, spec_stats, spec_params, sequence_length in fold_entries:
             
             # 1. 标准化时域数据
             # --- MODIFIED: 在此处添加 .astype(np.float32) 来确保数据类型一致 ---
@@ -307,10 +320,10 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
                     noverlap=spec_params['noverlap'],
                     max_length=sequence_length,
                 )
-                spec_norm = (spec - spec_mean) / (spec_std + 1e-6)
+                spec_norm = ((spec - spec_mean) / (spec_std + 1e-6)).astype(np.float32)
                 sequence_spectrograms.append(spec_norm)
             
-            X_spec = np.stack(sequence_spectrograms, axis=0)[np.newaxis, ...]
+            X_spec = np.stack(sequence_spectrograms, axis=0).astype(np.float32)[np.newaxis, ...]
             
             # 5. 转换为Tensor (由于上游已是float32, 这里生成的也是FloatTensor)
             xb_imu = torch.from_numpy(X_imu_pad).to(DEVICE)
@@ -366,7 +379,7 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
             if probs_sum is None: probs_sum = probs
             else: probs_sum += probs
 
-        avg_probs = probs_sum / len(model_scaler_stats_triplets)
+        avg_probs = probs_sum / len(fold_entries)
 
     pred_idx = int(np.argmax(avg_probs, axis=1)[0])
     label = le.inverse_transform([pred_idx])[0]
