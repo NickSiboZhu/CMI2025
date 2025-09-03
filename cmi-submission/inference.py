@@ -218,7 +218,7 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
             spec_stats = pickle.load(f)
         with open(spec_params_path, "rb") as f:
             spec_params = pickle.load(f)
-
+        
         ckpt = torch.load(model_path, map_location=device)
         if 'model_cfg' not in ckpt:
             raise ValueError(f"[{model_path}] 缺少 'model_cfg'")
