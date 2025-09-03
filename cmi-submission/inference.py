@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CMI – Detect Behavior with Sensor Data
---------------------------------------
-推理（多提交包 + 多基模型 + 严格类名对齐 + 无回退）
+CMI – Detect Behavior with Sensor Data (Robust Stacking Inference)
+------------------------------------------------------------------
+**安全/健壮版** 推理脚本：
+- 多提交包 + 多基模型 + 严格类名对齐 + 无回退（缺件直接报错）
+- 关键增强：
+  1) scaler.transform 之前**列对齐 + 缺列补位**；之后 **NaN/Inf 总闸清洗**。
+  2) 频谱图计算对**输入/输出**做 NaN/Inf 清洗；缺失通道→零信号。
+  3) stacking 特征 `x_stack` 在喂给 sklearn 前做**最终清洗**。
+  4) 模型输出若出现非有限值，**回退为均匀分布**，防止污染。
 
-你的目录约定：
+目录约定与上一版一致：
 - 多个提交包：/kaggle/input/cmi2025-ensemble/ensemble learning/cmi-submission (0.844), (0.846), (0.849)
 - 每个提交包的 weights 目录中：
    model_fold1_imu.pth / model_fold2_imu.pth ... （无 full/imu 子文件夹）
@@ -14,9 +20,9 @@ CMI – Detect Behavior with Sensor Data
 - 元模型工件（stacking）：/kaggle/input/cmi-link/stack_artifacts/{imu,full}/{meta_model.pkl, meta_info.json}
 - 基模型类名文件（用于映射到元模型类空间），优先查找（在每个提交包的 weights 下）：
    label_encoder_{variant}.pkl  或  classes_{variant}.json
-   （若你另有 label_map_{variant}.json 也会自动应用）
+   （若另有 label_map_{variant}.json 也会自动应用）
 
-注意：脚本不做“回退为平均”的逻辑，缺件直接报错，便于尽快发现问题。
+【注意】脚本不做“回退为平均”的缺件回退；只对**数值异常/缺列**做兜底，确保隐藏集极端样本不再导致 notebook 异常。
 """
 
 import os
@@ -64,9 +70,7 @@ def _ensure(p: str, what: str):
         raise FileNotFoundError(f"缺少 {what}: {p}")
 
 def _list_submission_dirs(root: str) -> Dict[str, str]:
-    """
-    返回 { '0.844': '<root>/cmi-submission (0.844)', ... }
-    """
+    """返回 { '0.844': '<root>/cmi-submission (0.844)', ... }"""
     dmap = {}
     if not os.path.isdir(root):
         raise FileNotFoundError(f"根路径不存在：{root}")
@@ -95,11 +99,9 @@ def _load_meta_for_variant(variant: str):
     print(f"✅ [{variant}] 元模型来自: {mdir}")
     return est, meta_info
 
+
 def _list_bases_from_meta(meta_info: Dict) -> List[str]:
-    """
-    从 meta_info['feature_columns'] 取基模型前缀（保持顺序去重）
-    形如 ["0.849_imu.csv::ClassA", "0.846_imu.csv::ClassA", ...]
-    """
+    """从 meta_info['feature_columns'] 取基模型前缀（保持顺序去重）"""
     bases = []
     for col in meta_info["feature_columns"]:
         prefix = col.split("::", 1)[0]
@@ -111,20 +113,13 @@ def _list_bases_from_meta(meta_info: Dict) -> List[str]:
 
 # ------------------ OOF 基模型前缀解析 -> 提交包 + 变体 ------------------
 def _parse_base_key(base_key: str) -> Tuple[str, str]:
-    """
-    base_key: "0.849_imu.csv" -> ('0.849', 'imu')
-              "0.846_full.csv" -> ('0.846', 'full')
-    """
     m = re.fullmatch(r"(\d+\.\d{3})_(imu|full)\.csv", base_key)
     if not m:
         raise ValueError(f"无法解析基模型前缀: {base_key}（期望格式 '0.849_imu.csv'）")
     return m.group(1), m.group(2)
 
+
 def _weights_dir_for_key(base_key: str) -> Tuple[str, str]:
-    """
-    由 base_key 确定其权重目录（提交包的 weights 根目录）和提交包根路径：
-      -> <PACKS_PARENT_DIR>/cmi-submission (lb)/weights/
-    """
     lb, variant = _parse_base_key(base_key)
     dmap = _list_submission_dirs(PACKS_PARENT_DIR)
     if lb not in dmap:
@@ -137,11 +132,6 @@ def _weights_dir_for_key(base_key: str) -> Tuple[str, str]:
 
 # ------------------ 基模型类信息（在 weights 根目录，按 variant 区分） ------------------
 def _load_base_classes(weights_dir: str, variant: str) -> List[str]:
-    """
-    优先：weights/label_encoder_{variant}.pkl
-    次选：weights/classes_{variant}.json
-    再次：weights/label_encoder.pkl 或 weights/classes.json
-    """
     cand = [
         os.path.join(weights_dir, f"label_encoder_{variant}.pkl"),
         os.path.join(weights_dir, f"classes_{variant}.json"),
@@ -158,7 +148,7 @@ def _load_base_classes(weights_dir: str, variant: str) -> List[str]:
             if not cls:
                 raise ValueError(f"[{p}] classes_ 为空")
             return [str(x) for x in cls]
-        else:  # .json
+        else:
             with open(p, "r", encoding="utf-8") as f:
                 arr = json.load(f)
             if not isinstance(arr, list) or not all(isinstance(x, str) for x in arr) or not arr:
@@ -169,30 +159,20 @@ def _load_base_classes(weights_dir: str, variant: str) -> List[str]:
         f"也可提供 label_encoder.pkl / classes.json）"
     )
 
+
 def _load_label_map(weights_dir: str, variant: str) -> Dict[str, str]:
-    """
-    可选：weights/label_map_{variant}.json 或 weights/label_map.json
-    """
     for name in [f"label_map_{variant}.json", "label_map.json"]:
         p = os.path.join(weights_dir, name)
         if os.path.exists(p):
             with open(p, "r", encoding="utf-8") as f:
                 d = json.load(f)
             if not isinstance(d, dict):
-                raise ValueError(f"[{p}] 需为字典 {{基类: 元类}}")
+                raise ValueError(f"[{p}] 需为字典 {基类: 元类}")
             return {str(k): str(v) for k, v in d.items()}
     return {}
 
 # ------------------ 模型加载（按文件名后缀 _{variant} + fold 号） ------------------
 def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> List[Tuple]:
-    """
-    需要文件：
-      model_fold{K}_{variant}.pth
-      scaler_fold{K}_{variant}.pkl
-      spec_stats_fold{K}_{variant}.pkl
-      spec_params_fold{K}_{variant}.pkl
-    也兼容中间带下划线：fold_{K}
-    """
     files = os.listdir(weights_dir)
 
     # 识别可用的 fold 号
@@ -208,10 +188,8 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
         raise FileNotFoundError(f"[{weights_dir}] 未发现任何 model_foldK_{variant}.pth")
 
     def _pick(tag: str, k: int, must_ext: str):
-        # 允许 fold_{k} 或 fold{k}
         cand = [f for f in files if f.endswith(must_ext) and re.fullmatch(rf"{tag}_fold_?{k}_{variant}\{must_ext}", f)]
         if not cand:
-            # 一些人命名是 f"{tag}_fold{k}_{variant}.pkl"
             cand = [f for f in files if f.endswith(must_ext) and re.fullmatch(rf"{tag}_fold{k}_{variant}\{must_ext}", f)]
         if not cand:
             raise FileNotFoundError(f"[{weights_dir}] 缺少 {tag}_fold{k}_{variant}{must_ext}")
@@ -219,7 +197,6 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
 
     folds = []
     for k in fold_nums:
-        # 路径
         model_path = None
         for f in files:
             if pat_model.match(f) or pat_model2.match(f):
@@ -254,11 +231,7 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
             from collections import OrderedDict
             state_dict = OrderedDict((k.replace('_orig_mod.', '', 1), v) for k, v in state_dict.items())
         model.load_state_dict(state_dict, strict=True)
-        model.to(device).eval()
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-        except Exception as e:
-            print(f"⚠️  torch.compile skipped: {e}")
+        model.eval()
 
         # 推断 seq_len
         seq_len = None
@@ -287,6 +260,7 @@ def _decide_variant(seq_df: "pd.DataFrame") -> str:
     thm_all_missing = not seq_df[thm_cols].notna().values.any() if thm_cols else True
     tof_all_missing = not seq_df[tof_cols].notna().values.any() if tof_cols else True
     return "imu" if thm_all_missing and tof_all_missing else "full"
+
 
 def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     seq_df = seq_pl.to_pandas()
@@ -317,14 +291,34 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     final_features_df = final_features_df[[c for c in feature_cols if c in final_features_df.columns]]
     return variant, final_features_df
 
+# ------------------ 频谱图安全生成（包一层总闸） ------------------
+_BASE_SPEC_ORDER = ['linear_acc_x','linear_acc_y','linear_acc_z','angular_vel_x','angular_vel_y','angular_vel_z']
+
+def _make_zero_spec(seq_len: int, spec_params: dict) -> np.ndarray:
+    zero_sig = np.zeros(seq_len, dtype=np.float32)
+    spec = generate_spectrogram(zero_sig, fs=spec_params['fs'], nperseg=spec_params['nperseg'],
+                                noverlap=spec_params['noverlap'], max_length=seq_len)
+    spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return spec
+
 # ------------------ 单折推理（与训练折一致的 scaler/spec） ------------------
 def _predict_one_fold(
     fold_entry: Tuple, features_df: pd.DataFrame, device: torch.device
 ) -> np.ndarray:
     model, scaler, spec_stats, spec_params, sequence_length = fold_entry
 
-    # 1) 标准化
+    # --- 列对齐 + 缺列补位 ---
+    if hasattr(scaler, 'feature_names_'):
+        needed_cols = list(scaler.feature_names_)
+        missing_cols = [c for c in needed_cols if c not in features_df.columns]
+        if missing_cols:
+            for c in missing_cols:
+                features_df[c] = np.nan
+        features_df = features_df[needed_cols]
+
+    # 1) 标准化 + 数值清洗
     X_scaled_unpadded = scaler.transform(features_df).astype(np.float32)
+    X_scaled_unpadded = np.nan_to_num(X_scaled_unpadded, nan=0.0, posinf=0.0, neginf=0.0)
     scaled_feature_names = scaler.get_feature_names_out().tolist()
 
     # 2) 列分派
@@ -332,34 +326,45 @@ def _predict_one_fold(
     thm_cols, tof_cols = generate_feature_columns(scaled_feature_names)
     thm_cols = [c for c in thm_cols if c in scaled_feature_names]
     tof_cols = [c for c in tof_cols if c in scaled_feature_names]
-    spec_source_cols = ['linear_acc_x','linear_acc_y','linear_acc_z','angular_vel_x','angular_vel_y','angular_vel_z']
-    spec_source_cols = [c for c in spec_source_cols if c in scaled_feature_names]
     imu_cols = [c for c in scaled_feature_names if c not in static_cols + tof_cols + thm_cols]
 
+    # 频谱源按固定顺序（缺列→零信号）
+    spec_source_cols = [c for c in _BASE_SPEC_ORDER]
+
     static_idx = [scaled_feature_names.index(c) for c in static_cols]
+    static_arr = X_scaled_unpadded[0:1, static_idx]
+
+    # 时域分量
     tof_idx    = [scaled_feature_names.index(c) for c in tof_cols]
     thm_idx    = [scaled_feature_names.index(c) for c in thm_cols]
     imu_idx    = [scaled_feature_names.index(c) for c in imu_cols]
-    spec_idx   = [scaled_feature_names.index(c) for c in spec_source_cols]
 
-    static_arr = X_scaled_unpadded[0:1, static_idx]
-    tof_arr, thm_arr, imu_arr = X_scaled_unpadded[:, tof_idx], X_scaled_unpadded[:, thm_idx], X_scaled_unpadded[:, imu_idx]
+    tof_arr, thm_arr, imu_arr = (
+        X_scaled_unpadded[:, tof_idx] if len(tof_idx) else np.zeros((X_scaled_unpadded.shape[0], 0), dtype=np.float32),
+        X_scaled_unpadded[:, thm_idx] if len(thm_idx) else np.zeros((X_scaled_unpadded.shape[0], 0), dtype=np.float32),
+        X_scaled_unpadded[:, imu_idx] if len(imu_idx) else np.zeros((X_scaled_unpadded.shape[0], 0), dtype=np.float32),
+    )
 
-    # TOF mask
+    # TOF mask（按传感器）
     tof_sensor_ids = []
     for c in scaled_feature_names:
         if c.startswith('tof_') and c.endswith('_missing') and c.count('_') == 2:
             try:
                 sid = int(c.split('_')[1])
-                if sid not in tof_sensor_ids: tof_sensor_ids.append(sid)
-            except Exception: pass
+                if sid not in tof_sensor_ids:
+                    tof_sensor_ids.append(sid)
+            except Exception:
+                pass
     if not tof_sensor_ids:
         seen = set()
         for c in scaled_feature_names:
             if c.startswith('tof_') and '_v' in c and not c.endswith('_missing'):
-                try: seen.add(int(c.split('_')[1]))
-                except Exception: pass
+                try:
+                    seen.add(int(c.split('_')[1]))
+                except Exception:
+                    pass
         tof_sensor_ids = sorted(list(seen))
+
     ch_mask_vals = []
     for sid in sorted(tof_sensor_ids):
         flag = f"tof_{sid}_missing"
@@ -369,33 +374,43 @@ def _predict_one_fold(
         else:
             valid = 1.0
         ch_mask_vals.append(valid)
-    tof_channel_mask_arr = np.array(ch_mask_vals, dtype=np.float32)[np.newaxis, :]
-    spec_source_arr = X_scaled_unpadded[:, spec_idx]
+    tof_channel_mask_arr = np.array(ch_mask_vals, dtype=np.float32)[np.newaxis, :] if ch_mask_vals else np.ones((1,0), dtype=np.float32)
 
-    # 3) Padding
+    # 3) Padding（严格长度）
     X_imu_pad, imu_mask = pad_sequences([imu_arr], max_length=sequence_length)
     X_thm_pad, _        = pad_sequences([thm_arr], max_length=sequence_length)
     X_tof_pad, _        = pad_sequences([tof_arr], max_length=sequence_length)
 
-    # 4) 频谱图
+    # 4) 频谱图（缺列→零信号；输入/输出 NaN→0）
     sequence_spectrograms = []
     spec_mean, spec_std = spec_stats['mean'], spec_stats['std']
-    for i in range(spec_source_arr.shape[1]):
-        signal_1d = spec_source_arr[:, i]
-        seq_len_current = len(signal_1d)
-        if seq_len_current >= sequence_length:
-            padded_signal = signal_1d[-sequence_length:]
+
+    # 预计算零谱，保证形状
+    zero_spec = _make_zero_spec(sequence_length, spec_params)
+
+    for name in spec_source_cols:
+        if name in scaled_feature_names:
+            idx = scaled_feature_names.index(name)
+            signal_1d = X_scaled_unpadded[:, idx]
+            signal_1d = np.nan_to_num(signal_1d, nan=0.0, posinf=0.0, neginf=0.0)
+            if len(signal_1d) >= sequence_length:
+                padded_signal = signal_1d[-sequence_length:]
+            else:
+                padded_signal = np.pad(signal_1d, (sequence_length - len(signal_1d), 0), 'constant')
+            spec = generate_spectrogram(
+                padded_signal,
+                fs=spec_params['fs'],
+                nperseg=spec_params['nperseg'],
+                noverlap=spec_params['noverlap'],
+                max_length=sequence_length,
+            )
+            spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0)
         else:
-            padded_signal = np.pad(signal_1d, (sequence_length - seq_len_current, 0), 'constant')
-        spec = generate_spectrogram(
-            padded_signal,
-            fs=spec_params['fs'],
-            nperseg=spec_params['nperseg'],
-            noverlap=spec_params['noverlap'],
-            max_length=sequence_length,
-        )
+            spec = zero_spec
         spec_norm = ((spec - spec_mean) / (spec_std + 1e-6)).astype(np.float32)
+        spec_norm = np.nan_to_num(spec_norm, nan=0.0, posinf=0.0, neginf=0.0)
         sequence_spectrograms.append(spec_norm)
+
     X_spec = np.stack(sequence_spectrograms, axis=0).astype(np.float32)[np.newaxis, ...]
 
     # 5) Tensor
@@ -410,8 +425,10 @@ def _predict_one_fold(
     thm_sensor_ids_inf = []
     for c in scaled_feature_names:
         if c.startswith('thm_') and c.endswith('_missing'):
-            try: thm_sensor_ids_inf.append(int(c.split('_')[1]))
-            except Exception: pass
+            try:
+                thm_sensor_ids_inf.append(int(c.split('_')[1]))
+            except Exception:
+                pass
     thm_sensor_ids_inf = sorted(list(set(thm_sensor_ids_inf)))
     thm_mask_vals = []
     for sid in thm_sensor_ids_inf:
@@ -436,6 +453,7 @@ def _predict_one_fold(
                     imu_rot_mask[0, i] = 0.0
     xb_imu_ch_mask = torch.from_numpy(imu_rot_mask).to(DEVICE)
 
+    model = model.to(DEVICE)
     # 6) 前向
     with torch.no_grad():
         logits = model(
@@ -446,7 +464,17 @@ def _predict_one_fold(
             imu_channel_mask=xb_imu_ch_mask
         )
         probs = torch.softmax(logits, dim=1).cpu().numpy()
+
+    # 数值守护：若出现 NaN/Inf，回退为均匀分布
+    if not np.isfinite(probs).all():
+        C = probs.shape[1]
+        probs = np.full((1, C), 1.0 / C, dtype=np.float32)
+
+    model = model.to("cpu")
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return probs  # [1, C_base]
+
 
 def _avg_proba_for_base(fold_entries: List[Tuple], features_df: pd.DataFrame) -> np.ndarray:
     acc = None
@@ -454,7 +482,12 @@ def _avg_proba_for_base(fold_entries: List[Tuple], features_df: pd.DataFrame) ->
         p = _predict_one_fold(fe, features_df, DEVICE)  # [1, C_base]
         acc = p if acc is None else acc + p
     avg = acc / len(fold_entries)
+    avg = np.nan_to_num(avg, nan=0.0, posinf=0.0, neginf=0.0)
+    s = float(avg.sum())
+    if s > 0:
+        avg = avg / s
     return avg[0]  # [C_base]
+
 
 def _map_base_to_meta_proba(
     proba_base: np.ndarray,
@@ -462,9 +495,6 @@ def _map_base_to_meta_proba(
     meta_classes: List[str],
     base_to_meta_map: Dict[str, str]
 ) -> np.ndarray:
-    """
-    将“基模型类空间”的概率映射到“元模型类空间”。
-    """
     meta_idx = {name: i for i, name in enumerate(meta_classes)}
     out = np.zeros((len(meta_classes),), dtype=np.float32)
 
@@ -501,12 +531,10 @@ packs = _list_submission_dirs(PACKS_PARENT_DIR)
 for v in VARIANTS:
     meta_info = META[v]["info"]
     base_keys = _list_bases_from_meta(meta_info)
-    class_names_full = meta_info["class_names_full"]
 
     bases: Dict[str, Dict] = {}
     for bk in base_keys:
         lb, variant_b = _parse_base_key(bk)
-        # 我们只加载与当前 variant 相同的 base（另一 variant 的 base 在该 variant 预测时会被忽略）
         if variant_b != v:
             continue
 
@@ -534,6 +562,7 @@ for v in VARIANTS:
 print("✅  Resource initialization complete. Ready for inference.")
 
 # ------------------ 预测（严格 stacking） ------------------
+
 def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
     res_v = RESOURCES[variant]
     est = res_v["meta"]["est"]
@@ -547,7 +576,6 @@ def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.
         if bk in probs_by_base:
             continue
         if bk not in res_v["bases"]:
-            # 这个前缀可能属于另一 variant，当前 variant 跳过
             continue
         base_entry = res_v["bases"][bk]
         p_base = _avg_proba_for_base(base_entry["fold_entries"], features_df)  # [C_base]
@@ -560,10 +588,12 @@ def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.
     for j, col in enumerate(meta_info["feature_columns"]):
         prefix, cls = col.split("::", 1)
         if prefix not in probs_by_base:
-            # 属于另一 variant 的列置 0
             x_stack[0, j] = 0.0
         else:
             x_stack[0, j] = float(probs_by_base[prefix][cls_to_idx[cls]])
+
+    # NEW: stacking 特征最终清洗，确保 sklearn 不吃到 NaN
+    x_stack = np.nan_to_num(x_stack, nan=1e-6, posinf=1e-6, neginf=1e-6)
 
     # 元模型输出概率
     if hasattr(est, "predict_proba"):
@@ -580,7 +610,13 @@ def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.
             raise RuntimeError("元模型既无 predict_proba 也无 decision_function。")
 
     proba = _safe_clip01(np.asarray(proba))
+    proba = np.nan_to_num(proba, nan=1e-9, posinf=1.0, neginf=0.0)
+    # 归一化
+    s = proba.sum(axis=1, keepdims=True)
+    s[s == 0] = 1.0
+    proba = proba / s
     return proba, meta_classes
+
 
 def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     if sequence.is_empty():
@@ -590,7 +626,6 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     proba, class_names = _predict_with_stacking(variant, features_df)
     pred_idx = int(np.argmax(proba, axis=1)[0])
     pred_name = class_names[pred_idx]
-    # 评测不接受 "Other"；若命中就改成比赛要求的名字
     if pred_name.strip().lower() == "other":
         pred_name = "Drink from bottle/cup"
     return pred_name
