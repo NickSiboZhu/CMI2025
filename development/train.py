@@ -822,19 +822,19 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=num_workers,
+            num_workers=8,
             pin_memory=True,
             pin_memory_device="cuda",
             persistent_workers=True,
             prefetch_factor=4,
             multiprocessing_context=mp.get_context('spawn'),
-            # drop_last=True
+            drop_last=True
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=2048,
+            batch_size=512,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=8,
             pin_memory=True,
             pin_memory_device="cuda",
             persistent_workers=True,
@@ -848,11 +848,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         
         model = model.to(device)
         # 编译模型以加快速度
-        # try:
-        #     # 最后一个batch不满，数据形状不固定，启用dynamic
-        #     model = torch.compile(model, mode='reduce-overhead', dynamic=False)
-        # except Exception as e:
-        #     print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
+        try:
+            # 最后一个batch不满，数据形状不固定，启用dynamic
+            model = torch.compile(model, mode='reduce-overhead', dynamic=False)
+        except Exception as e:
+            print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
         criterion = criterion.to(device)
         _log(logger, f"Model and criterion loaded to {device}")
         
@@ -899,7 +899,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
             _log(logger, f"Spectrogram params saved as '{spec_params_filename}'")
         
         fold_results.append({'fold': fold_idx + 1, 'best_val_score': best_val_score})
-        fold_models.append(model)
+        fold_models.append(model_filename)
         fold_histories.append(history)
         _log(logger, f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
     
@@ -947,6 +947,17 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     oof_probas_df.insert(1, "gesture_true", label_encoder.inverse_transform(oof_targets))
     oof_probas_df.to_csv(oof_probas_csv_path, index=False)
     _log(logger, f"OOF probability table saved to '{oof_probas_csv_path}'")
+
+    model.to('cpu')
+
+    # 2) 彻底释放引用（optimizer/scheduler/scaler 在 train_model() 里，见下一条）
+    del model
+    torch.cuda.empty_cache()
+    import gc; gc.collect()
+
+    # 3) 显式销毁 dataloader，确保 persistent_workers 及时退出
+    del train_loader, val_loader, train_dataset, val_dataset
+    gc.collect()
 
     return oof_comp_score, fold_models, fold_histories, fold_results
 

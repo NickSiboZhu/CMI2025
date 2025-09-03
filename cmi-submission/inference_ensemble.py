@@ -167,7 +167,7 @@ def _load_label_map(weights_dir: str, variant: str) -> Dict[str, str]:
             with open(p, "r", encoding="utf-8") as f:
                 d = json.load(f)
             if not isinstance(d, dict):
-                raise ValueError(f"[{p}] 需为字典 {{基类: 元类}}")
+                raise ValueError(f"[{p}] 需为字典 {基类: 元类}")
             return {str(k): str(v) for k, v in d.items()}
     return {}
 
@@ -188,10 +188,9 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
         raise FileNotFoundError(f"[{weights_dir}] 未发现任何 model_foldK_{variant}.pth")
 
     def _pick(tag: str, k: int, must_ext: str):
-        ext_pat = re.escape(must_ext)
-        cand = [f for f in files if f.endswith(must_ext) and re.fullmatch(rf"{tag}_fold_?{k}_{variant}{ext_pat}", f)]
+        cand = [f for f in files if f.endswith(must_ext) and re.fullmatch(rf"{tag}_fold_?{k}_{variant}\{must_ext}", f)]
         if not cand:
-            cand = [f for f in files if f.endswith(must_ext) and re.fullmatch(rf"{tag}_fold{k}_{variant}{ext_pat}", f)]
+            cand = [f for f in files if f.endswith(must_ext) and re.fullmatch(rf"{tag}_fold{k}_{variant}\{must_ext}", f)]
         if not cand:
             raise FileNotFoundError(f"[{weights_dir}] 缺少 {tag}_fold{k}_{variant}{must_ext}")
         return os.path.join(weights_dir, cand[0])

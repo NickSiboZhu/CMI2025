@@ -307,11 +307,11 @@ class TemporalEncoder(nn.Module):
             return out
 
         else:
-            # --- Transformer 分支保持不变 ---
-            cls = self.cls_token.expand(B, 1, -1).to(features.device)  # (B,1,C)
-            x = torch.cat([cls, features], dim=1)                       # (B,S+1,C)
+            # --- Transformer 分支 ---
+            # 确保 cls_token / pos_encoding 与 features 的 dtype/device 一致
+            cls = self.cls_token.to(dtype=features.dtype, device=features.device).expand(B, 1, -1)  # (B,1,C)
+            x = torch.cat([cls, features], dim=1)  # (B,S+1,C)
 
-            # 动态适配位置编码（与原实现一致）
             cur_len = x.size(1)
             if self.pos_encoding.size(1) != cur_len:
                 if self.pos_encoding.size(1) > cur_len:
@@ -322,15 +322,18 @@ class TemporalEncoder(nn.Module):
                     pos_enc = torch.cat([self.pos_encoding, pad], dim=1)
             else:
                 pos_enc = self.pos_encoding
-
-            x = x + pos_enc.to(x.device)
+            x = x + pos_enc.to(dtype=x.dtype, device=x.device)
             x = self.dropout(x)
 
-            cls_mask = torch.ones(B, 1, device=mask.device)
-            transformer_mask = torch.cat([cls_mask, mask], dim=1)
-            attention_mask = (transformer_mask == 0)
+            # ---- 关键：把 key_padding_mask 做成布尔且连续 ----
+            cls_mask = torch.ones(B, 1, device=mask.device, dtype=mask.dtype)
+            transformer_mask = torch.cat([cls_mask, mask], dim=1)  # (B,S+1)
+            attention_mask = (transformer_mask == 0).to(torch.bool).contiguous()  # (B,S+1), True = padding
 
-            x = self.transformer(x, src_key_padding_mask=attention_mask)  # (B,S+1,C)
+            # ---- 仅在这段前向强制使用 math kernel，避免高效核对 bias 连续性的苛刻要求 ----
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                x = self.transformer(x, src_key_padding_mask=attention_mask)  # (B,S+1,C)
+
             cls_out = x[:, 0]
             return self.classifier(cls_out)
 
