@@ -847,12 +847,12 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none') if loss_function == 'focal' else nn.CrossEntropyLoss(reduction='none')
         
         model = model.to(device)
-        # 编译模型以加快速度
-        try:
-            # 最后一个batch不满，数据形状不固定，启用dynamic
-            model = torch.compile(model, mode='reduce-overhead', dynamic=False)
-        except Exception as e:
-            print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
+        # # 编译模型以加快速度
+        # try:
+        #     # 最后一个batch不满，数据形状不固定，启用dynamic
+        #     model = torch.compile(model, mode='reduce-overhead', dynamic=False)
+        # except Exception as e:
+        #     print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
         criterion = criterion.to(device)
         _log(logger, f"Model and criterion loaded to {device}")
         

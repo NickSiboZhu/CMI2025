@@ -49,6 +49,8 @@ venv.bak/
 *.feather
 *.h5
 *.hdf5
+# Allow project-specific data
+!/development/data/*.csv
 
 # Model outputs and logs
 *.log

@@ -113,7 +113,7 @@ training = dict(
     patience=15,
     # start_lr is no longer used; learning rates are defined per-layer below
     weight_decay=1e-2,
-    use_amp=True, 
+    use_amp=False, 
     mixup_enabled=True,
     mixup_alpha=0.2,
     loss=dict(type='CrossEntropyLoss'),

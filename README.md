@@ -1,35 +1,44 @@
 # CMI Gesture Recognition System
 
-A config-driven multimodal deep learning system for detecting body-focused repetitive behaviors (BFRB) using sensor data from IMU, thermal, and time-of-flight sensors.
+A config-driven, multimodal deep learning system for detecting body-focused repetitive behaviors (BFRB) using sensor data from IMU, thermal, and time-of-flight sensors. This document outlines the core methodologies, system architecture, and usage instructions.
+
+## Core Methodologies
+
+This section details the key strategies that enabled rapid, robust model development.
+
+### 1. Computation — An Efficient Experimental Framework
+
+To enable rapid iteration, we optimized our workflow for speed:
+
+-   **Data Processing Acceleration (pandas → polars)**: We migrated heavy preprocessing from pandas to polars. Its multi-threaded architecture provided a significant performance boost, drastically reducing data preparation time.
+-   **Model Training Acceleration (`torch.compile`)**: We used `torch.compile` to JIT-compile the model, which optimized GPU operations and reduced Python overhead for faster training cycles.
+
+These optimizations were a strategic necessity, allowing us to conduct more experiments and thoroughly validate our hypotheses.
+
+### 2. Data — From Raw Signals to Intelligent Features
+
+Our approach to data was two-pronged: sophisticated feature engineering and creating a trustworthy evaluation system.
+
+-   **Feature Engineering**:
+    -   **Domain-Knowledge**: We leveraged domain expertise to engineer critical time-domain features (e.g., gravity-compensated linear acceleration, quaternion-derived angular velocity).
+    -   **Frequency Domain (Spectrograms)**: We created a spectrogram branch, treating the 1D signal as an "image." This enabled a 2D CNN to explicitly learn from time-frequency representations, capturing features complementary to the 1D branch.
+-   **Reliable Cross-Validation (CV)**: We developed a robust, subject-grouped CV framework to prevent data leakage, ensuring that performance metrics reflect true generalization capabilities.
+
+### 3. Model — A Narrative of Architectural Evolution
+
+Our model development for time-series classification followed a logical progression, with each architecture addressing the limitations of the last.
+
+-   **Stage 1: The 1D CNN Baseline**: A standard 1D CNN extracted local patterns. However, its reliance on global pooling to compress the temporal dimension resulted in the loss of crucial sequential information.
+-   **Stage 2: Introducing Sequential Context with LSTM**: To preserve temporal dependencies, we replaced global pooling with an LSTM. The CNN's output feature map was treated as a sequence, and the LSTM's final hidden state provided a context-aware summary for classification.
+-   **Stage 3: Capturing Global Relationships with a Transformer**: To model relationships between all parts of the sequence simultaneously, we used a Transformer. A `[CLS]` token, processed by the self-attention mechanism, created a globally-informed representation that captured complex inter-dependencies across the entire time series.
+-   **Handling Auxiliary Data (Multi-Branch Approach)**:
+    -   **Static Features**: Time-invariant data (e.g., demographics) were processed in a separate MLP branch.
+    -   **Spectrograms**: Processed in their own dedicated 2D CNN branch.
+-   **Final Model**: The outputs from all branches (Time-Series, Static, Spectrogram) were concatenated before the final classification head to create a comprehensive, multi-modal model.
 
 ## System Architecture
 
-### Config-Driven Design
-
-The system uses a centralized configuration approach where all training parameters, model architecture, and data processing settings are defined in Python config files. This ensures reproducibility and easy experimentation.
-
-```
-configs/
-├── base_config.py          # Base training configuration
-├── model_configs/          # Model architecture definitions
-│   ├── multimodal_v1.py   # Full multimodal model
-│   └── imu_only.py        # IMU-only variant
-└── ensemble_configs/       # Stacking configurations
-    └── ridge_stack.py     # Ridge meta-learner config
-```
-
-### Data Pipeline
-
-The system processes three types of sensor data:
-- **IMU**: Linear acceleration + angular velocity (6 channels)
-- **Thermal**: Temperature readings from multiple sensors
-- **Time-of-Flight**: Distance measurements in 8x8 pixel arrays
-
-### Model Structure
-
-The multimodal architecture processes different sensor types through specialized branches:
-
-#### Architecture Overview
+#### Overall Architecture
 
 ```mermaid
 graph TD
@@ -37,9 +46,9 @@ graph TD
     B --> C["Feature Engineering"]
     C --> D["Multimodal Branches"]
     
-    D --> E["IMU Branch<br/>(CNN1D + Attention)"]
+    D --> E["IMU Branch<br/>(CNN1D + Attention/LSTM/Transformer)"]
     D --> F["Thermal Branch<br/>(CNN1D)"]
-    D --> G["ToF Branch<br/>(CNN2D + Reshape)"]
+    D --> G["ToF Branch<br/>(CNN2D)"]
     D --> H["Spectrogram Branch<br/>(CNN2D)"]
     D --> I["Static Features<br/>(MLP)"]
     
@@ -50,7 +59,7 @@ graph TD
     I --> J
     
     J --> K["Classifier Head<br/>(18 Classes)"]
-    K --> L["Competition Metric<br/>(Binary F1 + Macro F1)"]
+    K --> L["Competition Metric"]
     
     style E fill:#e1f5fe
     style F fill:#fff3e0
@@ -59,17 +68,9 @@ graph TD
     style I fill:#fce4ec
 ```
 
-#### Branch Details
+#### Ensemble Strategy
 
-- **IMU Branch**: 1D CNN with attention mechanism for temporal acceleration/gyroscope data
-- **Thermal Branch**: 1D CNN for temperature sensor readings
-- **ToF Branch**: 2D CNN processing 8x8 pixel distance arrays, reshaped for temporal modeling
-- **Spectrogram Branch**: 2D CNN analyzing frequency-domain representations of IMU signals
-- **Static Features**: MLP for demographic and engineered features
-
-### Ensemble Strategy
-
-The system uses a two-stage stacking approach:
+The system uses a two-stage stacking approach with subject-grouped cross-validation to prevent data leakage and improve generalization.
 
 ```mermaid
 graph LR
@@ -87,11 +88,11 @@ graph LR
     style E fill:#e8f5e8
 ```
 
-1. **Base Models**: Multiple variants (full/imu) trained with 5-fold group-aware CV
-2. **Meta Learner**: Ridge classifier with optional probability calibration
-3. **Features**: Concatenated out-of-fold predictions from base models
+## Usage
 
-## Installation
+The training workflow consists of installing dependencies, training base models via configuration files, optionally running an ensemble, and executing inference.
+
+### Installation
 
 ```bash
 # Clone repository
@@ -99,362 +100,151 @@ git clone <repository-url>
 cd cmi_competition
 
 # Install dependencies
-pip install torch torchvision torchaudio
+pip install torch torchvision toraudio
 pip install scikit-learn pandas numpy polars
 pip install lightgbm xgboost catboost  # optional ensemble models
 pip install scipy matplotlib seaborn  # for analysis
 ```
 
-## Usage
+### Training
 
-### Training Base Models
+The training system is fully config-driven. All parameters, including model architecture, data variants, and hyperparameters, are defined in configuration files.
 
-The training system is fully config-driven. Create or modify config files in `configs/`:
+**Example Commands:**
 
 ```bash
-# Train with specific config
-python development/train.py --config configs/multimodal_v1.py
+# Basic training with a specific config
+python development/train.py --config cmi-submission/configs/multimodality_model_v1_full_config.py
 
 # Show data stratification details
-python development/train.py --config configs/multimodal_v1.py --stratification
+python development/train.py --config cmi-submission/configs/multimodality_model_v1_full_config.py --stratification
+
+# Override output directory
+TRAIN_OUTPUT_DIR=/custom/path python development/train.py --config cmi-submission/configs/multimodality_model_v1_full_config.py
 ```
 
-#### Sample Config Structure
+**Sample Config Structure:**
+
+A single configuration file defines the environment, data, training, model, and spectrogram parameters.
 
 ```python
-# configs/multimodal_v1.py
-environment = {
-    'seed': 42,
-    'gpu_id': None,  # Auto-select
-    'num_workers': 8
-}
+# cmi-submission/configs/multimodality_model_v3_full_config.py
+# ===================================================================
+#   Configuration v3 – FULL Multimodal (IMU + THM + TOF + DEMO)
+# ===================================================================
 
-data = {
-    'variant': 'full',  # 'full' or 'imu'
-    'batch_size': 32,
-    'max_length': 100
-}
+# --------------------------- Data Settings ---------------------------
+data = dict(
+    variant='full',
+    max_length=100,
+    batch_size=64,
+)
 
-training = {
-    'epochs': 50,
-    'patience': 15,
-    'weight_decay': 1e-2,
-    'use_amp': True,
-    'mixup_enabled': True,
-    'mixup_alpha': 0.4,
-    'loss': {'type': 'FocalLoss', 'gamma': 2.0, 'alpha': 1.0},
-    'scheduler_cfg': {
-        'type': 'cosine',
-        'warmup_ratio': 0.1,
-        'layer_lrs': {
-            'imu': 3e-4,
-            'thm': 2e-4,
-            'tof': 2e-4,
-            'spec': 1e-4,
-            'mlp': 1e-3,
-            'fusion': 5e-4
-        }
-    }
-}
+# -------------------------- Model Architecture -----------------------
+model = dict(
+    type='MultimodalityModel',
+    num_classes=18,
+    sequence_length=data['max_length'],
 
-model = {
-    'type': 'MultimodalityModel',
-    'imu_branch_cfg': {'hidden_dims': [256, 128]},
-    'thm_branch_cfg': {'hidden_dims': [128, 64]},
-    'tof_branch_cfg': {'hidden_dims': [256, 128]},
-    'spec_branch_cfg': {'hidden_dims': [256, 128]},
-    'mlp_branch_cfg': {'hidden_dims': [256, 128]}
-}
+    # IMU branch (inertial measurement unit)
+    imu_branch_cfg=dict(
+        type='CNN1D',
+        input_channels=None,  # will be filled dynamically from data
+        sequence_length=data['max_length'],
+        filters=[64, 128, 256],
+        kernel_sizes=[5, 5, 3],
+        temporal_aggregation='temporal_encoder',  # 'global_pool' or 'temporal_encoder'
+        temporal_mode='lstm',  # 'lstm' or 'transformer'
+        use_residual=True,
+        use_se=True,
+    ),
 
-spec_params = {
-    'fs': 50,
-    'nperseg': 16,
-    'noverlap_ratio': 0.5
-}
+    # THM branch (thermopile sensors)
+    thm_branch_cfg=dict(
+        type='CNN1D',
+        input_channels=None,  # will be filled dynamically from data
+        sequence_length=data['max_length'],
+        filters=[32, 64, 128],
+        kernel_sizes=[5, 5, 3],
+        temporal_aggregation='temporal_encoder',
+        temporal_mode='lstm',
+        use_residual=True,
+        use_se=True,
+    ),
+
+    # TOF 2D CNN branch config
+    tof_branch_cfg=dict(
+        type='TemporalTOF2DCNN',
+        input_channels=5,
+        seq_len=100,
+        conv_channels=[32, 64, 128],
+        temporal_mode='lstm',
+        use_residual=True,
+        use_se=True,
+    ),
+
+    # MLP branch for static features
+    mlp_branch_cfg=dict(
+        type='MLP',
+        input_features=None,  # will be filled dynamically
+        hidden_dims=[64],
+        output_dim=32,
+    ),
+
+    # Spectrogram branch
+    spec_branch_cfg=dict(
+        type='SpectrogramCNN',
+        in_channels=6,
+        filters=[32, 64, 128],
+        use_residual=True,
+    ),
+
+    # Enable/disable branches
+    use_thm=True,
+    use_tof=True,
+    use_spec=True,
+
+    # Fusion head
+    fusion_head_cfg=dict(
+        type='FusionHead',
+        hidden_dims=[256, 128],
+        dropout_rates=[0.4, 0.3]
+    )
+)
+
+# ----------------------- Training Strategy ---------------------------
+training = dict(
+    epochs=100,
+    patience=15,
+    weight_decay=1e-2,
+    use_amp=False,
+    mixup_enabled=True,
+    mixup_alpha=0.2,
+    loss=dict(type='CrossEntropyLoss'),
+    scheduler_cfg=dict(
+        type='cosine',
+        warmup_ratio=0.1,
+        layer_lrs=dict(
+            imu=1e-3, thm=1e-3, tof=5e-4, mlp=2e-3,
+            spec=2e-3, fusion=2e-3,
+        )
+    ),
+)
+
+# -------------------------- Environment ------------------------------
+environment = dict(gpu_id=None, seed=42, num_workers=4)
+
+# -------------------------- Spectrogram Params ------------------------
+spec_params = dict(
+    fs=10.0,
+    nperseg=20,
+    noverlap_ratio=0.75,
+    max_length=data['max_length'],
+)
 ```
 
 ### Ensemble Training (Stacking)
 
-After training base models, use the ensemble module for meta-learning:
-
-```python
-# ensemble/stack.py or import ensemble.stack
-from ensemble.stack import CONFIG, main
-
-# Configure stacking
-CONFIG.update({
-    "INPUT_DIR": "./weights",  # Directory with OOF CSV files
-    "TRAIN_CSV": "path/to/train.csv",
-    "META_MODEL": "ridge",
-    "RIDGE_CALIBRATE_PREFIT": True,
-    "USE_COMPOSITE_CLASS_WEIGHTS": True
-})
-
-# Run stacking
-main()
-```
-
-Or run directly:
-```bash
-python -m ensemble.stack
-```
-
-### Inference
-
-The inference system supports multiple submission packages with automatic model discovery:
-
-```python
-# For Kaggle submission
-python cmi-submission/inference.py
-
-# Local testing with verbose output
-INFER_VERBOSE=1 python cmi-submission/inference.py
-```
-
-## Key Features
-
-### Advanced Training Techniques
-
-- **Discriminative Learning Rates**: Different learning rates per model branch
-- **Mixup Augmentation**: Data augmentation for improved generalization  
-- **Composite Class Weighting**: Custom BFRB-aware loss weighting
-- **Group-aware Cross-Validation**: Subject-based folding to prevent data leakage
-- **Mixed Precision Training**: Automatic mixed precision for faster training
-
-### Robust Ensemble Methods
-
-- **Subject-grouped Stacking**: Prevents overfitting in meta-learner
-- **Probability Calibration**: Temperature scaling and Platt scaling options
-- **Multiple Meta Models**: Ridge, Logistic, Random Forest, XGBoost, LightGBM, CatBoost
-- **NaN-safe Pipeline**: Comprehensive handling of missing/invalid values
-
-### Production-ready Inference
-
-- **Multi-package Support**: Handles multiple submission packages automatically
-- **Graceful Degradation**: Fallback mechanisms for missing components
-- **Memory Optimization**: Efficient resource management for Kaggle constraints
-- **Class Name Alignment**: Robust label mapping between training and inference
-
-## File Structure
+After training base models and generating out-of-fold predictions, use the ensemble module for meta-learning.
 
 ```
-cmi_competition/
-├── development/
-│   ├── train.py              # Main training script
-│   └── configs/              # Training configurations
-├── cmi-submission/
-│   ├── inference.py          # Kaggle inference script
-│   ├── models/               # Model architectures
-│   ├── data_utils/           # Data processing utilities
-│   └── weights/              # Trained model artifacts
-├── ensemble/
-│   ├── __init__.py
-│   └── stack.py              # Meta-learning/stacking
-└── README.md
-```
-
-## Competition Metric
-
-The system optimizes for the official competition metric:
-
-**Score = 0.5 × Binary F1 + 0.5 × Macro F1**
-
-Where:
-- **Binary F1**: BFRB vs Non-BFRB classification
-- **Macro F1**: Average F1 across 9 classes (8 BFRB + 1 combined Non-BFRB)
-
-## Training Workflow
-
-1. **Data Preparation**: Automatic feature engineering and variant detection
-2. **Base Model Training**: 5-fold cross-validation with group awareness
-3. **OOF Collection**: Out-of-fold predictions saved for stacking
-4. **Meta Learning**: Train ensemble on OOF predictions
-5. **Artifact Export**: Save models, scalers, and metadata for inference
-
-## Commands Reference
-
-### Training Commands
-
-```bash
-# Basic training
-python development/train.py --config configs/base_config.py
-
-# With stratification analysis
-python development/train.py --config configs/base_config.py --stratification
-
-# Override output directory
-TRAIN_OUTPUT_DIR=/custom/path python development/train.py --config configs/base_config.py
-
-# Save results for orchestration
-RESULT_JSON_PATH=/path/result.json python development/train.py --config configs/base_config.py
-```
-
-### Ensemble Commands
-
-```bash
-# Run stacking with default config
-python -m ensemble.stack
-
-# Import and configure programmatically
-python -c "
-from ensemble.stack import CONFIG, main
-CONFIG['INPUT_DIR'] = './oof_predictions'
-CONFIG['META_MODEL'] = 'ridge'
-main()
-"
-```
-
-### Inference Commands
-
-```bash
-# Kaggle submission (production)
-python cmi-submission/inference.py
-
-# Local testing with debug output
-INFER_VERBOSE=1 INFER_DEBUG=1 python cmi-submission/inference.py
-
-# Enable torch.compile (if stable)
-ENABLE_TORCH_COMPILE=1 python cmi-submission/inference.py
-```
-
-## Configuration Examples
-
-### Training Configuration
-
-```python
-# configs/example_config.py
-environment = {
-    'seed': 42,
-    'gpu_id': 0,
-    'num_workers': 8
-}
-
-data = {
-    'variant': 'full',
-    'batch_size': 32,
-    'max_length': 100
-}
-
-training = {
-    'epochs': 50,
-    'patience': 15,
-    'weight_decay': 1e-2,
-    'use_amp': True,
-    'mixup_enabled': True,
-    'mixup_alpha': 0.4,
-    'loss': {
-        'type': 'FocalLoss',
-        'gamma': 2.0,
-        'alpha': 1.0
-    },
-    'scheduler_cfg': {
-        'type': 'cosine',
-        'warmup_ratio': 0.1,
-        'layer_lrs': {
-            'imu': 3e-4,
-            'thm': 2e-4,
-            'tof': 2e-4,
-            'spec': 1e-4,
-            'mlp': 1e-3,
-            'fusion': 5e-4
-        }
-    }
-}
-
-spec_params = {
-    'fs': 50,
-    'nperseg': 16,
-    'noverlap_ratio': 0.5
-}
-
-model = {
-    'type': 'MultimodalityModel',
-    'imu_branch_cfg': {
-        'hidden_dims': [256, 128],
-        'use_attention': True
-    },
-    'thm_branch_cfg': {
-        'hidden_dims': [128, 64]
-    },
-    'tof_branch_cfg': {
-        'hidden_dims': [256, 128],
-        'reshape_strategy': 'flatten'
-    },
-    'spec_branch_cfg': {
-        'hidden_dims': [256, 128]
-    },
-    'mlp_branch_cfg': {
-        'hidden_dims': [256, 128, 64]
-    }
-}
-```
-
-### Ensemble Configuration
-
-```python
-# ensemble/stack.py CONFIG section
-CONFIG = {
-    "INPUT_DIR": "./weights",
-    "TRAIN_CSV": "path/to/train.csv",
-    "META_MODEL": "ridge",
-    "N_SPLITS": 5,
-    "USE_LOGITS": False,
-    "SCALE_LINEAR": False,
-    "RIDGE_CALIBRATE_PREFIT": True,
-    "USE_COMPOSITE_CLASS_WEIGHTS": True,
-    "SAVE_DIR": "./stack_artifacts"
-}
-```
-
-## Output Artifacts
-
-### Training Outputs
-
-- `model_fold_{1-5}_{variant}.pth`: Trained model weights
-- `scaler_fold_{1-5}_{variant}.pkl`: Feature scalers
-- `spec_stats_fold_{1-5}_{variant}.pkl`: Spectrogram normalization stats
-- `spec_params_fold_{1-5}_{variant}.pkl`: Spectrogram generation parameters
-- `label_encoder_{variant}.pkl`: Label encoders
-- `oof_probas_{variant}.csv`: Out-of-fold predictions
-- `kfold_summary_{variant}.json`: Cross-validation summary
-
-### Ensemble Outputs
-
-- `stack_artifacts/{variant}/meta_model.pkl`: Trained meta-learner
-- `stack_artifacts/{variant}/meta_info.json`: Meta-model configuration
-- `stack_oof.csv`: Second-stage OOF predictions (optional)
-
-## Troubleshooting
-
-### Common Issues
-
-1. **CUDA Out of Memory**
-   - Reduce `batch_size` in config
-   - Set `use_amp: True` for mixed precision
-   - Use `gpu_id: None` for auto-selection
-
-2. **Convergence Issues**
-   - Adjust learning rates in `scheduler_cfg.layer_lrs`
-   - Increase `patience` for early stopping
-   - Check class weights and loss function
-
-3. **Inference Failures**
-   - Verify all required artifacts exist in weights directory
-   - Check environment variables: `INFER_VERBOSE=1` for debugging
-   - Ensure consistent `spec_params` between training and inference
-
-### Performance Optimization
-
-- **Training**: Use `torch.compile`, mixed precision, and optimal batch sizes
-- **Inference**: Disable verbose logging, use CPU for meta-learner if memory-constrained
-- **Ensemble**: Consider fewer meta-model folds if training time is critical
-
-## License
-
-This project is developed for the CMI competition and follows competition guidelines.
-
-## Authors
-
-- Core architecture and training pipeline
-- Ensemble stacking implementation  
-- Production inference system
