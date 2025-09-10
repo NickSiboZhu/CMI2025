@@ -68,13 +68,13 @@ graph TD
     B --> STATIC["Static Features<br/>(batch, D)<br/>Demographics + flags"]
 
     %% Branches
-    IMU --> CNN1D_IMU["CNN1D<br/>filters: 64→128→256"] --> TEMP1["LSTM/Transformer<br/>Temporal Encoder"] --> EMB1["IMU Embedding"]
+    IMU --> CNN1D_IMU["CNN1D<br/>filters: 64→128→256"] --> TEMP1["Temporal Aggregation<br/>Global Pool OR<br/>Temporal Encoder<br/>(LSTM/Transformer)"] --> EMB1["IMU Embedding"]
     
-    THM --> CNN1D_THM["CNN1D<br/>filters: 32→64→128"] --> TEMP2["LSTM/Transformer<br/>Temporal Encoder"] --> EMB2["THM Embedding"]
+    THM --> CNN1D_THM["CNN1D<br/>filters: 32→64→128"] --> TEMP2["Temporal Aggregation<br/>Global Pool OR<br/>Temporal Encoder<br/>(LSTM/Transformer)"] --> EMB2["THM Embedding"]
     
     SPEC --> CNN2D_SPEC["CNN2D<br/>filters: 32→64→128"] --> EMB3["Spec Embedding"]
     
-    TOF --> CNN2D_TOF["CNN2D<br/>Spatial: 8×8→features"] --> TEMP3["LSTM/Transformer<br/>Temporal Encoder"] --> EMB4["TOF Embedding"]
+    TOF --> CNN2D_TOF["CNN2D<br/>Spatial: 8×8→features"] --> TEMP3["Temporal Aggregation<br/>Global Pool OR<br/>Temporal Encoder<br/>(LSTM/Transformer)"] --> EMB4["TOF Embedding"]
     
     STATIC --> MLP_STATIC["MLP<br/>hidden: 64→32"] --> EMB5["Static Embedding"]
 
