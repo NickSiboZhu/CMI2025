@@ -33,7 +33,9 @@ Our approach to data was two-pronged: sophisticated feature engineering and crea
 -   **Feature Engineering**:
     -   **Domain-Knowledge**: We leveraged domain expertise to engineer critical time-domain features (e.g., gravity-compensated linear acceleration, quaternion-derived angular velocity).
     -   **Frequency Domain (Spectrograms)**: We created a spectrogram branch, treating the 1D signal as an "image." This enabled a 2D CNN to explicitly learn from time-frequency representations, capturing features complementary to the 1D branch.
--   **Reliable Cross-Validation (CV)**: We developed a robust, subject-grouped CV framework to prevent data leakage, ensuring that performance metrics reflect true generalization capabilities.
+-   **Reliable Cross-Validation (CV)**: We developed a robust CV framework using `StratifiedGroupKFold` for trustworthy evaluation.
+    -   **Why Grouped (by `subject`)**: Sequences from the same person are highly correlated. To prevent the model from simply memorizing a person's movement style (data leakage), we group by subject. This ensures that all data from a single subject appears in *either* the training set or the validation set, but never both. This forces the model to generalize to unseen subjects.
+    -   **Why Stratified (by `gesture`)**: The gesture classes are imbalanced. Stratification ensures that each fold has the same percentage of samples for each gesture as the entire dataset. This leads to more stable and reliable validation scores across all folds.
 
 ### 3. Model — A Narrative of Architectural Evolution
 
@@ -53,30 +55,58 @@ Our model development for time-series classification followed a logical progress
 
 ```mermaid
 graph TD
-    A["Raw Sensor Data"] --> B["Data Preprocessing"]
-    B --> C["Feature Engineering"]
-    C --> D["Multimodal Branches"]
-    
-    D --> E["IMU Branch<br/>(CNN1D + Attention/LSTM/Transformer)"]
-    D --> F["Thermal Branch<br/>(CNN1D)"]
-    D --> G["ToF Branch<br/>(CNN2D)"]
-    D --> H["Spectrogram Branch<br/>(CNN2D)"]
-    D --> I["Static Features<br/>(MLP)"]
-    
-    E --> J["Feature Fusion"]
-    F --> J
-    G --> J
-    H --> J
-    I --> J
-    
-    J --> K["Classifier Head<br/>(18 Classes)"]
-    K --> L["Competition Metric"]
-    
-    style E fill:#e1f5fe
-    style F fill:#fff3e0
-    style G fill:#f3e5f5
-    style H fill:#e8f5e8
-    style I fill:#fce4ec
+    %% Stage: Input & Preprocessing
+    A["Raw Sensor Data\n• IMU (acc/rot)\n• THM (temp)\n• TOF (5×8×8)\n• Demographics"] --> B["Preprocessing & FE\n• Interpolate/clean\n• Remove gravity (IMU)\n• Angular vel/angle\n• TOF spatial interpolation\n• *_missing flags\n• Scaling (masked z-score/MinMax)"]
+    B --> C["Spectrogram Generation (STFT)\n• From IMU-derived signals\n• Global mean/std per fold"]
+
+    %% Stage: Branches
+    subgraph D["Multimodal Branches"]
+        direction LR
+
+        subgraph D1["IMU Branch (1D)"]
+            IMU["IMU (T × C_imu)\n+ temporal mask\n+ per-channel mask"] --> CNN_IMU["CNN1D"]
+            CNN_IMU --> TE_IMU["Temporal Encoder\n(LSTM/Transformer)"]
+            TE_IMU --> E_IMU["Embedding"]
+        end
+
+        subgraph D2["THM Branch (1D)"]
+            THM["THM (T × C_thm)\n+ temporal mask\n+ per-sensor mask"] --> CNN_THM["CNN1D"]
+            CNN_THM --> TE_THM["Temporal Encoder\n(LSTM/Transformer)"]
+            TE_THM --> E_THM["Embedding"]
+        end
+
+        subgraph D3["Spectrogram Branch (2D)"]
+            SPEC["Spec (C_spec × F × T)"] --> CNN_SPEC["CNN2D"]
+            CNN_SPEC --> E_SPEC["Embedding"]
+        end
+
+        subgraph D4["TOF Branch (2D)"]
+            TOF["TOF (S × 8×8 × T)\n+ per-sensor mask"] --> CNN_TOF["CNN2D"]
+            CNN_TOF --> TE_TOF["Temporal Encoder\n(LSTM/Transformer)"]
+            TE_TOF --> E_TOF["Embedding"]
+        end
+
+        subgraph D5["Static Branch (MLP)"]
+            STATIC["Demographics\n+ *_missing flags"] --> MLP_STATIC["MLP"]
+            MLP_STATIC --> E_STATIC["Embedding"]
+        end
+    end
+
+    %% Fusion & Head
+    E_IMU -. optional .-> F
+    E_THM -. optional .-> F
+    E_SPEC -. optional .-> F
+    E_TOF -. optional .-> F
+    E_STATIC --> F["Concatenate → Fusion Head\n(MLP / Attention / Bilinear / Transformer)"]
+    F --> K["Classifier Head (18 classes)"]
+    K --> L["Metrics\n• Competition: 0.5×Binary F1 + 0.5×Macro F1\n• Accuracy (reporting)"]
+
+    %% Styles
+    style D1 fill:#e1f5fe
+    style D2 fill:#fff3e0
+    style D4 fill:#f3e5f5
+    style D3 fill:#e8f5e8
+    style D5 fill:#fce4ec
 ```
 
 #### Ensemble Strategy
@@ -257,3 +287,22 @@ spec_params = dict(
 ### Ensemble Training (Stacking)
 
 After training base models and generating out-of-fold predictions, use the ensemble module for meta-learning.
+
+```
+```
+
+## Evaluation & Results
+
+-   **Primary metric (competition)**: `Score = 0.5 × Binary F1 + 0.5 × Macro F1`.
+    -   Binary F1: BFRB vs Non-BFRB (target vs others).
+    -   Macro F1: Average F1 across all 9 classes (8 BFRB + 1 combined Non-BFRB).
+-   **Secondary metric (reporting)**: Accuracy (percentage of correctly classified sequences).
+-   **How we report**:
+    -   Per-fold validation metrics (competition score, accuracy).
+    -   Overall OOF metrics aggregated across folds.
+    -   Optional per-class F1 from OOF predictions for deeper analysis.
+-   **Where to find artifacts**:
+    -   OOF predictions CSV and per-fold checkpoints.
+    -   `kfold_summary_{variant}.json` with fold-wise and overall scores.
+
+Note: Exact numbers depend on training runs and seeds; refer to the saved artifacts from your latest experiments. On Kaggle’s hidden test set, this solution achieved a **bronze medal** (187/2657).
