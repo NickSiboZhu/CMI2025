@@ -55,58 +55,46 @@ Our model development for time-series classification followed a logical progress
 
 ```mermaid
 graph TD
-    %% Stage: Input & Preprocessing
-    A["Raw Sensor Data\n• IMU (acc/rot)\n• THM (temp)\n• TOF (5×8×8)\n• Demographics"] --> B["Preprocessing & FE\n• Interpolate/clean\n• Remove gravity (IMU)\n• Angular vel/angle\n• TOF spatial interpolation\n• *_missing flags\n• Scaling (masked z-score/MinMax)"]
-    B --> C["Spectrogram Generation (STFT)\n• From IMU-derived signals\n• Global mean/std per fold"]
+    %% Input & Preprocessing
+    A["Raw Sensor Data<br/>• IMU: acc_xyz, rot_xyzw<br/>• THM: temp sensors 1-5<br/>• TOF: 5×8×8 distance grids<br/>• Demographics"] --> B["Preprocessing & Feature Engineering<br/>• Interpolate missing values<br/>• Remove gravity from IMU<br/>• Compute angular velocity/angles<br/>• TOF spatial interpolation<br/>• Generate *_missing flags<br/>• Masked scaling: z-score/MinMax"]
+    
+    B --> C["Spectrogram Generation<br/>• STFT from IMU signals<br/>• Global normalization per fold"]
+    
+    %% Data Flow to Branches
+    B --> IMU["IMU Time Series<br/>(batch, T, C_imu)<br/>+ temporal mask<br/>+ channel mask"]
+    B --> THM["THM Time Series<br/>(batch, T, C_thm)<br/>+ temporal mask<br/>+ sensor mask"]
+    B --> TOF["TOF Grids<br/>(batch, 5×64, T)<br/>+ sensor mask"]
+    C --> SPEC["Spectrograms<br/>(batch, 6, F, T)"]
+    B --> STATIC["Static Features<br/>(batch, D)<br/>Demographics + flags"]
 
-    %% Stage: Branches
-    subgraph D["Multimodal Branches"]
-        direction LR
+    %% Branches
+    IMU --> CNN1D_IMU["CNN1D<br/>filters: 64→128→256"] --> TEMP1["LSTM/Transformer<br/>Temporal Encoder"] --> EMB1["IMU Embedding"]
+    
+    THM --> CNN1D_THM["CNN1D<br/>filters: 32→64→128"] --> TEMP2["LSTM/Transformer<br/>Temporal Encoder"] --> EMB2["THM Embedding"]
+    
+    SPEC --> CNN2D_SPEC["CNN2D<br/>filters: 32→64→128"] --> EMB3["Spec Embedding"]
+    
+    TOF --> CNN2D_TOF["CNN2D<br/>Spatial: 8×8→features"] --> TEMP3["LSTM/Transformer<br/>Temporal Encoder"] --> EMB4["TOF Embedding"]
+    
+    STATIC --> MLP_STATIC["MLP<br/>hidden: 64→32"] --> EMB5["Static Embedding"]
 
-        subgraph D1["IMU Branch (1D)"]
-            IMU["IMU (T × C_imu)\n+ temporal mask\n+ per-channel mask"] --> CNN_IMU["CNN1D"]
-            CNN_IMU --> TE_IMU["Temporal Encoder\n(LSTM/Transformer)"]
-            TE_IMU --> E_IMU["Embedding"]
-        end
+    %% Fusion
+    EMB1 -.-> FUSION["Feature Concatenation<br/>↓<br/>Fusion Head<br/>(MLP/Attention/Bilinear/Transformer)"]
+    EMB2 -.-> FUSION
+    EMB3 -.-> FUSION
+    EMB4 -.-> FUSION
+    EMB5 --> FUSION
+    
+    FUSION --> CLASSIFIER["Classifier Head<br/>(18 gesture classes)"]
+    CLASSIFIER --> METRICS["Evaluation<br/>• Competition: 0.5×Binary_F1 + 0.5×Macro_F1<br/>• Accuracy for reporting"]
 
-        subgraph D2["THM Branch (1D)"]
-            THM["THM (T × C_thm)\n+ temporal mask\n+ per-sensor mask"] --> CNN_THM["CNN1D"]
-            CNN_THM --> TE_THM["Temporal Encoder\n(LSTM/Transformer)"]
-            TE_THM --> E_THM["Embedding"]
-        end
-
-        subgraph D3["Spectrogram Branch (2D)"]
-            SPEC["Spec (C_spec × F × T)"] --> CNN_SPEC["CNN2D"]
-            CNN_SPEC --> E_SPEC["Embedding"]
-        end
-
-        subgraph D4["TOF Branch (2D)"]
-            TOF["TOF (S × 8×8 × T)\n+ per-sensor mask"] --> CNN_TOF["CNN2D"]
-            CNN_TOF --> TE_TOF["Temporal Encoder\n(LSTM/Transformer)"]
-            TE_TOF --> E_TOF["Embedding"]
-        end
-
-        subgraph D5["Static Branch (MLP)"]
-            STATIC["Demographics\n+ *_missing flags"] --> MLP_STATIC["MLP"]
-            MLP_STATIC --> E_STATIC["Embedding"]
-        end
-    end
-
-    %% Fusion & Head
-    E_IMU -. optional .-> F
-    E_THM -. optional .-> F
-    E_SPEC -. optional .-> F
-    E_TOF -. optional .-> F
-    E_STATIC --> F["Concatenate → Fusion Head\n(MLP / Attention / Bilinear / Transformer)"]
-    F --> K["Classifier Head (18 classes)"]
-    K --> L["Metrics\n• Competition: 0.5×Binary F1 + 0.5×Macro F1\n• Accuracy (reporting)"]
-
-    %% Styles
-    style D1 fill:#e1f5fe
-    style D2 fill:#fff3e0
-    style D4 fill:#f3e5f5
-    style D3 fill:#e8f5e8
-    style D5 fill:#fce4ec
+    %% Styling
+    style IMU fill:#e1f5fe
+    style THM fill:#fff3e0
+    style TOF fill:#f3e5f5
+    style SPEC fill:#e8f5e8
+    style STATIC fill:#fce4ec
+    style FUSION fill:#f0f0f0
 ```
 
 #### Ensemble Strategy
