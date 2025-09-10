@@ -1,5 +1,16 @@
 # CMI Gesture Recognition System
 
+## Competition Result
+
+🥉 **Bronze Medal**: This solution achieved a bronze medal in the CMI - Detect Behavior with Sensor Data competition on Kaggle, placing **187th out of 2657 teams**.
+
+## Authors
+
+-   [@nicksibozhu](https://www.kaggle.com/nicksibozhu)
+-   [@co000l](https://www.kaggle.com/co000l)
+
+---
+
 A config-driven, multimodal deep learning system for detecting body-focused repetitive behaviors (BFRB) using sensor data from IMU, thermal, and time-of-flight sensors. This document outlines the core methodologies, system architecture, and usage instructions.
 
 ## Core Methodologies
@@ -246,5 +257,3 @@ spec_params = dict(
 ### Ensemble Training (Stacking)
 
 After training base models and generating out-of-fold predictions, use the ensemble module for meta-learning.
-
-```
