@@ -37,17 +37,177 @@ Our approach to data was two-pronged: sophisticated feature engineering and crea
     -   **Why Grouped (by `subject`)**: Sequences from the same person are highly correlated. To prevent the model from simply memorizing a person's movement style (data leakage), we group by subject. This ensures that all data from a single subject appears in *either* the training set or the validation set, but never both. This forces the model to generalize to unseen subjects.
     -   **Why Stratified (by `gesture`)**: The gesture classes are imbalanced. Stratification ensures that each fold has the same percentage of samples for each gesture as the entire dataset. This leads to more stable and reliable validation scores across all folds.
 
-### 3. Model — A Narrative of Architectural Evolution
+### 3. Model Architecture — Comprehensive Design
 
-Our model development for time-series classification followed a logical progression, with each architecture addressing the limitations of the last.
+Our multimodal gesture recognition system employs a sophisticated architecture that processes heterogeneous sensor data through specialized branches, each optimized for its specific data characteristics.
 
--   **Stage 1: The 1D CNN Baseline**: A standard 1D CNN extracted local patterns. However, its reliance on global pooling to compress the temporal dimension resulted in the loss of crucial sequential information.
--   **Stage 2: Introducing Sequential Context with LSTM**: To preserve temporal dependencies, we replaced global pooling with an LSTM. The CNN's output feature map was treated as a sequence, and the LSTM's final hidden state provided a context-aware summary for classification.
--   **Stage 3: Capturing Global Relationships with a Transformer**: To model relationships between all parts of the sequence simultaneously, we used a Transformer. A `[CLS]` token, processed by the self-attention mechanism, created a globally-informed representation that captured complex inter-dependencies across the entire time series.
--   **Handling Auxiliary Data (Multi-Branch Approach)**:
-    -   **Static Features**: Time-invariant data (e.g., demographics) were processed in a separate MLP branch.
-    -   **Spectrograms**: Processed in their own dedicated 2D CNN branch.
--   **Final Model**: The outputs from all branches (Time-Series, Static, Spectrogram) were concatenated before the final classification head to create a comprehensive, multi-modal model.
+#### 3.1 Overall Architecture Philosophy
+
+The model follows a **multi-branch fusion paradigm** where each sensor modality is processed through domain-specific feature extractors before being combined via learnable fusion strategies. This design recognizes that different sensor types (temporal signals, spatial grids, frequency representations) require fundamentally different processing approaches.
+
+#### 3.2 Core Architectural Components
+
+##### **A. Convolutional Feature Extractors**
+
+**1D CNN Branch (IMU/THM Time Series)**
+- **Purpose**: Extract temporal patterns from accelerometer, gyroscope, and thermal sensor data
+- **Architecture**: Configurable conv layers with residual connections and squeeze-excite attention
+- **Key Features**:
+  - Masked convolutions to handle variable-length sequences
+  - Custom `MaskedBatchNorm1d` for proper normalization with padding
+  - `MaskedSE1D` for channel attention that respects sequence masks
+  - Residual connections with dimension matching projections
+
+**2D CNN Branch (TOF Spatial Grids)**
+- **Purpose**: Process 8×8 depth grids from Time-of-Flight sensors
+- **Architecture**: Two-stage processing (spatial → temporal)
+  - Stage 1: `TOF2DCNN` extracts spatial features per timestep
+  - Stage 2: Temporal encoder aggregates across time
+- **Key Features**:
+  - Sensor gating (adaptive/static) for handling missing TOF sensors
+  - `MaskedBatchNorm2d` with dual masking (temporal + channel)
+  - SE blocks for spatial attention within each 8×8 grid
+
+**2D CNN Branch (Spectrograms)**
+- **Purpose**: Process time-frequency representations of IMU signals
+- **Architecture**: Standard 2D CNN with mask-aware global average pooling
+- **Key Features**:
+  - Handles spectrograms as "images" with frequency × time dimensions
+  - Custom masked pooling to avoid contamination from padding regions
+
+##### **B. Non-Convolutional Feature Extractors**
+
+**MLP Branch (Static Features)**
+- **Purpose**: Process time-invariant demographic and contextual features
+- **Architecture**: Simple feedforward network with configurable hidden layers
+- **Key Features**:
+  - Handles demographic data (age, gender, etc.) and aggregated statistics
+  - Dropout regularization for generalization
+  - Direct feature processing without temporal considerations
+
+##### **C. Temporal Aggregation Strategies**
+
+After convolutional feature extraction, we obtain embeddings of shape `(batch, timestamps, channels)`. Three strategies aggregate this temporal information:
+
+**Global Pooling**
+- Compresses temporal dimension via masked average pooling
+- Each channel preserves one aggregated value
+- Efficient but temporally-invariant representation
+
+**LSTM Encoder**
+- Treats timesteps as sequential input with packed sequences
+- Bidirectional option for forward/backward temporal context
+- Captures sequential dependencies and long-term patterns
+
+**Transformer Encoder**
+- Self-attention mechanism with learnable CLS token
+- Global receptive field across all timesteps
+- Captures complex inter-temporal relationships
+
+##### **D. Masking System**
+
+**Temporal Masking**: Handles variable-length sequences
+- Applied at every conv layer to prevent padding contamination
+- Mask propagation through pooling operations
+- Ensures proper normalization statistics in batch norm layers
+
+**Channel Masking**: Handles missing/faulty sensors
+- Per-sample channel masks for sensor failures
+- Applied before feature extraction to zero out missing channels
+- Prevents contamination of batch statistics from missing sensors
+
+**Frame Masking**: For TOF sequences
+- Frame-level validity masks for temporal TOF processing
+- Integrated into spatial CNN batch normalization
+
+##### **E. Multi-Modal Fusion Strategies**
+
+After branch-specific feature extraction, four fusion approaches combine modality representations:
+
+**Linear Fusion** (Default)
+- Simple concatenation followed by MLP layers
+- LayerNorm + dropout for regularization
+- Baseline fusion strategy
+
+**Attention Fusion**
+- Learns per-modality importance weights via attention
+- Projects each branch to common dimension
+- Softmax-weighted combination of projected features
+
+**Bilinear Fusion**
+- Captures cross-modal interactions via bilinear pooling
+- All pairwise modality interactions computed
+- Rich interaction modeling but higher complexity
+
+**Transformer Fusion**
+- Treats modalities as sequence tokens
+- Learnable CLS token aggregates cross-modal information
+- Most sophisticated fusion with full cross-modal attention
+
+#### 3.3 Model Variants
+
+**Base Models**:
+- `CNN1D`: Standalone 1D CNN for time series
+- `SpectrogramCNN`: Standalone 2D CNN for spectrograms
+- `TemporalTOF2DCNN`: Two-stage spatial-temporal TOF processor
+- `MLP`: Simple feedforward network for static features
+
+**Fusion Model**:
+- `MultimodalityModel`: Orchestrates all branches and fusion strategies
+
+#### 3.4 Configuration Mapping
+
+The architecture components map to configuration sections as follows:
+
+```python
+model = dict(
+    type='MultimodalityModel',
+    # IMU time series → CNN1D with temporal aggregation
+    imu_branch_cfg=dict(type='CNN1D', temporal_aggregation='temporal_encoder'),
+    # THM time series → CNN1D with temporal aggregation  
+    thm_branch_cfg=dict(type='CNN1D', temporal_aggregation='temporal_encoder'),
+    # TOF spatial grids → Two-stage spatial-temporal processing
+    tof_branch_cfg=dict(type='TemporalTOF2DCNN', temporal_mode='lstm'),
+    # Spectrograms → 2D CNN for frequency-time processing
+    spec_branch_cfg=dict(type='SpectrogramCNN', use_residual=True),
+    # Static features → Simple MLP
+    mlp_branch_cfg=dict(type='MLP', hidden_dims=[64], output_dim=32),
+    # Multi-modal fusion strategy
+    fusion_head_cfg=dict(type='FusionHead', hidden_dims=[256, 128])
+)
+```
+
+### Hyperparameter Search (Multiprocessing)
+
+How it works:
+- Orchestrator: Optuna runs trials in parallel (`n_jobs = #GPUs`) and persists to a SQLite DB for resume.
+- Subprocess isolation: Each trial launches `development/train.py` via `subprocess.Popen(...)` to avoid CUDA context reuse and memory leaks.
+- GPU binding: Round‑robin per trial → `CUDA_VISIBLE_DEVICES = trial.number % torch.cuda.device_count()`.
+- Compilation cache isolation: Per‑trial TorchInductor cache (`TORCHINDUCTOR_CACHE_DIR=...pid{os.getpid()}`) prevents compiler collisions.
+- Per‑trial artifact directories: Trial‑unique dirs (with PID) store logs, checkpoints, `result.json`.
+- Top‑K preservation: Callback maintains best‑K artifacts under `weights/topk_<variant>/` using locks and atomic writes.
+- OOM handling: Stream logs, detect OOM patterns, gracefully prune the trial (not marked as failed).
+
+How to use:
+- Configure in `development/hyperparameter_search.py`:
+  - `CONFIG_FILE_PATH`, `N_TRIALS`, `N_STARTUP_TRIALS`, `TOPK`, `SAVE_BEST_TO_FINAL`, `ENABLE_BASE_PRELOAD`
+- Run the search (auto‑parallelizes across all available GPUs):
+  ```bash
+  python development/hyperparameter_search.py
+  ```
+- Artifacts: per‑trial dirs under `weights/…/trial_artifacts_*`, Top‑K under `weights/topk_<variant>/`, study DB `{variant}-study.db`.
+
+#### 3.5 Key Innovations
+
+1. **Robust Masking**: Comprehensive masking system handles real-world data imperfections
+2. **Modular Design**: Each component is independently configurable via registry system
+3. **Flexible Fusion**: Multiple fusion strategies accommodate different data relationships
+4. **Hardware-Aware**: Optimized for compilation with PyTorch's `torch.compile`
+5. **Hyperparameter Agnostic**: All architectural choices left to Optuna optimization
+
+#### 3.6 Design Rationale
+
+The architecture avoids architectural bias by implementing multiple valid approaches for each design decision (temporal aggregation, fusion strategy, attention mechanisms). Rather than making a priori assumptions about which approach is "best," we rely on automated hyperparameter optimization to discover the optimal configuration for each specific dataset and task.
 
 ## System Architecture
 
