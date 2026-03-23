@@ -1,5 +1,3 @@
-# data_preprocessing.py
-
 import pandas as pd
 import numpy as np
 import polars as pl
@@ -16,11 +14,10 @@ from scipy import signal
 from joblib import Parallel, delayed
 import time
 
-# --- 2. 优化后的语谱图生成函数 ---
 def generate_spectrogram(ts_data, fs, nperseg, noverlap, max_length):
-    """一个封装好的、使用动态参数的优化版函数"""
+    """Generate a log-scaled spectrogram using the runtime STFT parameters."""
     if ts_data is None or len(ts_data) == 0:
-        # 如果数据为空, 计算预期的形状并返回零矩阵
+        # Match the downstream shape contract even for empty signals.
         freqs, time_bins, _ = signal.stft(np.zeros(max_length), fs=fs, nperseg=nperseg, noverlap=noverlap)
         spec_shape = (len(freqs), len(time_bins))
         return np.zeros(spec_shape, dtype=np.float32)
@@ -30,10 +27,8 @@ def generate_spectrogram(ts_data, fs, nperseg, noverlap, max_length):
     return log_spectrogram.astype(np.float32)
 
 
-# --- 3. 用于并行处理的工作函数 ---
 def process_and_get_stats(group, spec_params, max_length):
-    """处理单个group，并返回其统计数据"""
-    # 从字典中解包参数
+    """Accumulate spectrogram statistics for one sequence group."""
     fs = spec_params['fs']
     nperseg = spec_params['nperseg']
     noverlap = spec_params['noverlap']
@@ -42,7 +37,7 @@ def process_and_get_stats(group, spec_params, max_length):
     total_sum = 0.0
     total_sum_sq = 0.0
     spec_source_cols = ['linear_acc_x', 'linear_acc_y', 'linear_acc_z', 'angular_vel_x', 'angular_vel_y', 'angular_vel_z']
-    for col in spec_source_cols: # 假设 spec_source_cols 已定义
+    for col in spec_source_cols:
         signal_1d = group[col].values
         seq_len = len(signal_1d)
         
@@ -51,7 +46,6 @@ def process_and_get_stats(group, spec_params, max_length):
         else:
             padded_signal = np.pad(signal_1d, (max_length - seq_len, 0), 'constant')
         
-        # 调用使用动态参数的优化函数
         spec = generate_spectrogram(padded_signal, fs, nperseg, noverlap, max_length)
         
         count += spec.size
@@ -76,7 +70,7 @@ def _calculate_jerk_and_angacc_polars(group_df: pl.DataFrame, dt=1/10) -> pl.Dat
     lin = group_df.select(['linear_acc_x', 'linear_acc_y', 'linear_acc_z']).to_numpy()
     ang = group_df.select(['angular_vel_x', 'angular_vel_y', 'angular_vel_z']).to_numpy()
 
-    # Prepend first row so输出长度与输入一致
+    # Keep the derivative features aligned one-to-one with the source sequence.
     dlin = np.diff(lin, axis=0, prepend=lin[:1])
     dang = np.diff(ang, axis=0, prepend=ang[:1])
 
@@ -215,16 +209,18 @@ def _calculate_angular_distance_polars(group_df: pl.DataFrame) -> pl.DataFrame:
 def feature_engineering(train_df: pd.DataFrame): 
     """ 
     Applies the full feature engineering pipeline.
-    MODIFIED: Removed Jerk and Snap calculations as they are being replaced by spectrograms.
+
+    Jerk and snap were intentionally removed from the final feature set because
+    the spectrogram branch now carries most of that high-frequency signal.
     """ 
     print("\nApplying advanced feature engineering (with Polars backend)...")
 
-    # --- 步骤 1: 从 Pandas 转换为 Polars ---
     original_index = train_df.index
     pl_df = pl.from_pandas(train_df)
     cols_to_process = [c for c in pl_df.columns if c.startswith('acc_') or c.startswith('rot_')]
 
-    # --- 步骤 2: 使用 Polars 表达式进行高性能计算 ---
+    # This part stays in Polars because grouped interpolation and joins are
+    # materially faster here than in pandas for the full training set.
     pl_df = pl_df.with_columns(
         pl.col(cols_to_process).interpolate().over('sequence_id').fill_null(0.0)
     ).with_columns(
@@ -235,27 +231,24 @@ def feature_engineering(train_df: pd.DataFrame):
     )
 
     print("Calculating engineered features (excluding jerk/snap)...")
-    # 计算基础特征
     pl_df = pl_df.with_columns(
         (pl.col('acc_x')**2 + pl.col('acc_y')**2 + pl.col('acc_z')**2).sqrt().alias('acc_mag'),
         (2 * pl.col('rot_w').clip(-1, 1).arccos()).alias('rot_angle'),
     )
 
-    # --- 步骤 3: 使用 map_groups 高效调用新的 Polars 辅助函数 ---
     linear_accel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_remove_gravity_from_acc_polars)
     pl_df = pl.concat([pl_df, linear_accel_results], how='horizontal')
     pl_df = pl_df.with_columns(
         (pl.col('linear_acc_x')**2 + pl.col('linear_acc_y')**2 + pl.col('linear_acc_z')**2).sqrt().alias('linear_acc_mag')
     )
 
-    # --- NEW: Thermopile (THM) per-sensor and overall missingness flags (computed before THM interpolation) ---
+    # Compute THM missingness before interpolation so the flags reflect raw
+    # sensor availability.
     thm_cols = [c for c in pl_df.columns if c.startswith('thm_') and len(c.split('_')) == 2]
     if thm_cols:
-        # Per-sequence, per-sensor all-null flags
         thm_missing_agg = pl_df.group_by('sequence_id', maintain_order=True).agg(
             [pl.col(col).is_null().all().alias(f"{col}_missing") for col in thm_cols]
         )
-        # Overall THM missing: all sensors missing within the sequence
         sum_expr = None
         for col in thm_cols:
             expr = pl.col(f"{col}_missing").cast(pl.Int8)
@@ -263,10 +256,8 @@ def feature_engineering(train_df: pd.DataFrame):
         thm_missing_agg = thm_missing_agg.with_columns(
             (sum_expr == pl.lit(len(thm_cols))).alias('thm_missing')
         )
-        # Cast flags to Float32 for consistency
         cast_exprs = [pl.col(f"{col}_missing").cast(pl.Float32) for col in thm_cols] + [pl.col('thm_missing').cast(pl.Float32)]
         thm_missing_agg = thm_missing_agg.with_columns(cast_exprs)
-        # Join back per-row
         pl_df = pl_df.join(thm_missing_agg, on='sequence_id', how='left')
 
     angular_vel_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_angular_velocity_from_quat_polars)
@@ -277,8 +268,6 @@ def feature_engineering(train_df: pd.DataFrame):
     jerk_angacc_results = pl_df.group_by('sequence_id', maintain_order=True).map_groups(_calculate_jerk_and_angacc_polars)
     pl_df = pl.concat([pl_df, jerk_angacc_results], how='horizontal')
     
-    # --- 步骤 4: 定义最终特征列并进行最终清理 ---
-    # --- MODIFIED: Removed jerk and snap features from the list ---
     final_feature_cols = [ 
         'rot_w', 'rot_x', 'rot_y', 'rot_z',  
         'acc_mag', 'rot_angle',
@@ -303,7 +292,6 @@ def feature_engineering(train_df: pd.DataFrame):
     
     print(f"Generated {len(final_feature_cols)} features after engineering.")
 
-    # --- 步骤 5: 从 Polars 转换回 Pandas ---
     final_pandas_df = pl_df.to_pandas()
     final_pandas_df.index = original_index
 
@@ -383,20 +371,19 @@ def generate_feature_columns(df_columns):
 
 # Helper to locate shared weights directory inside cmi-submission
 def _get_weights_dir():
-    module_dir = os.path.dirname(os.path.abspath(__file__))  # …/cmi-submission/data_utils
-    subm_root  = os.path.abspath(os.path.join(module_dir, '..'))      # …/cmi-submission
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    subm_root  = os.path.abspath(os.path.join(module_dir, '..'))
     weights_dir = os.path.join(subm_root, 'weights')
     os.makedirs(weights_dir, exist_ok=True)
     return weights_dir
 
 def load_and_preprocess_data(variant: str = "full"):
     """
-    Load training data and demographics, preprocess, and return a full DataFrame.
-    MODIFIED: Applies advanced feature engineering after data loading.
+    Load raw training data, merge demographics, and run the shared preprocessing
+    pipeline used by training and inference.
     """
     print("Loading data...")
     
-    # --- File path logic ---
     current_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = current_dir
     project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
@@ -412,7 +399,6 @@ def load_and_preprocess_data(variant: str = "full"):
     if not os.path.exists(train_path):
         raise FileNotFoundError("train.csv not found in either cmi-submission/data or development/data")
     
-    # --- Data loading and merging ---
     train_df = pd.read_csv(train_path)
     demographics_df = pd.read_csv(demographics_path)
     BAD_SUBJECTS = {"SUBJ_045235", "SUBJ_019262"}
@@ -432,83 +418,66 @@ def load_and_preprocess_data(variant: str = "full"):
     if variant == "full":
         print("\nFiltering out sequences with no valid ToF or THM data...")
         
-        # 找出所有以 'tof_' 或 'thm_' 开头的列 (这部分逻辑不变)
         tof_cols = [c for c in train_df.columns if c.startswith('tof_')]
         thm_cols = [c for c in train_df.columns if c.startswith('thm_')]
         all_sensor_cols = tof_cols + thm_cols
         
         if all_sensor_cols:
             original_seq_count = train_df['sequence_id'].nunique()
-            # 1. 对所有传感器列创建一个布尔 DataFrame (True 代表非空值)
-            #    然后使用 .any(axis=1) 横向检查每一行，只要行内有一个 True，结果就为 True。
-            #    这一步会生成一个布尔 Series，长度与 train_df 的行数相同。
+            # Drop clearly unusable sequences before the expensive interpolation and
+            # feature-engineering stages.
             has_valid_row = train_df[all_sensor_cols].notna().any(axis=1)
             
-            # 2. 使用 .loc 基于上面的布尔 Series 快速定位到所有包含有效数据的行，
-            #    并提取这些行的 'sequence_id'，最后用 .unique() 获取不重复的ID列表。
-            #    这比逐个分组应用函数快几个数量级。
             full_quality_sids = train_df.loc[has_valid_row, 'sequence_id'].unique()
             
-            # 3. 使用 .isin() 高效过滤。这是基于列表筛选行的最快方法。
             train_df = train_df[train_df['sequence_id'].isin(full_quality_sids)]
             print(f"  {original_seq_count} total sequences found.")
             print(f"  {len(full_quality_sids)} sequences have at least one valid ToF or THM reading and will be used.")
             print(f"  Filtered data shape: {train_df.shape}")
     
-    # --- Label encoding ---
     label_encoder = LabelEncoder()
     train_df['gesture_encoded'] = label_encoder.fit_transform(train_df['gesture'])
 
-    # --- Add TOF missing flags BEFORE interpolation ---
     if variant != "imu":
         train_df = add_tof_missing_flags(train_df)
 
-    # --- Spatial interpolation for TOF sensors ---
     if variant != "imu":
         train_df = interpolate_tof(train_df)
     
-    # --- *** NEW: APPLY ADVANCED FEATURE ENGINEERING *** ---
     train_df, feature_cols = feature_engineering(train_df)
 
-    #  将静态特征列添加回总特征列表
-    # 1. 找出数据中实际存在的静态列
+    # Static features and missingness flags are consumed by the MLP branch and by
+    # modality/channel masking, so they must stay in the exported feature list.
     existing_static_cols = [c for c in STATIC_FEATURE_COLS if c in train_df.columns]
     
-    # 2. 将它们添加到 feature_cols 列表中，并去重
     for col in existing_static_cols:
         if col not in feature_cols:
             feature_cols.append(col)
 
-    # 3. 动态添加所有 *_missing 静态标志列到特征列表（静态分支专用）
     dynamic_missing_flags = [c for c in train_df.columns if c.endswith('_missing')]
     for col in dynamic_missing_flags:
         if col not in feature_cols:
             feature_cols.append(col)
     
-    # --- Filter features based on variant if necessary ---
     if variant == "imu":
-        # 确保在imu模式下，特征列只包含IMU和人口统计学特征
+        # The IMU-only variant excludes THM and ToF features entirely.
         imu_engineered_cols = [c for c in feature_cols if not (c.startswith("thm_") or c.startswith("tof_"))]
         demographic_cols = [c for c in STATIC_FEATURE_COLS if c in train_df.columns]
-        # 合并并去重
         feature_cols = sorted(list(set(imu_engineered_cols + demographic_cols)))
         
     print(f"Variant: {variant}. Final feature columns after filtering: {len(feature_cols)}")
 
-    # Ensure chronological order so interpolation is meaningful
     train_df = train_df.sort_values(['sequence_id', 'sequence_counter'])
     
-    # Return the full preprocessed DataFrame
     print("✅ Preprocessing complete. Returning full DataFrame.")
     return train_df, label_encoder, feature_cols
 
 def pad_sequences(sequences, max_length: int):
     """
-    Pad sequences to same length and generate a corresponding attention mask.
-    MODIFIED: Creates float32 arrays to save memory and requires max_length.
+    Pad or truncate variable-length sequences and build float32 attention masks.
     """
     if not sequences:
-        return np.array([], dtype=np.float32), np.array([], dtype=np.float32) # CHANGED
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
     if max_length is None:
         max_length = max(len(seq) for seq in sequences)
     
@@ -516,13 +485,11 @@ def pad_sequences(sequences, max_length: int):
     print("Strategy: Keep END of sequences, pad zeros at BEGINNING, generate mask")
     
     num_features = sequences[0].shape[1]
-    # CHANGED: Specify dtype=np.float32 for both arrays
     padded_sequences = np.zeros((len(sequences), max_length, num_features), dtype=np.float32)
     masks = np.zeros((len(sequences), max_length), dtype=np.float32) 
     
     for i, seq in enumerate(sequences):
-        # Ensure the sequence being placed is also float32
-        seq_as_float32 = np.asarray(seq, dtype=np.float32) # ADDED this line
+        seq_as_float32 = np.asarray(seq, dtype=np.float32)
         seq_length = len(seq_as_float32)
         
         if seq_length >= max_length:
@@ -537,9 +504,10 @@ def pad_sequences(sequences, max_length: int):
 
 class TofScaler(BaseEstimator, TransformerMixin):
     """
-    一个自定义的Scikit-learn转换器，用于处理ToF（Time-of-Flight）数据。
-    
-    它只对大于等于0的有效距离值进行Min-Max缩放，而忽略代表“无响应”的-1值。
+    Scikit-learn compatible scaler for ToF values.
+
+    Valid distances are min-max scaled while the ``-1`` no-response sentinel is
+    preserved so missingness semantics survive normalization.
     """
     def __init__(self, feature_range=(0, 1)):
         self.feature_range = feature_range
@@ -547,7 +515,7 @@ class TofScaler(BaseEstimator, TransformerMixin):
 
     def fit(self, X, y=None):
         """
-        从输入数据X中学习缩放参数。
+        Learn scaling statistics from the valid ToF distances.
         """
         X_np = np.asarray(X)
         values_to_fit = X_np[X_np != -1].reshape(-1, 1)
@@ -558,7 +526,7 @@ class TofScaler(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         """
-        使用学习到的参数转换数据X。
+        Transform ToF values while leaving the ``-1`` sentinel untouched.
         """
         if self.scaler_ is None:
             raise RuntimeError("This TofScaler instance is not fitted yet.")
@@ -733,7 +701,6 @@ class MaskedStandardAndMinMaxScaler(BaseEstimator, TransformerMixin):
     def get_feature_names_out(self, input_features=None):
         return np.asarray(self.feature_names_, dtype=object)
 
-# --- NEW: Compute TOF missing flags BEFORE any interpolation/fill ---
 def add_tof_missing_flags(df: pd.DataFrame) -> pd.DataFrame:
     """
     Add per-sequence, per-sensor TOF missing flags named `tof_{sid}_missing`.
@@ -789,12 +756,11 @@ def add_tof_missing_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
     """
-    根据指定的接口，使用统一的预处理器对训练集和验证集进行标准化。
-    - 对IMU, 温度, 人口统计学特征以及所有新工程化的特征应用Z-score标准化。
-    - 对ToF特征应用自定义的Min-Max规范化（-1保持不变）。
-    - 返回标准化后的DataFrame以及一个单一、已拟合的scaler对象。
+    Normalize train and validation features with one fitted preprocessing object.
+
+    IMU, THM, demographic, and engineered features use masked z-scoring. ToF
+    values use the custom min-max path so the ``-1`` sentinel remains intact.
     """
-    # 1. 识别需要Z-score标准化的特征
     zscore_prefixes = ['acc_', 'rot_', 'thm_', 'linear_', 'angular_']
     zscore_cols = [
         col for col in X_train.columns 
@@ -811,42 +777,37 @@ def normalize_features(X_train: pd.DataFrame, X_val: pd.DataFrame):
         if col not in zscore_cols:
             zscore_cols.append(col)
 
-    # 2. 构建自定义带掩码的缩放器（Z-score 忽略无效 ROT/THM；TOF 使用 Min-Max 与之前一致）
+    # Binary missingness flags stay untouched; masking happens inside the scaler.
     scaler = MaskedStandardAndMinMaxScaler(
         zscore_prefixes=zscore_prefixes,
         demographic_cols=existing_demographic_cols,
     )
 
-    # 3. 在训练数据上拟合scaler
     print(f"\nNormalizing features...")
-    # 统计信息仅用于日志，实际列选择在自定义scaler内部完成
     print(f"Applying Z-score (masked) to ~{len(zscore_cols)} columns (prefix based, excluding *_missing & tof_).")
     print(f"Applying Min-Max to TOF columns (unchanged from previous training).")
     scaler.fit(X_train)
 
-    # 4. 使用已拟合的scaler转换训练集和验证集
     X_train_transformed_np = scaler.transform(X_train).astype(np.float32)
     X_val_transformed_np = scaler.transform(X_val).astype(np.float32)
 
-    # 5. 获取列名并重建DataFrame（顺序保持不变）
     feature_names = scaler.get_feature_names_out()
     X_train_normalized = pd.DataFrame(X_train_transformed_np, index=X_train.index, columns=feature_names)
     X_val_normalized = pd.DataFrame(X_val_transformed_np, index=X_val.index, columns=feature_names)
     
     return X_train_normalized, X_val_normalized, scaler
 
-# --- NEW: Function to prepare base data (for hyperparameter search) ---
 def prepare_base_data_kfold(variant: str = "full", n_splits: int = 5):
     """
-    加载并预处理所有时域和静态数据，进行特征工程，标准化，并按K-Fold分割。
-    此函数 *不* 生成频谱图，为超参数搜索优化。
+    Prepare K-fold splits without spectrograms.
+
+    Hyperparameter search reuses this output so expensive loading, interpolation,
+    and feature engineering do not have to run for every spectrogram setting.
     """
-    # 1. 加载并进行基础预处理 (包括特征工程)
     start_time = time.time()
     all_data_df, label_encoder, all_feature_cols = load_and_preprocess_data(variant)
     print(f"Base data loading and FE took {time.time() - start_time:.2f} seconds.")
 
-    # 2. 准备分层分组K折交叉验证
     labels_map_df = all_data_df[["sequence_id", "gesture_encoded", "subject"]].drop_duplicates().reset_index(drop=True)
     y = labels_map_df["gesture_encoded"].values
     subjects = labels_map_df["subject"].values
@@ -868,7 +829,6 @@ def prepare_base_data_kfold(variant: str = "full", n_splits: int = 5):
         y_train = labels_map_df[labels_map_df["sequence_id"].isin(train_sids)]["gesture_encoded"].values
         y_val = labels_map_df[labels_map_df["sequence_id"].isin(val_sids)]["gesture_encoded"].values
 
-        # 3. 标准化时域特征
         X_train_norm, X_val_norm, scaler_fold = normalize_features(train_df[all_feature_cols], val_df[all_feature_cols])
         # Add sequence_id back for grouping
         X_train_norm["sequence_id"] = train_df["sequence_id"]
@@ -889,11 +849,13 @@ def prepare_base_data_kfold(variant: str = "full", n_splits: int = 5):
     print("\n✅ Base K-fold data prepared.")
     return base_fold_data, label_encoder, y, unique_seq_ids
 
-# --- NEW: Function to generate and attach spectrograms ---
 def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"):
     """
-    接收基础K-Fold数据和频谱图参数，生成频谱图并将其附加到每个折叠中。
-    [REVERTED] 恢复了原始的数据处理策略。
+    Generate spectrogram tensors and attach them to each prebuilt fold.
+
+    This stage is separated from ``prepare_base_data_kfold`` so hyperparameter
+    search can sweep spectrogram settings without repeating the full tabular
+    preprocessing pipeline.
     """
     print(f"\nGenerating and attaching spectrograms with params: {spec_params}")
     fs = spec_params['fs']
@@ -901,7 +863,6 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
     noverlap = spec_params['noverlap']
     max_length = spec_params['max_length']
 
-    # 动态识别各模态的列名
     sample_fold = base_fold_data[0]
     all_feature_cols = sample_fold['all_feature_cols']
     
@@ -924,7 +885,6 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
         train_sids = base_fold['train_sids']
         val_sids = base_fold['val_sids']
 
-        # 1. 计算该折叠训练集的全局频谱图统计量
         print("Calculating global spectrogram statistics...")
         groups = [group for _, group in X_train_norm.groupby('sequence_id')]
         results = Parallel(n_jobs=-1)(delayed(process_and_get_stats)(group, spec_params, max_length) for group in groups)
@@ -938,8 +898,6 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
         print(f"  Global Spec Mean: {global_spec_mean:.4f}, Global Spec Std: {global_spec_std:.4f}")
         spec_stats = {'mean': global_spec_mean, 'std': global_spec_std}
 
-        # 2. 分离多模态数据, padding时域数据, 并生成频谱图
-        # --- 处理训练集 ---
         grouped_train = X_train_norm.groupby('sequence_id')
         train_static_list, train_imu_list, train_thm_list, train_tof_list, train_spec_list = [], [], [], [], []
         train_tof_channel_masks = []  # (num_sequences, num_sensors)
@@ -948,15 +906,14 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
             group = grouped_train.get_group(sid)
             train_static_list.append(group[static_cols].iloc[0].values)
             train_imu_list.append(group[imu_cols].values)
-            train_thm_list.append(group[thm_cols].values) # [REVERTED]
-            train_tof_list.append(group[tof_cols].values) # [REVERTED]
-            # --- Build per-sequence TOF channel mask from tof_{sid}_missing (1=missing -> mask=0) ---
+            train_thm_list.append(group[thm_cols].values)
+            train_tof_list.append(group[tof_cols].values)
+            # Derive per-sequence ToF channel masks from the missingness flags.
             tof_sensor_ids = get_sensor_config(all_feature_cols)['tof_sensor_ids']
             ch_mask = []
             for tof_sid in tof_sensor_ids:
                 flag_col = f"tof_{tof_sid}_missing"
                 if flag_col in group.columns:
-                    # 同一序列内该列恒定，取第一行即可
                     valid = 1.0 - float(group[flag_col].iloc[0])
                 else:
                     valid = 1.0
@@ -972,14 +929,13 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
                 sequence_spectrograms.append(spec)
             train_spec_list.append(np.stack(sequence_spectrograms, axis=0))
 
-        # --- [REVERTED] 恢复到原始的直接padding逻辑 ---
         X_train_static = np.array(train_static_list, dtype=np.float32)
         X_train_imu, train_mask = pad_sequences(train_imu_list, max_length=max_length)
         X_train_thm, _ = pad_sequences(train_thm_list, max_length=max_length)
         X_train_tof, _ = pad_sequences(train_tof_list, max_length=max_length)
         X_train_spec = np.array(train_spec_list, dtype=np.float32)
         X_train_tof_channel_mask = np.stack(train_tof_channel_masks, axis=0).astype(np.float32) if len(train_tof_channel_masks) > 0 else None
-        # --- Build THM per-sensor channel masks (1=valid, 0=missing) ---
+        # Derive THM channel masks from sequence-level missingness flags.
         thm_sensor_ids = get_sensor_config(all_feature_cols)['thm_sensor_ids']
         train_thm_channel_masks = []
         for sid in train_sids:
@@ -994,14 +950,13 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
                 ch_mask.append(valid)
             train_thm_channel_masks.append(np.array(ch_mask, dtype=np.float32))
         X_train_thm_channel_mask = np.stack(train_thm_channel_masks, axis=0).astype(np.float32) if len(train_thm_channel_masks) > 0 else None
-        # --- Build IMU per-channel mask for rot_* only (1=valid, 0=missing when rot_missing==1) ---
+        # Only quaternion channels participate in IMU channel masking.
         imu_feature_names = [c for c in imu_cols]
         rot_fields = ['rot_w','rot_x','rot_y','rot_z']
         imu_rot_indices = [i for i, c in enumerate(imu_feature_names) if c in rot_fields]
         train_imu_channel_masks = []
         for sid in train_sids:
             group = grouped_train.get_group(sid)
-            # default all ones
             ch_mask = np.ones((len(imu_feature_names),), dtype=np.float32)
             if 'rot_missing' in group.columns and float(group['rot_missing'].iloc[0]) == 1.0:
                 for idx in imu_rot_indices:
@@ -1010,7 +965,6 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
         X_train_imu_channel_mask = np.stack(train_imu_channel_masks, axis=0).astype(np.float32)
 
 
-        # --- 处理验证集 ---
         grouped_val = X_val_norm.groupby('sequence_id')
         val_static_list, val_imu_list, val_thm_list, val_tof_list, val_spec_list = [], [], [], [], []
         val_tof_channel_masks = []
@@ -1019,9 +973,9 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
             group = grouped_val.get_group(sid)
             val_static_list.append(group[static_cols].iloc[0].values)
             val_imu_list.append(group[imu_cols].values)
-            val_thm_list.append(group[thm_cols].values) # [REVERTED]
-            val_tof_list.append(group[tof_cols].values) # [REVERTED]
-            # --- Build per-sequence TOF channel mask for validation ---
+            val_thm_list.append(group[thm_cols].values)
+            val_tof_list.append(group[tof_cols].values)
+            # Rebuild validation masks with the same sequence-level rule.
             tof_sensor_ids = get_sensor_config(all_feature_cols)['tof_sensor_ids']
             ch_mask = []
             for tof_sid in tof_sensor_ids:
@@ -1042,7 +996,6 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
                 sequence_spectrograms.append(spec)
             val_spec_list.append(np.stack(sequence_spectrograms, axis=0))
 
-        # --- [REVERTED] 恢复到原始的直接padding逻辑 ---
         X_val_static = np.array(val_static_list, dtype=np.float32)
         X_val_imu, val_mask = pad_sequences(val_imu_list, max_length=max_length)
         X_val_thm, _ = pad_sequences(val_thm_list, max_length=max_length)
@@ -1074,7 +1027,6 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
             val_imu_channel_masks.append(ch_mask)
         X_val_imu_channel_mask = np.stack(val_imu_channel_masks, axis=0).astype(np.float32)
 
-        # 3. 存储该折的所有数据
         final_fold = {
             'X_train_imu': X_train_imu, 'X_train_thm': X_train_thm, 'X_train_tof': X_train_tof,
             'X_train_spec': X_train_spec, 'X_train_static': X_train_static,
@@ -1096,11 +1048,12 @@ def generate_and_attach_spectrograms(base_fold_data, spec_params, variant="full"
 
     return final_fold_data
 
-# --- MODIFIED: Main data preparation entry point ---
 def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str="full", n_splits: int=5, spec_params: dict = None):
     """
-    为多模态架构准备K-Fold数据的主入口函数。
-    此函数现在协调基础数据的准备和频谱图的生成。
+    Main entry point for multimodal K-fold preparation.
+
+    Base tabular features and spectrogram tensors are split into separate stages
+    so expensive preprocessing can be reused across spectrogram experiments.
     """
     full_start_time = time.time()
     # Strict: require spec_params from config and validate overlap
@@ -1119,13 +1072,11 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
     else:
         raise ValueError("spec_params must include either 'noverlap' or 'noverlap_ratio'.")
     
-    # 2. 准备基础数据 (除频谱图外的所有内容)
     base_fold_data, label_encoder, y, unique_seq_ids = prepare_base_data_kfold(
         variant=variant, 
         n_splits=n_splits
     )
 
-    # 3. 生成频谱图并附加到基础数据中
     fold_data = generate_and_attach_spectrograms(
         base_fold_data, 
         normalized_spec_params, 
@@ -1138,7 +1089,7 @@ def prepare_data_kfold_multimodal(show_stratification: bool=False, variant: str=
 
 if __name__ == "__main__":
     print("Running data preprocessing script...")
-    # 可选择 "full" 或 "imu" 变体进行测试
+    # Switch between "full" and "imu" for local smoke tests.
     VARIANT = "full" 
     MAX_LENGTH = 100 # Define max_length for the test run
     

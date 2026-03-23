@@ -1,10 +1,8 @@
-# ===================================================================
-#   Configuration v2 – IMU-Only (no TOF, with DEMO)
-# ===================================================================
+# Configuration v2: IMU-only model with demographics and spectrogram features.
 
 # --------------------------- Data Settings ---------------------------
 data = dict(
-    variant='imu',  # Fixed: must match data preprocessing logic
+    variant='imu',  # Must stay aligned with the preprocessing and model-selection logic.
     max_length=100,
     batch_size=64,
 )
@@ -15,31 +13,24 @@ model = dict(
     num_classes=18,
     sequence_length=data['max_length'],
 
-    # IMU branch - smaller since IMU-only has less data
     imu_branch_cfg=dict(
         type='CNN1D',
-        input_channels=None,  # will be filled dynamically from data
+        input_channels=None,  # Filled from the prepared dataset.
         sequence_length=data['max_length'],
         filters=[64, 128, 256],
         kernel_sizes=[5, 5, 3],
-        # NEW: Temporal aggregation options
-        temporal_aggregation='global_pool',  # 'global_pool' or 'temporal_encoder'
-        # temporal_mode='lstm',  # 'lstm' or 'transformer' (when using temporal_encoder)
-        # lstm_hidden=128,
-        # lstm_layers=1,
-        # bidirectional=False,
-        # # NEW: ResNet-style residual connections
+        # Global pooling keeps the IMU-only baseline cheaper and easier to tune.
+        temporal_aggregation='global_pool',
         use_residual=True,
-        # NEW: Channel attention (SE)
         use_se=True,
         se_reduction=16
     ),
 
-    # MLP branch blueprint (same as full)
+    # Keep a lightweight side branch for demographics and missingness flags.
     mlp_branch_cfg=dict(
         type='MLP',
-        input_features=None,  # will be filled dynamically from data
-        hidden_dims=[64],           # simpler since less total data
+        input_features=None,  # Filled from the prepared dataset.
+        hidden_dims=[64],
         output_dim=32,
         dropout_rate=0.5
     ),
@@ -51,15 +42,14 @@ model = dict(
         kernel_sizes=[3, 3, 3],
         use_residual=True,
     ),
-    # Explicitly enable Spectrogram branch
+    # Spectrograms add a complementary view when THM and ToF are disabled.
     use_spec=True,
-    # Disable TOF and THM branches entirely for IMU variant
     use_tof=False,
     use_thm=False,
 
-    # Fusion head blueprint - smaller combined feature size
+    # A smaller fusion head is enough once only IMU, spectrogram, and MLP branches remain.
     fusion_head_cfg=dict(
-        type='FusionHead',  # Use default LinearFusionHead
+        type='FusionHead',
         hidden_dims=[256, 128],
         dropout_rates=[0.4, 0.3]
     )
@@ -69,19 +59,16 @@ model = dict(
 training = dict(
     epochs=100,
     patience=15,
-    # start_lr is no longer used; learning rates are defined per-layer below
     weight_decay=1e-2,
     use_amp=True, 
     mixup_enabled=False,
     mixup_alpha=0.2,
     loss=dict(type='CrossEntropyLoss'),
 
-    # --- NEW: Learning Rate Scheduler Configuration ---
-    # Choose 'cosine' or 'reduce_on_plateau'
+    # Keep scheduler settings explicit so standalone runs and Optuna share one interface.
     scheduler_cfg=dict(
-        type='cosine',  # Default is cosine annealing
-        warmup_ratio=0.1, # Optional warmup for ReduceLROnPlateau
-        # --- NEW: Specific Learning Rates per Branch ---
+        type='cosine',
+        warmup_ratio=0.1,
         layer_lrs=dict(
             imu=5e-4,
             mlp=1e-3,

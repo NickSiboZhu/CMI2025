@@ -1,13 +1,12 @@
 import torch
 import torch.nn as nn
 
-# Import the refactored CNN classes
 from .cnn1d import CNN1D
 from .cnn2d import TemporalTOF2DCNN
 from .mlp import MLP
-from . import MODELS  # Import registry
+from . import MODELS
 from utils.registry import build_from_cfg
-from . import fusion_head  # Import fusion head module
+from . import fusion_head
 
 
 @MODELS.register_module()
@@ -22,32 +21,24 @@ class MultimodalityModel(nn.Module):
     4. An MLP branch for processing static demographic data.
     """
     def __init__(self,
-                 # --- required configs (strict, no defaults) ---
                  num_classes: int,
                  sequence_length: int,
                  imu_branch_cfg: dict,
                  mlp_branch_cfg: dict,
                  fusion_head_cfg: dict,
-                 # --- modality toggles (required, no defaults) ---
                  use_tof: bool,
                  use_thm: bool,
                  use_spec: bool,
-                 # --- optional branch configs ---
                  tof_branch_cfg: dict = None,
                  thm_branch_cfg: dict = None,
                  spec_branch_cfg: dict = None,
                  ):
         super(MultimodalityModel, self).__init__()
 
-        # Store modality flags
         self.use_tof = use_tof
         self.use_thm = use_thm
-        # --- NEW: Store spectrogram flag ---
         self.use_spec = use_spec
 
-        # ------------------------------------------------------------------
-        # 1. Build 1-D CNN branch for IMU (required)
-        # ------------------------------------------------------------------
         if imu_branch_cfg is None:
             raise ValueError("'imu_branch_cfg' must be provided.")
         imu_cfg = imu_branch_cfg.copy()
@@ -55,9 +46,6 @@ class MultimodalityModel(nn.Module):
         self.imu_branch = build_from_cfg(imu_cfg, MODELS)
         self.imu_output_size = self.imu_branch.cnn_output_size
 
-        # ------------------------------------------------------------------
-        # 2. Build 1-D CNN branch for THM (optional)
-        # ------------------------------------------------------------------
         if self.use_thm:
             if thm_branch_cfg is None:
                 raise ValueError("'thm_branch_cfg' must be provided when 'use_thm' is True.")
@@ -69,7 +57,6 @@ class MultimodalityModel(nn.Module):
             self.thm_branch = None
             self.thm_output_size = 0
 
-        # --- NEW: Build 2D CNN branch for Spectrograms ---
         if self.use_spec:
             if spec_branch_cfg is None:
                 raise ValueError("'spec_branch_cfg' must be provided when 'use_spec' is True.")
@@ -80,12 +67,11 @@ class MultimodalityModel(nn.Module):
             self.spec_branch = None
             self.spec_output_size = 0
             
-        # --- Build 2D CNN branch for TOF ---
         if self.use_tof:
             if tof_branch_cfg is None:
                 raise ValueError("'tof_branch_cfg' must be provided when 'use_tof' is True.")
             tof_cfg = tof_branch_cfg.copy()
-            # Inject shared sequence_length into the sub-config (2D branch expects 'seq_len')
+            # The ToF branch expects ``seq_len`` instead of ``sequence_length``.
             tof_cfg['seq_len'] = sequence_length
             self.tof_branch = build_from_cfg(tof_cfg, MODELS)
             self.tof_2d_output_size = self.tof_branch.out_features
@@ -93,11 +79,9 @@ class MultimodalityModel(nn.Module):
             self.tof_branch = None
             self.tof_2d_output_size = 0
 
-        # --- Build MLP branch ---
         self.mlp_branch = build_from_cfg(mlp_branch_cfg, MODELS)
         self.mlp_output_size = self.mlp_branch.output_dim
 
-        # --- Fusion head ---
         combined_feature_size = (
             self.imu_output_size +
             (self.thm_output_size if self.use_thm else 0) +
@@ -106,7 +90,6 @@ class MultimodalityModel(nn.Module):
             self.mlp_output_size
         )
 
-        # The 'type' must be explicitly defined in the config; no fallback.
         fusion_cfg = fusion_head_cfg.copy()
         fusion_head_cfg['num_classes'] = num_classes
         fusion_head_cfg['input_dim'] = combined_feature_size
@@ -119,11 +102,10 @@ class MultimodalityModel(nn.Module):
         print(f"  MLP: {self.mlp_output_size}")
         print(f"  Total combined features: {combined_feature_size}")
 
-        # For advanced fusion heads, collect and pass branch dimensions
-        fusion_type = fusion_head_cfg['type']  # Strict: will raise KeyError if not present
+        fusion_type = fusion_head_cfg['type']
         if fusion_type in ['BilinearFusionHead', 'AttentionFusionHead', 'TransformerFusionHead']:
             branch_dims = []
-            # The order must match concatenation in forward: IMU, THM?, SPEC?, TOF?, MLP
+            # Branch order must match the concatenation order used in ``forward``.
             branch_dims.append(self.imu_output_size)
             if self.use_thm:
                 branch_dims.append(self.thm_output_size)
@@ -138,7 +120,6 @@ class MultimodalityModel(nn.Module):
         fusion_cfg['input_dim'] = combined_feature_size
         self.classifier_head = build_from_cfg(fusion_cfg, MODELS)
 
-    # --- MODIFIED: Updated forward pass signature ---
     def forward(self, imu_input: torch.Tensor, thm_input: torch.Tensor, 
                 tof_input: torch.Tensor, spec_input: torch.Tensor, 
                 static_input: torch.Tensor, mask: torch.Tensor = None,
@@ -148,20 +129,15 @@ class MultimodalityModel(nn.Module):
         """
         Defines the forward pass logic of the hybrid multimodal fusion model.
         """
-        # 1. Process 1D time-domain data
         imu_features = self.imu_branch(imu_input, mask=mask, channel_mask=imu_channel_mask)
         thm_features = self.thm_branch(thm_input, mask=mask, channel_mask=thm_channel_mask) if self.use_thm else None
         
-        # 2. Process 2D time-frequency data (Spectrograms)
         spec_features = self.spec_branch(spec_input) if self.use_spec else None
         
-        # 3. Process 2D spatial data (TOF)
         tof_features = self.tof_branch(tof_input, mask=mask, channel_mask=tof_channel_mask) if self.use_tof else None
         
-        # 4. Process static data
         mlp_features = self.mlp_branch(static_input)
         
-        # 5. Concatenate features from all active branches
         features_to_concat = [imu_features]
         if thm_features is not None: features_to_concat.append(thm_features)
         if spec_features is not None: features_to_concat.append(spec_features)
@@ -170,7 +146,6 @@ class MultimodalityModel(nn.Module):
         
         combined_features = torch.cat(features_to_concat, dim=1)
         
-        # 6. Final classification
         output = self.classifier_head(combined_features)
         
         return output

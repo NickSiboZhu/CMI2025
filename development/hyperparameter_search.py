@@ -1,11 +1,13 @@
 # hyperparameter_search.py
 """
-进行超参数搜索。会在本地产生一个db文件记录搜索结果，可在一次搜索后加载其自动搜索。
-它会自动读取配置文件中的 'variant' ('imu' 或 'full')
+Run Optuna hyperparameter search for one training configuration.
+
+The script reads ``variant`` from the selected config file and stores study
+state in a local SQLite database so interrupted searches can be resumed.
 """
 import optuna
 from optuna.samplers import TPESampler
-from optuna.trial import TrialState  # NEW
+from optuna.trial import TrialState
 from optuna.exceptions import TrialPruned
 import torch
 import copy
@@ -39,12 +41,11 @@ class LoggerWriter:
     def flush(self):
         pass
 
-# ----------------- 用户配置 -----------------
-# 脚本将自动从该文件中读取 'variant' 并调整行为
+# User configuration. The script reads ``variant`` from this config file.
 CONFIG_FILE_PATH = r'cmi-submission/configs/multimodality_model_v3_full_config.py'
-# 你想要要运行的试验次数
+# Total number of trials to run.
 N_TRIALS = 500
-# 初始随机搜索的次数
+# Number of startup trials before TPE takes over.
 N_STARTUP_TRIALS = 75
 # Get variant from config to dynamically set paths and study names
 base_cfg = train.load_py_config(CONFIG_FILE_PATH)
@@ -62,7 +63,7 @@ TRIAL_ARTIFACTS_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'trial_artifacts_{variant
 LOG_DIR = os.path.join('logs')  # legacy; not used for per-trial logging
 os.makedirs(TRIAL_ARTIFACTS_DIR, exist_ok=True)
 
-# --- NEW: Top-K & per-trial cache directories ---
+# Top-k and per-trial cache directories.
 TOPK = 10
 TOPK_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'topk_{variant}')
 TRIAL_CACHE_DIR = os.path.join(FINAL_WEIGHTS_DIR, f'trial_cache_{variant}')
@@ -88,7 +89,7 @@ USE_PID_IN_DIR = True
 # Track whether we applied the monkey patch so we can safely restore it later
 MONKEY_PATCH_APPLIED = False
 
-# 需要收集和保存的文件清单（与训练脚本保持一致）
+# Files that define a completed training run and should be cached together.
 FILES_TO_COLLECT = (
     [f'model_fold_{i}_{variant}.pth' for i in range(1, 6)] +
     [f'scaler_fold_{i}_{variant}.pkl' for i in range(1, 6)] +
@@ -106,7 +107,7 @@ def _safe_copy(src_dir, dst_dir, filenames):
             shutil.copy(src, os.path.join(dst_dir, filename))
 
 def stash_current_trial_artifacts(trial):
-    """NEW: 把当前 trial 的产物从其专属输出目录复制到专属缓存目录"""
+    """Copy the current trial artifacts into its dedicated cache directory."""
     src_artifact_dir = trial.user_attrs.get('artifact_dir')
     if not src_artifact_dir or not os.path.isdir(src_artifact_dir):
         return
@@ -118,7 +119,7 @@ def stash_current_trial_artifacts(trial):
         cache_dir = os.path.join(TRIAL_CACHE_DIR, f"trial_{trial.number}")
     _safe_copy(src_artifact_dir, cache_dir, FILES_TO_COLLECT)
 
-    # 同步本 trial 的日志与参数快照，便于复现
+    # Keep logs and parameter snapshots next to the cached weights for reproducibility.
     src_log_path = os.path.join(src_artifact_dir, 'train.log')
     if os.path.exists(src_log_path):
         shutil.copy(src_log_path, os.path.join(cache_dir, 'train.log'))
@@ -129,11 +130,11 @@ def stash_current_trial_artifacts(trial):
         with open(os.path.join(cache_dir, 'effective_params.json'), 'w', encoding='utf-8') as f:
             json.dump(eff, f, indent=2)
 
-    # 标记缓存目录供回调和 Top-K 使用
+    # Callbacks read the cached copy, not the live working directory.
     trial.set_user_attr('cache_dir', cache_dir)
 
 def save_top_k_models_callback(k=TOPK):
-    """NEW: 在 weights/topk_<variant>/ 维护分数最高的前 K 个试验完整产物"""
+    """Maintain complete artifacts for the top-k completed trials."""
     def _cb(study: optuna.study.Study, _trial: optuna.trial.FrozenTrial):
         # Serialize Top-K directory updates across worker processes to avoid races
         lock_path = os.path.join(TOPK_DIR, ".lock")
@@ -191,7 +192,7 @@ def save_top_k_models_callback(k=TOPK):
     return _cb
 
 def setup_trial_logger(trial: optuna.trial.Trial) -> logging.Logger:
-    """为每个 Trial 创建独立文件日志记录器，写入其产物目录 train.log。"""
+    """Create a per-trial file logger that writes into the artifact directory."""
     # Make logger name process-unique to avoid cross-process handler reuse
     logger_name = f"optuna.trial.{trial.number}.pid{os.getpid()}"
     logger = logging.getLogger(logger_name)
@@ -233,7 +234,7 @@ def setup_trial_logger(trial: optuna.trial.Trial) -> logging.Logger:
 
 def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
     """
-    Optuna 回调函数，用于在找到新的最佳试验时保存模型文件。
+    Copy the current best trial into ``FINAL_WEIGHTS_DIR``.
     """
     if study.best_trial.number == trial.number:
         print(f"\nNew best trial found: #{trial.number} with score {trial.value:.4f}. Saving models.")
@@ -263,7 +264,7 @@ def save_best_model_callback(study: optuna.study.Study, trial: optuna.trial.Froz
 
 def objective(trial: optuna.trial.Trial) -> float:
     """
-    Optuna 的目标函数（使用 logging 模块的最终版本）。
+    Launch one trial-specific training run and return its OOF score.
     """
     # 1) Ensure per-trial artifact dir and logger
     # Create per-trial artifact dir (optionally with PID suffix)
@@ -274,7 +275,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     os.makedirs(trial_artifacts_dir, exist_ok=True)
     trial.set_user_attr('artifact_dir', trial_artifacts_dir)
 
-    # 让compile结果可以跨fold使用
+    # Reuse the compiled kernels across folds within the same trial.
     inductor_cache_dir = os.path.join(trial_artifacts_dir, f"inductor_cache_pid{os.getpid()}")
     os.makedirs(inductor_cache_dir, exist_ok=True)
     os.environ["TORCHINDUCTOR_CACHE_DIR"] = inductor_cache_dir
@@ -290,7 +291,7 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     # Delayed logging of variant until after it is loaded below to avoid UnboundLocalError
 
-    # 清除dynamo缓存防止模型多次编译占据缓存
+    # Clear Dynamo state between trials to avoid stale compile artifacts.
     torch._dynamo.reset()
     cfg = train.load_py_config(CONFIG_FILE_PATH)
     variant = cfg.data['variant']
@@ -299,14 +300,14 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     # ===================================================================
     #
-    # Part 1: 定义超参数搜索空间
+    # Part 1: define the hyperparameter search space.
     # -----------------------------------------------------------------
-    # `if variant == 'full'` 是安全的，因为它在单个 study 中是恒定的。
-    # 但循环次数等内部依赖仍需扁平化。
+    # ``variant`` is fixed inside a single study, but Optuna still benefits from a
+    # flattened search space when layer counts toggle subordinate parameters.
     #
     # ===================================================================
 
-    # --- 设定动态层数的最大值 ---
+    # Upper bounds for dynamic-depth branches.
     MAX_IMU_LAYERS = 4
     MAX_MLP_LAYERS = 3
     MAX_THM_LAYERS = 4
@@ -314,22 +315,22 @@ def objective(trial: optuna.trial.Trial) -> float:
     MAX_FUSION_LAYERS = 3
     MAX_SPEC_LAYERS = 3
 
-    # --- 1. 定义通用超参数 ---
+    # Shared training hyperparameters.
     cfg.training['epochs'] = trial.suggest_int('epochs', 20, 150)
     cfg.training['patience'] = trial.suggest_int('patience', 10, 30, step=5)
     cfg.training['weight_decay'] = trial.suggest_float('weight_decay', 1e-6, 1e-1, log=True)
     
-    # Mixup (扁平化)
+    # Keep mixup parameters explicit even when disabled so the sampler still sees them.
     cfg.training['mixup_enabled'] = trial.suggest_categorical('mixup_enabled', [True, False])
     mixup_alpha = trial.suggest_float('mixup_alpha', 0.1, 0.5)
     cfg.training['mixup_alpha'] = mixup_alpha if cfg.training['mixup_enabled'] else 0.0
 
-    # Scheduler (扁平化)
+    # Flatten scheduler parameters for the same reason.
     scheduler_type = trial.suggest_categorical('scheduler_type', ['cosine', 'reduce_on_plateau'])
     scheduler_cfg = {'type': scheduler_type}
-    # 统一 warmup_ratio 参数，让采样器学习通用效果
+    # Share warmup_ratio across schedulers so Optuna can learn a transferable prior.
     scheduler_cfg['warmup_ratio'] = trial.suggest_float('warmup_ratio', 0.0, 0.2)
-    # 为 ReduceOnPlateau 定义参数
+    # Extra parameters used only when ReduceLROnPlateau is selected.
     lr_reduce_factor = trial.suggest_float('lr_reduce_factor', 0.2, 0.8, step=0.1)
     lr_patience = trial.suggest_int('lr_patience', 5, 15, step=2)
     min_lr = trial.suggest_float('min_lr', 1e-7, 1e-5, log=True)
@@ -338,14 +339,14 @@ def objective(trial: optuna.trial.Trial) -> float:
         scheduler_cfg['patience'] = lr_patience
         scheduler_cfg['min_lr'] = min_lr
 
-    # 分层学习率
+    # Per-branch learning rates.
     layer_lrs = {}
     layer_lrs['imu'] = trial.suggest_float('lr_imu', 1e-5, 1e-2, log=True)
     layer_lrs['mlp'] = trial.suggest_float('lr_mlp', 1e-5, 1e-2, log=True)
     layer_lrs['fusion'] = trial.suggest_float('lr_fusion', 1e-5, 1e-2, log=True)
     layer_lrs['spec'] = trial.suggest_float('lr_spec', 1e-5, 1e-2, log=True)
     
-    # --- NEW: 搜索 max_length ---
+    # Search the global sequence length directly.
     max_length = trial.suggest_int('max_length', 60, 300, step=20)
     # Propagate sampled value to config data only
     cfg.data['max_length'] = max_length
@@ -368,12 +369,12 @@ def objective(trial: optuna.trial.Trial) -> float:
         # Be permissive: if a key is missing in a variant, skip it
         pass
 
-    # --- NEW: Spectrogram 数据生成超参数 ---
+    # Spectrogram generation hyperparameters.
     spec_params = {}
     spec_params['nperseg'] = trial.suggest_int('spec_nperseg', 16, 64, step=4)
     spec_params['noverlap_ratio'] = trial.suggest_float('spec_noverlap_ratio', 0.5, 0.95)
     spec_params['fs'] = 10.0
-    spec_params['max_length'] = max_length  # 由搜索结果注入
+    spec_params['max_length'] = max_length  # Inject the sampled global length.
 
     _np = int(spec_params['nperseg'])
     _ratio = float(spec_params['noverlap_ratio'])
@@ -382,7 +383,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         raise ValueError(f"Computed noverlap({_no}) must satisfy 0 <= noverlap < nperseg({_np}).")
     spec_params['noverlap'] = _no
 
-    # --- Spectrogram (Spec) 分支架构 ---
+    # Spectrogram branch.
     if 'spec_branch_cfg' in cfg.model:
         num_spec_layers = trial.suggest_int('num_spec_layers', 2, MAX_SPEC_LAYERS)
         spec_filters_all = [trial.suggest_int(f'spec_filter_{i}', 16, 512, step=16) for i in range(MAX_SPEC_LAYERS)]
@@ -391,7 +392,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         cfg.model['spec_branch_cfg']['kernel_sizes'] = spec_kernel_sizes_all[:num_spec_layers]
         cfg.model['spec_branch_cfg']['use_residual'] = trial.suggest_categorical('spec_use_residual', [True, False])
 
-    # IMU 分支 (扁平化)
+    # IMU branch.
     num_imu_layers = trial.suggest_int('num_imu_layers', 2, MAX_IMU_LAYERS)
     imu_filters_all = [trial.suggest_int(f'imu_filter_{i}', 32, 1536, step=16) for i in range(MAX_IMU_LAYERS)]
     imu_kernel_sizes_all = [trial.suggest_int(f"imu_kernel_{i}", 3, 11, step=2) for i in range(MAX_IMU_LAYERS)]
@@ -402,7 +403,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     cfg.model['imu_branch_cfg']['use_se'] = trial.suggest_categorical('imu_use_se', [True, False])
     cfg.model['imu_branch_cfg']['se_reduction'] = trial.suggest_categorical('imu_se_reduction', [8, 16, 32])
 
-    # --- IMU Temporal Aggregation (正确、无条件地定义所有相关参数) ---
+    # Define IMU temporal-aggregation parameters unconditionally to keep the search flat.
     imu_temporal_aggregation = trial.suggest_categorical('imu_temporal_aggregation', ['global_pool', 'temporal_encoder'])
     imu_temporal_mode = trial.suggest_categorical('imu_temporal_mode', ['lstm', 'transformer'])
     imu_lstm_hidden = trial.suggest_int('imu_lstm_hidden', 128, 512, step=64)
@@ -427,19 +428,19 @@ def objective(trial: optuna.trial.Trial) -> float:
             cfg.model['imu_branch_cfg']['ff_dim'] = imu_transformer_ff_dim
             cfg.model['imu_branch_cfg']['dropout'] = imu_transformer_dropout
     
-    # MLP 分支 (扁平化)
+    # MLP branch.
     num_mlp_hidden_layers = trial.suggest_int('num_mlp_hidden_layers', 1, MAX_MLP_LAYERS)
     mlp_hidden_dims_all = [trial.suggest_int(f'mlp_hidden_dim_{i}', 16, 256, step=16) for i in range(MAX_MLP_LAYERS)]
     cfg.model['mlp_branch_cfg']['hidden_dims'] = mlp_hidden_dims_all[:num_mlp_hidden_layers]
     cfg.model['mlp_branch_cfg']['output_dim'] = trial.suggest_int('mlp_output_dim', 16, 128, step=16)
     cfg.model['mlp_branch_cfg']['dropout_rate'] = trial.suggest_float('mlp_dropout_rate', 0.1, 0.5)
 
-    # --- 2. 为 "full" 分支定义额外超参数 ---
+    # Extra hyperparameters for the full multimodal variant.
     if variant == 'full':
         layer_lrs['thm'] = trial.suggest_float('lr_thm', 1e-5, 1e-2, log=True)
         layer_lrs['tof'] = trial.suggest_float('lr_tof', 1e-5, 1e-2, log=True)
         
-        # THM 分支 (扁平化)
+    # THM branch.
         num_thm_layers = trial.suggest_int('num_thm_layers', 1, MAX_THM_LAYERS)
         thm_filters_all = [trial.suggest_int(f'thm_filter_{i}', 16, 512, step=16) for i in range(MAX_THM_LAYERS)]
         thm_kernel_sizes_all = [trial.suggest_categorical(f'thm_kernel_{i}', [3, 5, 7]) for i in range(MAX_THM_LAYERS)]
@@ -454,18 +455,18 @@ def objective(trial: optuna.trial.Trial) -> float:
         thm_temporal_aggregation = trial.suggest_categorical('thm_temporal_aggregation', ['global_pool', 'temporal_encoder'])
         thm_temporal_mode = trial.suggest_categorical('thm_temporal_mode', ['lstm', 'transformer'])
 
-        # THM LSTM 参数
+    # THM LSTM parameters.
         thm_lstm_hidden = trial.suggest_int('thm_lstm_hidden', 64, 256, step=32)
         thm_lstm_layers = trial.suggest_int('thm_lstm_layers', 1, 2)
         thm_bidirectional = trial.suggest_categorical('thm_bidirectional', [True, False])
 
-        # THM Transformer 参数
+    # THM transformer parameters.
         thm_transformer_heads = trial.suggest_categorical('thm_num_heads', [4, 8, 16])
         thm_transformer_layers = trial.suggest_int('thm_num_layers', 1, 2)
         thm_transformer_ff_dim = trial.suggest_int('thm_ff_dim', 256, 1024, step=128)
         thm_transformer_dropout = trial.suggest_float('thm_dropout', 0.1, 0.4)
 
-        # --- 组装 THM 分支配置 ---
+    # Assemble the THM branch config from the sampled values.
         cfg.model['thm_branch_cfg']['temporal_aggregation'] = thm_temporal_aggregation
         if thm_temporal_aggregation == 'temporal_encoder':
             cfg.model['thm_branch_cfg']['temporal_mode'] = thm_temporal_mode
@@ -479,7 +480,7 @@ def objective(trial: optuna.trial.Trial) -> float:
                 cfg.model['thm_branch_cfg']['ff_dim'] = thm_transformer_ff_dim
                 cfg.model['thm_branch_cfg']['dropout'] = thm_transformer_dropout
 
-        # TOF 分支 (扁平化)
+    # ToF branch.
         cfg.model['tof_branch_cfg']['use_residual'] = trial.suggest_categorical('tof_use_residual', [True, False])
         # --- TOF SE hyperparameters ---
         cfg.model['tof_branch_cfg']['use_se'] = trial.suggest_categorical('tof_use_se', [True, False])
@@ -514,7 +515,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         
         tof_channels_assembled = [min(ch, max_ch) for ch in tof_conv_channels_all]
         cfg.model['tof_branch_cfg']['conv_channels'] = tof_channels_assembled[:num_tof_cnn_layers]
-        # TOF Temporal (扁平化)
+    # ToF temporal branch.
         tof_temporal_mode = trial.suggest_categorical('tof_temporal_mode', ['lstm', 'transformer'])
         cfg.model['tof_branch_cfg']['temporal_mode'] = tof_temporal_mode
         
@@ -537,11 +538,11 @@ def objective(trial: optuna.trial.Trial) -> float:
             cfg.model['tof_branch_cfg']['lstm_layers'] = tof_lstm_layers
             cfg.model['tof_branch_cfg']['bidirectional'] = tof_bidirectional
     
-    # 将最终确定的学习率配置赋给 cfg
+    # Push the sampled per-branch learning rates back into the config.
     scheduler_cfg['layer_lrs'] = layer_lrs
     cfg.training['scheduler_cfg'] = scheduler_cfg
-    # --- 3. 定义 Fusion Head ---
-    # 清理旧的或不相关的键
+    # Rebuild the fusion head config from the sampled values.
+    # Drop keys from alternative layouts so downstream code sees one clean schema.
     for key in ['hidden_dims', 'dropout_rates', 'branch_dims', 'embed_dim', 'num_heads', 'depth', 'dropout']:
         if key in cfg.model['fusion_head_cfg']:
             cfg.model['fusion_head_cfg'].pop(key)
@@ -553,7 +554,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     cfg.model['fusion_head_cfg']['hidden_dims'] = fusion_hidden_dims_all[:num_fusion_layers]
     cfg.model['fusion_head_cfg']['dropout_rates'] = fusion_dropout_rates_all[:num_fusion_layers]
 
-    # --- NEW: 仅针对语谱图的增强（SpecAugment）超参数搜索 ---
+    # SpecAugment-only search space.
     spec_augment_prob = trial.suggest_float('spec_augment_prob', 0.0, 1.0)
     freq_mask_param   = trial.suggest_int('freq_mask_param', 2, 10)
     num_freq_masks    = trial.suggest_int('num_freq_masks', 0, 3)
@@ -569,7 +570,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     
     try:
         # ===================================================================
-        #                          4. 运行训练流程
+    # Part 4: run training.
         # ===================================================================
         # log file for this trial is already set up in setup_trial_logger via 'study_log_path'
         # Redirect stdout/stderr to logger to capture print-based outputs from called functions
@@ -731,7 +732,7 @@ def objective(trial: optuna.trial.Trial) -> float:
             'dropout_rates': cfg.model['fusion_head_cfg']['dropout_rates']
         }
 
-        # --- NEW: 记录增强配置 ---
+        # Record the effective augmentation config with the rest of the trial payload.
         effective_params['aug_params'] = aug_params
 
         # Store params and log header
@@ -804,12 +805,12 @@ def objective(trial: optuna.trial.Trial) -> float:
             universal_newlines=True
         )
         # Stream subprocess logs into the per-trial logger
-        oom_detected = False  # NEW
+        oom_detected = False
         for line in proc.stdout:
             txt = line.rstrip('\n')
             logger.info(txt)
             low = txt.lower()
-            # 常见 OOM 关键词（尽量宽松一些）
+            # Match a broad set of OOM signatures emitted by different CUDA stacks.
             if ("cuda out of memory" in low or
                 "cuda error: out of memory" in low or
                 "cublas_status_alloc_failed" in low or
@@ -819,8 +820,8 @@ def objective(trial: optuna.trial.Trial) -> float:
         ret = proc.wait()
         if ret != 0:
             if oom_detected:
-                trial.set_user_attr('oom', True)     # 方便统计
-                # 直接剪枝，不返回数值，避免进入 COMPLETE
+                trial.set_user_attr('oom', True)
+                # Prune immediately so Optuna does not mark the trial as COMPLETE.
                 raise TrialPruned("CUDA OOM during training subprocess")
             else:
                 raise RuntimeError(f"Training subprocess exited with code {ret}")
@@ -867,7 +868,7 @@ def objective(trial: optuna.trial.Trial) -> float:
         except Exception:
             pass
         
-        # 删除compile缓存
+        # Remove the trial-local compile cache on exit.
         if os.path.isdir(inductor_cache_dir):
             shutil.rmtree(inductor_cache_dir, ignore_errors=True)
 
@@ -893,15 +894,16 @@ if __name__ == "__main__":
         print("Base data has been pre-loaded into memory.")
         print("="*60)
 
-        # 保存原始函数以便后续恢复
+        # Save the original function so the monkey patch can be undone in ``finally``.
         original_prepare_data_func = train.prepare_data_kfold_multimodal
 
-        # --- MODIFIED: Create a new monkey-patch function ---
         def mock_prepare_data_kfold_multimodal(*args, **kwargs):
             """
-            猴子补丁函数: 使用预加载的基础数据和当前试验的频谱图参数，
-            动态生成完整的K-Fold数据，避免重复加载和特征工程。
-            仅在不进行全局 max_length 搜索时使用。
+            Generate full fold data from preloaded base folds plus trial-specific
+            spectrogram settings.
+
+            This is only safe when the search does not rebuild the global
+            max_length-dependent tabular preprocessing.
             """
             print("--> Monkey patch activated: Generating spectrograms for new trial...")
             spec_params = kwargs.get('spec_params')
@@ -924,7 +926,7 @@ if __name__ == "__main__":
             print("--> Spectrograms generated. Returning full dataset for trial.")
             return full_fold_data, label_encoder, y_all, sequence_ids_all
 
-        # 应用猴子补丁
+        # Swap in the lightweight spectrogram-only path.
         train.prepare_data_kfold_multimodal = mock_prepare_data_kfold_multimodal
         MONKEY_PATCH_APPLIED = True
         print("Monkey patch applied. `prepare_data_kfold_multimodal` will now use pre-loaded data.")
@@ -940,7 +942,7 @@ if __name__ == "__main__":
             load_if_exists=True,
             sampler=sampler,
         )
-        # 维护 Top-K（新回调）。可选：当前最优（原回调）
+        # Always maintain Top-K artifacts and optionally mirror the single best run.
         # Run trials in parallel across available GPUs using Optuna's n_jobs
         # Set n_jobs to the number of GPUs; Optuna will launch that many worker processes
         n_jobs = torch.cuda.device_count() if torch.cuda.is_available() else 1
@@ -968,16 +970,16 @@ if __name__ == "__main__":
             shutil.rmtree(TRIAL_ARTIFACTS_DIR, ignore_errors=True)
             print(f"\nCleaned up temporary artifacts directory: {TRIAL_ARTIFACTS_DIR}")
 
-        # 清理 trial cache 目录并恢复原始函数
+        # Remove cached trial copies and restore the original data-preparation entry point.
         if os.path.exists(TRIAL_CACHE_DIR):
             shutil.rmtree(TRIAL_CACHE_DIR, ignore_errors=True)
             print(f"Cleaned up temporary cache directory: {TRIAL_CACHE_DIR}")
 
-        # 恢复原始函数（仅当之前应用过猴子补丁）
+        # Only restore if this process actually patched the training module.
         try:
             if MONKEY_PATCH_APPLIED:
                 train.prepare_data_kfold_multimodal = original_prepare_data_func
                 print("\nMonkey patch restored. Original function is back.")
         except NameError:
-            # original_prepare_data_func 未定义时跳过恢复
+            # The preload branch never ran in this process.
             pass

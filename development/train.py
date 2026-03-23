@@ -1,4 +1,3 @@
-# ... (所有 imports 保持不变) ...
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,7 +5,7 @@ from torch.utils.data import DataLoader
 import torch._dynamo
 import multiprocessing as mp
 
-# 加上这行，可以在支持的硬件上提升性能
+# Prefer faster float32 matmul kernels on supported hardware.
 torch.set_float32_matmul_precision('high')
 
 import numpy as np
@@ -37,8 +36,6 @@ def set_seed(seed_value=42):
     print(f"Random seed set to {seed_value}")
 
 
-# --- Helper to load python config file ---
-
 def load_py_config(config_path):
     """Dynamically load a Python config file as a module and return the namespace as an object with attribute access."""
     cfg_dict = runpy.run_path(config_path)
@@ -64,7 +61,6 @@ from utils.focal_loss import FocalLoss
 from utils.registry import build_from_cfg
 from models import MODELS
 
-# --- MODIFIED: Import the new data prep functions ---
 from models.multimodality import MultimodalityModel
 from models.datasets import MultimodalDataset
 from data_utils.data_preprocessing import prepare_data_kfold_multimodal, prepare_base_data_kfold, generate_and_attach_spectrograms
@@ -72,21 +68,19 @@ from data_utils.data_preprocessing import prepare_data_kfold_multimodal, prepare
 # Directory holding all models, scalers, summaries
 WEIGHT_DIR = os.path.join(SUBM_DIR, 'weights')
 os.makedirs(WEIGHT_DIR, exist_ok=True)
-# ... (calculate_composite_weights_18_class 和 competition_metric 保持不变) ...
-
 from models.cnn1d import MaskedBatchNorm1d
 from models.cnn2d import MaskedBatchNorm2d
 
 def build_param_groups(model, base_wd, layer_lrs=None):
-    # 1) 归类需要 no_decay 的模块类型 + 名称关键字
+    # Zero weight decay for normalization layers and positional-style parameters.
     no_decay_mods = (nn.BatchNorm1d, nn.BatchNorm2d, nn.LayerNorm,
                      MaskedBatchNorm1d, MaskedBatchNorm2d)
     no_decay_name_keys = ("bias", "bn.weight", "BatchNorm.weight",
                           "LayerNorm.weight", "layer_norm.weight",
                           "pos_embed", "pos_encoding", "position", "embeddings",
-                          "cls_token", "sensor_gate")  # 视情况保留 sensor_gate
+                          "cls_token", "sensor_gate")
 
-    # 2) 收集 no_decay 参数集合（按对象身份判断）
+    # Compare parameters by object identity so shared modules only land in one set.
     no_decay_params = set()
     for m in model.modules():
         if isinstance(m, no_decay_mods):
@@ -97,7 +91,7 @@ def build_param_groups(model, base_wd, layer_lrs=None):
         if p.requires_grad and any(k in n for k in no_decay_name_keys):
             no_decay_params.add(p)
 
-    # 3) 分支映射（保持你原有的命名）
+    # Keep branch names aligned with the learning-rate config keys.
     branch_map = {
         'imu': model.imu_branch,
         'thm': getattr(model, 'thm_branch', None),
@@ -135,27 +129,22 @@ def calculate_composite_weights_18_class(y_18_class_series: pd.Series,
                                          label_encoder_18_class: LabelEncoder, 
                                          target_gesture_names: list):
     """
-    为18分类模型计算自定义复合权重字典 {class_index: weight}。
+    Compute the competition-shaped class weights for the 18-class model.
     """
-    # 1. 根据新的推导计算类别重要性
-    # BFRB类别的重要性: 0.5*(1/16) + 0.5*(1/9)
+    # These constants mirror the metric's 50/50 mix of binary and macro F1.
     IMP_BFRB = 25 / 288
-    # 单个NON-BFRB类别的重要性: 0.5*(1/20) + 0.5*(1/90)
     IMP_NON_BFRB_INDIVIDUAL = 11 / 360
     
     class_counts = y_18_class_series.value_counts()
     
     raw_weights = {}
     for name in label_encoder_18_class.classes_:
-        count = class_counts.get(name, 1)  # 避免除以零
+        count = class_counts.get(name, 1)
         if name in target_gesture_names:
-            # 这是一个BFRB (target) 类别
             raw_weights[name] = IMP_BFRB / count
         else:
-            # 这是一个NON-BFRB (non-target) 类别
             raw_weights[name] = IMP_NON_BFRB_INDIVIDUAL / count
             
-    # 标准化权重 (使平均值为1)
     total_raw_weight = sum(raw_weights.values())
     num_classes = len(raw_weights)
     avg_raw_weight = total_raw_weight / num_classes if num_classes > 0 else 1.0
@@ -163,7 +152,6 @@ def calculate_composite_weights_18_class(y_18_class_series: pd.Series,
     
     normalized_weights = {name: w / avg_raw_weight for name, w in raw_weights.items()}
     
-    # 创建最终的 class_weight 字典 {class_index: weight}
     class_weight_dict = {}
     for idx, name in enumerate(label_encoder_18_class.classes_):
         if name not in normalized_weights:
@@ -173,7 +161,6 @@ def calculate_composite_weights_18_class(y_18_class_series: pd.Series,
 
     return class_weight_dict
 
-# --- NEW: Competition Metric Configuration ---
 # Define BFRB vs Non-BFRB categories based on gesture names rather than indices
 # This is much more robust and maintainable
 BFRB_GESTURES = {
@@ -252,7 +239,7 @@ def competition_metric(y_true, y_pred, label_encoder):
     final_score = (binary_f1 + macro_f1) / 2.0
     return final_score
 
-# --- NEW: helper indices for target/non-target ---
+# Helper indices for target vs. non-target.
 def _get_target_non_target_indices(label_encoder):
     classes = list(label_encoder.classes_)
     tgt_idx = [i for i, g in enumerate(classes) if g in BFRB_GESTURES]
@@ -261,7 +248,7 @@ def _get_target_non_target_indices(label_encoder):
         raise ValueError("Target / Non-target index sets are empty. Check class names against BFRB/NON_BFRB sets.")
     return np.array(tgt_idx, dtype=int), np.array(non_idx, dtype=int)
 
-# --- NEW: prob/logit helpers ---
+# Probability/logit helpers.
 def _p_to_logit(p):
     p = np.clip(p, 1e-12, 1 - 1e-12)
     return np.log(p) - np.log(1 - p)
@@ -274,7 +261,7 @@ def _probs_to_p_target(probs, tgt_idx):
     p_tgt = probs[:, tgt_idx].sum(axis=1)
     return np.clip(p_tgt, 1e-12, 1 - 1e-12)
 
-# --- NEW: 用 NLL 拟合二分类温度（标量 T），在给定 logits(z) 上拟合 ---
+# Fit a scalar temperature on the binary target-vs-rest logit.
 def _fit_temperature_by_grid(z, y_binary, T_min=0.5, T_max=10.0, num=60):
     # z: raw log-odds logits for target (log(p/(1-p))), y_binary in {0,1}
     Ts = np.exp(np.linspace(np.log(T_min), np.log(T_max), num))
@@ -287,18 +274,17 @@ def _fit_temperature_by_grid(z, y_binary, T_min=0.5, T_max=10.0, num=60):
             best_nll, best_T = nll, T
     return float(best_T)
 
-# --- NEW: 阈值搜索（直接最大化你的最终比赛分） ---
+# Search the gate threshold directly against the competition metric.
 def _search_tau(p_cal, probs_18, y_true_idx, label_encoder, tgt_idx, non_idx, fallback_non_name="Drink from bottle/cup"):
-    # 候选阈值用排序后的唯一概率，避免 dense 网格的开销
+    # Unique probabilities are much cheaper than a dense threshold grid.
     cand = np.unique(np.clip(p_cal, 1e-6, 1 - 1e-6))
-    # 加入两端兜底
+    # Include a few safe endpoints.
     cand = np.concatenate([np.array([1e-6, 0.5, 1-1e-6]), cand])
     cand = np.unique(cand)
 
-    # 预计算各样本在 target 内的 argmax（返回原18类索引）
-    # 在 target 区间内选最大概率对应的“原始类别索引”
+    # Keep the winning target class in the original 18-class index space.
     tgt_best_local = tgt_idx[np.argmax(probs_18[:, tgt_idx], axis=1)]
-    # non-target 回退统一映射到这个类别（与 inference 保持一致）
+    # Match the inference-time fallback class used outside the BFRB set.
     all_classes = list(label_encoder.classes_)
     if fallback_non_name not in all_classes:
         raise ValueError(f"Fallback non-target '{fallback_non_name}' not found in label encoder classes.")
@@ -312,16 +298,16 @@ def _search_tau(p_cal, probs_18, y_true_idx, label_encoder, tgt_idx, non_idx, fa
             best_score, best_tau = score, float(tau)
     return best_tau, best_score
 
-# --- NEW: 两半交叉校准（方案B），返回 T*, τ* 与对比报告 ---
+# Two-half cross calibration for temperature and gate threshold.
 def cross_calibrate_T_tau_on_oof(oof_probs, y_true_idx, label_encoder, rng_seed=42):
-    # 1) 组装二分类标签
+    # Collapse the 18-way labels into the target-vs-rest view used by the gate.
     classes = list(label_encoder.classes_)
     y_true_names = np.array(classes, dtype=object)[y_true_idx]
     y_bin = np.array([1 if g in BFRB_GESTURES else 0 for g in y_true_names], dtype=int)
 
     tgt_idx, non_idx = _get_target_non_target_indices(label_encoder)
 
-    # 2) 两半分割（按二分类标签分层，保证正负均衡）
+    # Stratify the split on the binary gate target to keep both halves balanced.
     rng = np.random.RandomState(rng_seed)
     pos_idx = np.where(y_bin == 1)[0]
     neg_idx = np.where(y_bin == 0)[0]
@@ -334,14 +320,14 @@ def cross_calibrate_T_tau_on_oof(oof_probs, y_true_idx, label_encoder, rng_seed=
     def _fit_on(train_idx, eval_idx):
         probs_tr = oof_probs[train_idx]
         probs_ev = oof_probs[eval_idx]
-        y_tr = y_bin[train_idx]; y_ev = y_true_idx[eval_idx]  # 注意：评估要用原 18 类 index
+        y_tr = y_bin[train_idx]; y_ev = y_true_idx[eval_idx]
 
-        # 训练集上得到 z 与 T
+        # Fit temperature on one half.
         p_tgt_tr = _probs_to_p_target(probs_tr, tgt_idx)
         z_tr = _p_to_logit(p_tgt_tr)
         T = _fit_temperature_by_grid(z_tr, y_tr)
 
-        # 评估集上：温度缩放 + 阈值搜索
+        # Apply that temperature to the held-out half, then search the gate.
         p_tgt_ev = _probs_to_p_target(probs_ev, tgt_idx)
         z_ev = _p_to_logit(p_tgt_ev)
         p_cal_ev = _sigmoid(z_ev / T)
@@ -355,21 +341,22 @@ def cross_calibrate_T_tau_on_oof(oof_probs, y_true_idx, label_encoder, rng_seed=
     T_A, tau_A, score_A = _fit_on(A, B)
     T_B, tau_B, score_B = _fit_on(B, A)
 
-    # 聚合参数 → 用中位数更稳健
+    # Median aggregation is more stable than averaging two noisy estimates.
     T_star = float(np.median([T_A, T_B]))
     tau_star = float(np.median([tau_A, tau_B]))
 
-    # 用整份 OOF 复算“校准+门控”后的分数，仅做对比
+    # Re-score the full OOF set only for diagnostics.
     p_tgt_all = _probs_to_p_target(oof_probs, _get_target_non_target_indices(label_encoder)[0])
     z_all = _p_to_logit(p_tgt_all)
     p_cal_all = _sigmoid(z_all / T_star)
 
-    # 复用搜索里的逻辑，重算最终 OOF 分
+    # Reuse the same threshold-search logic on the full OOF set.
     best_tau_all, oof_calibrated_score = _search_tau(
         p_cal_all, oof_probs, y_true_idx, label_encoder,
         *_get_target_non_target_indices(label_encoder)
     )
-    # 我们**不**采用复算出的 best_tau_all（那是在整份 OOF 上选的），只报告它与 tau_star 的接近度
+    # ``best_tau_all`` is optimistic because it is chosen on the full OOF set, so
+    # it is reported only as a diagnostic reference.
     report = {
         "T_half_A": T_A, "tau_half_A": tau_A, "score_half_A": score_A,
         "T_half_B": T_B, "tau_half_B": tau_B, "score_half_B": score_B,
@@ -379,7 +366,7 @@ def cross_calibrate_T_tau_on_oof(oof_probs, y_true_idx, label_encoder, rng_seed=
     }
     return T_star, tau_star, report
 
-# --- NEW: 应用（T*, τ*）做最终门控预测（给 OOF/诊断用）
+# Apply the calibrated temperature and threshold to 18-class probabilities.
 def apply_gate_with_T_tau(probs_18, label_encoder, T_star, tau_star, fallback_non_name="Drink from bottle/cup"):
     tgt_idx, non_idx = _get_target_non_target_indices(label_encoder)
     p_tgt = _probs_to_p_target(probs_18, tgt_idx)
@@ -479,13 +466,11 @@ def setup_device(gpu_id=None, logger=None):
     
     return device
 
-# --- MODIFIED: Function signatures to accept `spec_data` ---
 def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp=True, scheduler=None, mixup_enabled=False, mixup_alpha=0.4):
     model.train() 
     total_loss = 0
     all_preds, all_targets = [], []
     
-    # --- MODIFIED: Unpack spec_data from dataloader ---
     for (imu_data, thm_data, tof_data, spec_data, static_data, mask, tof_ch_mask, thm_ch_mask, imu_ch_mask), target, sample_weights in dataloader:
         imu_data  = imu_data.to(device, non_blocking=True)
         thm_data  = thm_data.to(device, non_blocking=True)
@@ -506,7 +491,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
                 lam = np.random.beta(mixup_alpha, mixup_alpha)
                 rand_index = torch.randperm(imu_data.size(0)).to(device)
                 
-                # --- MODIFIED: Mix spec_data as well ---
                 imu_data = lam * imu_data + (1 - lam) * imu_data[rand_index]
                 thm_data = lam * thm_data + (1 - lam) * thm_data[rand_index]
                 tof_data = lam * tof_data + (1 - lam) * tof_data[rand_index]
@@ -523,7 +507,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
                 target_a, target_b = target, target[rand_index]
                 weights_a, weights_b = sample_weights, sample_weights[rand_index]
 
-                # --- MODIFIED: Pass spec_data to the model ---
                 output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask, tof_channel_mask=tof_ch_mask, thm_channel_mask=thm_ch_mask, imu_channel_mask=imu_ch_mask)
                 
                 loss_a = criterion(output, target_a) * weights_a
@@ -531,7 +514,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scaler, use_amp
                 loss = (lam * loss_a + (1 - lam) * loss_b).mean()
 
             else:
-                # --- MODIFIED: Pass spec_data to the model ---
                 output = model(imu_data, thm_data, tof_data, spec_data, static_data, mask=mask, tof_channel_mask=tof_ch_mask, thm_channel_mask=thm_ch_mask, imu_channel_mask=imu_ch_mask)
                 loss = (criterion(output, target) * sample_weights).mean()
         
@@ -552,11 +534,11 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     model.eval()
     total_loss = 0
     all_preds, all_targets = [], []
-    all_probs = []  # --- NEW
+    # Keep full class probabilities for OOF calibration and diagnostics.
+    all_probs = []
     val_criterion = nn.CrossEntropyLoss().to(device)
     
     with torch.no_grad():
-        # --- MODIFIED: Unpack spec_data and channel masks from dataloader ---
         for (imu_data, thm_data, tof_data, spec_data, static_data, mask, tof_ch_mask, thm_ch_mask, imu_ch_mask), target, _ in dataloader:
             imu_data  = imu_data.to(device, non_blocking=True)
             thm_data  = thm_data.to(device, non_blocking=True)
@@ -575,7 +557,7 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
                 probs = torch.softmax(logits, dim=1)
             
             total_loss += loss.item()
-            all_probs.append(probs.detach().cpu().numpy())  # --- NEW
+            all_probs.append(probs.detach().cpu().numpy())
             preds = logits.argmax(dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_targets.extend(target.cpu().numpy())
@@ -583,11 +565,10 @@ def validate_and_evaluate_epoch(model, dataloader, device, label_encoder, use_am
     avg_loss = total_loss / len(dataloader)
     all_preds = np.array(all_preds)
     all_targets = np.array(all_targets)
-    all_probs = np.concatenate(all_probs, axis=0)  # --- NEW
+    all_probs = np.concatenate(all_probs, axis=0)
     accuracy = 100. * (all_preds == all_targets).mean()
     comp_score = competition_metric(all_targets, all_preds, label_encoder)
     
-    # --- MODIFIED: 返回 probs ---
     return avg_loss, accuracy, comp_score, all_preds, all_targets, all_probs
 
 def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patience=15, weight_decay=1e-2, device='cpu', use_amp=True, variant: str = 'full', fold_tag: str = '', criterion=None, mixup_enabled=False, mixup_alpha=0.4, scheduler_cfg=None, output_dir: str = WEIGHT_DIR, logger=None):
@@ -595,19 +576,18 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
 
-    # --- NEW: Optimizer setup with specific layer learning rates ---
+    # Use per-branch learning rates when the config enables discriminative tuning.
     layer_lrs = scheduler_cfg['layer_lrs'] if scheduler_cfg else None
     
     if layer_lrs:
         print("Using discriminative learning rates per layer.")
         param_groups = []
         
-        # --- MODIFIED: Add 'spec' branch to the map ---
         branch_map = {
             'imu': model.imu_branch,
             'thm': getattr(model, 'thm_branch', None),
             'tof': getattr(model, 'tof_branch', None),
-            'spec': getattr(model, 'spec_branch', None), # NEW
+            'spec': getattr(model, 'spec_branch', None),
             'mlp': model.mlp_branch,
             'fusion': model.classifier_head
         }
@@ -634,19 +614,18 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
     scaler = amp.GradScaler(device=device.type, enabled=use_amp)
     _log(logger, f"Automatic Mixed Precision (AMP): {'Enabled' if scaler.is_enabled() else 'Disabled'}")
 
-    # --- NEW: Dynamic Scheduler Setup ---
+    # Keep scheduler configuration strict so standalone runs and Optuna trials
+    # exercise the same policy surface.
     if scheduler_cfg is None:
         raise ValueError("scheduler_cfg must be provided by config in strict mode.")
     scheduler = None
     if scheduler_cfg['type'] == 'cosine':
         total_training_steps = epochs * len(train_loader)
-        # Warmup_ratio is now required for this scheduler type
         warmup_ratio = scheduler_cfg['warmup_ratio']
         warmup_steps = int(warmup_ratio * total_training_steps)
         scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_training_steps)
         _log(logger, f"Using Cosine Annealing scheduler with warmup ratio: {warmup_ratio} ({warmup_steps} steps).")
     elif scheduler_cfg['type'] == 'reduce_on_plateau':
-        # All parameters are now required for this scheduler type
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='max', # Step on max validation score
@@ -697,23 +676,23 @@ def train_model(model, train_loader, val_loader, label_encoder, epochs=50, patie
 
 
         def _format_lr_info(optimizer):
-            # 没有命名分组时，退化为单LR显示
+            # Fall back to one LR when parameter groups are unnamed.
             first = optimizer.param_groups[0]
             if 'name' not in first:
                 return f"LR: {first['lr']:.6f}"
 
-            # 仅展示 decay 组（隐藏 *_no_decay），并按“分支名”去重
+            # Hide ``*_no_decay`` groups and show one LR per branch.
             visible = {}
             for g in optimizer.param_groups:
                 name = g.get('name')
                 if not name:
                     continue
-                if 'no_decay' in name:   # 关键：隐藏 no_decay
+                if 'no_decay' in name:
                     continue
-                branch = name.rsplit('_', 1)[0]  # 去掉结尾的 "_decay"
-                visible[branch] = g['lr']        # 同一分支只保留一个LR
+                branch = name.rsplit('_', 1)[0]
+                visible[branch] = g['lr']
 
-            if not visible:  # 兜底
+            if not visible:
                 return f"LR: {first['lr']:.6f}"
             return "LRs: " + ", ".join([f"{b}={lr:.2e}" for b, lr in visible.items()])
         lr_info = _format_lr_info(optimizer)
@@ -738,14 +717,12 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     _log(logger, "TRAINING 5 MODELS WITH 5-FOLD CROSS-VALIDATION")
     _log(logger, "="*60)
     
-    # 确保输出目录存在
+    # The search runner can point each trial at a private artifact directory.
     os.makedirs(output_dir, exist_ok=True)
     
-    # 设置设备
     if device is None:
         device = setup_device()
 
-    # --- MODIFIED: Pass spec_params to the data preparation function ---
     fold_data, label_encoder, y_all, sequence_ids_all = prepare_data_kfold_multimodal(
         show_stratification=show_stratification,
         variant=variant,
@@ -758,7 +735,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     oof_probs = np.full((num_samples, num_classes), np.nan, dtype=np.float32)
     fold_assign = np.full(num_samples, -1, dtype=int)
     
-    # 动态注入特征维度
+    # Infer input shapes from the prepared data instead of duplicating them in config.
     sample_imu = fold_data[0]['X_train_imu']
     sample_thm = fold_data[0]['X_train_thm']
     sample_tof = fold_data[0]['X_train_tof']
@@ -782,7 +759,7 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
     fold_models = []
     fold_histories = []
     
-    # 训练每个折叠
+    # Train one model per fold and keep the fold-specific preprocessing artifacts.
     for fold_idx in range(len(fold_data)):
         _log(logger, f"\n" + "="*60)
         _log(logger, f"TRAINING FOLD {fold_idx + 1}/{len(fold_data)}")
@@ -794,7 +771,6 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         y_train_series = pd.Series(label_encoder.inverse_transform(fold['y_train']))
         class_weight_dict = calculate_composite_weights_18_class(y_train_series, label_encoder, list(BFRB_GESTURES))
         
-        # 创建数据集，并传入spec_stats
         train_dataset = MultimodalDataset(
             fold['X_train_imu'], fold['X_train_thm'], fold['X_train_tof'], fold['X_train_spec'],
             fold['X_train_static'], fold['y_train'], mask=fold['train_mask'],
@@ -847,9 +823,10 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction='none') if loss_function == 'focal' else nn.CrossEntropyLoss(reduction='none')
         
         model = model.to(device)
-        # # 编译模型以加快速度
+        # torch.compile remains optional because these dataloaders already hide
+        # much of the host-side latency.
         # try:
-        #     # 最后一个batch不满，数据形状不固定，启用dynamic
+        #     # The last batch can have a different shape, so dynamic compilation may help.
         #     model = torch.compile(model, mode='reduce-overhead', dynamic=False)
         # except Exception as e:
         #     print(f"⚠️  Warning: torch.compile failed with error: {e}. Continuing without compilation.")
@@ -867,25 +844,22 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         )
         
         _log(logger, f"\nEvaluating fold {fold_idx + 1}...")
-        _, _, _, all_preds_val, _, all_probs_val = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)  # --- MODIFIED
+        _, _, _, all_preds_val, _, all_probs_val = validate_and_evaluate_epoch(model, val_loader, device, label_encoder, use_amp)
         oof_preds[fold['val_idx']] = all_preds_val
         oof_probs[fold['val_idx'], :] = all_probs_val
         fold_assign[fold['val_idx']] = fold_idx
         best_val_score = max(history['val_competition_score'])
         
-        # 保存模型
         model_filename = os.path.join(output_dir, f'model_fold_{fold_idx + 1}_{variant}.pth')
         torch.save({'state_dict': model.state_dict(), 'model_cfg': model_cfg}, model_filename)
         _log(logger, f"Model saved as '{model_filename}'")
 
-        # 保存 scaler
         scaler_fold = fold['scaler']
         scaler_filename = os.path.join(output_dir, f'scaler_fold_{fold_idx + 1}_{variant}.pkl')
         with open(scaler_filename, 'wb') as sf:
             pickle.dump(scaler_fold, sf)
         _log(logger, f"Scaler saved as '{scaler_filename}'")
         
-        # 保存该折叠的频谱图统计量 (spec_stats)
         spec_stats_filename = os.path.join(output_dir, f'spec_stats_fold_{fold_idx + 1}_{variant}.pkl')
         with open(spec_stats_filename, 'wb') as f:
             pickle.dump(spec_stats, f)
@@ -903,13 +877,11 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         fold_histories.append(history)
         _log(logger, f"Fold {fold_idx + 1} - Best Val Score: {best_val_score:.4f}")
     
-    # 保存全局标签编码器
     le_filename = os.path.join(output_dir, f'label_encoder_{variant}.pkl')
     with open(le_filename, 'wb') as lf:
         pickle.dump(label_encoder, lf)
     print(f"Label encoder saved as '{le_filename}'")
     
-    # 打印和保存所有折叠的总结
     _log(logger, f"\n" + "="*60 + "\n5-FOLD CROSS-VALIDATION SUMMARY\n" + "="*60)
     best_scores = [result['best_val_score'] for result in fold_results]
     _log(logger, f"Best Validation Scores per Fold: {[f'{score:.4f}' for score in best_scores]}")
@@ -929,7 +901,6 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
         json.dump(summary, f, indent=2)
     _log(logger, f"Summary saved to '{os.path.join(output_dir, f'kfold_summary_{variant}.json')}'")
     
-    # 计算并保存OOF结果
     oof_comp_score = competition_metric(oof_targets, oof_preds, label_encoder)
     _log(logger, f"\n🏆 Overall OOF Competition Score: {oof_comp_score:.4f}")
     oof_df = pd.DataFrame({
@@ -950,18 +921,17 @@ def train_kfold_models(epochs=50, weight_decay=1e-2, batch_size=32, patience=15,
 
     model.to('cpu')
 
-    # 2) 彻底释放引用（optimizer/scheduler/scaler 在 train_model() 里，见下一条）
+    # Drop large references explicitly so long Optuna runs release memory promptly.
     del model
     torch.cuda.empty_cache()
     import gc; gc.collect()
 
-    # 3) 显式销毁 dataloader，确保 persistent_workers 及时退出
+    # Explicitly deleting dataloaders helps persistent workers exit between trials.
     del train_loader, val_loader, train_dataset, val_dataset
     gc.collect()
 
     return oof_comp_score, fold_models, fold_histories, fold_results
 
-# ... (main function remains largely the same, just calling the modified functions) ...
 def main():
     """Main training function - config file required"""
     parser = argparse.ArgumentParser(description="Gesture Recognition Training (Config Required)")
@@ -974,7 +944,6 @@ def main():
     print(f"Loading config from: {args.config}")
     cfg = load_py_config(args.config)
     
-    # --- NEW: Set seed for reproducibility ---
     # Will raise KeyError if 'seed' is missing from config
     set_seed(cfg.environment['seed'])
     
@@ -1041,16 +1010,15 @@ def main():
     print(f"  Mixup Enabled: {mixup_enabled}")
     if mixup_enabled:
         print(f"  Mixup Alpha: {mixup_alpha}")
-    print(f"  Loss Function: {loss_type}") # Use the name from config
+    print(f"  Loss Function: {loss_type}")
     if loss_function == 'focal':
         print(f"  Focal Gamma: {focal_gamma}")
         print(f"  Focal Alpha: {focal_alpha}")
     print(f"  GPU ID: {gpu_id}")
-    # --- NEW: Print scheduler config ---
     print(f"  Scheduler Config: {scheduler_cfg}")
     print(f"  Spec Params: nperseg={spec_params['nperseg']}, noverlap={spec_params['noverlap']}")
     
-    # Print layer-specific learning rates if configured
+    # Mirror the effective branch-wise rates in the startup log for reproducibility.
     layer_lrs = scheduler_cfg['layer_lrs'] if 'layer_lrs' in scheduler_cfg else None
     if layer_lrs is not None:
         print(f"  Layer-Specific Learning Rates:")

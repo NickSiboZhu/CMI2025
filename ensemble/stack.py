@@ -1,13 +1,13 @@
 # stack.py
 # ------------------------------------------------------------
 # v4: Group-aware Prefit Calibration + Composite Class Weights + Subject-Grouped Stacking
-#  - 固定 schema：train.csv 必含 ['sequence_id','subject']
-#  - 每个 OOF CSV 必含 ['sequence_id','gesture_true', <各类别概率列>]
-#  - 二阶段：GroupKFold(groups=subject) 防泄漏
-#  - 元模型：'ridge'|'logistic'|'rf'|'lgbm'|'catboost'|'xgb'
-#  - Ridge 默认开启“组感知 prefit”概率校准（不与外层验证折交叉），关闭有风险的 cv=3 校准
-#  - 不做 logits、不做线性特征标准化（你已验证更优）
-#  - 导出：meta_model.pkl + meta_info.json；可选保存二阶段 OOF 概率
+#  - Fixed schema: train.csv must contain ['sequence_id', 'subject'].
+#  - Every OOF CSV must contain ['sequence_id', 'gesture_true', <class probability columns>].
+#  - Stage two uses GroupKFold(groups=subject) to prevent subject leakage.
+#  - Supported meta-models: 'ridge', 'logistic', 'rf', 'lgbm', 'catboost', 'xgb'.
+#  - Ridge supports group-aware prefit calibration as a safer alternative to cv=3 calibration.
+#  - Logits and linear-feature scaling stay off by default because they underperformed here.
+#  - Exports meta_model.pkl + meta_info.json, with optional second-stage OOF probabilities.
 # ------------------------------------------------------------
 
 import os
@@ -41,40 +41,40 @@ except Exception:
     CatBoostClassifier = None
 
 # ============================================================
-# 0) 配置：直接在这里改
+# Configuration
 # ============================================================
 CONFIG = {
-    "INPUT_DIR": "",             # 放多个 OOF 概率CSV的目录（每个文件含: sequence_id, gesture_true, 各类别列）
-    "TRAIN_CSV": "",       # 训练数据（至少含 sequence_id 与 subject 列）
-    "SUBJECT_COL": "subject",         # 固定：subject 列名
-    "STRICT_SUBJECT_MATCH": True,     # True: 若有 sequence_id 找不到 subject -> 报错
+    "INPUT_DIR": "",             # Directory holding the base-model OOF probability CSVs.
+    "TRAIN_CSV": "",             # Training metadata with at least sequence_id and subject.
+    "SUBJECT_COL": "subject",    # Subject column used to build GroupKFold splits.
+    "STRICT_SUBJECT_MATCH": True,     # Error if any sequence_id cannot be matched back to a subject.
 
     # Stacking / features
     "META_MODEL": "ridge",            # 'ridge'|'logistic'|'rf'|'lgbm'|'catboost'|'xgb'
-    "N_SPLITS": 5,                    # GroupKFold 折数（自动截断到 <= 唯一 subject 数）
-    "USE_LOGITS": False,              # ✅ 不使用 logit（你已验证更佳）
-    "SCALE_LINEAR": False,            # ✅ 不标准化线性特征（你已验证更佳）
+    "N_SPLITS": 5,                    # GroupKFold splits, capped by the number of unique subjects.
+    "USE_LOGITS": False,              # Disabled because raw probabilities worked better here.
+    "SCALE_LINEAR": False,            # Disabled because linear scaling hurt the public score.
     "RANDOM_STATE": 42,
 
-    # —— 概率校准策略（仅对 ridge 生效）
-    "RIDGE_CALIBRATE": False,         # ⚠️ 有轻微乐观风险（折内非组感知 KFold），默认关闭
-    "RIDGE_CALIBRATE_PREFIT": False,   # ✅ 外层折内“组感知 prefit”校准（零泄漏）
-    "CALIBRATION_METHOD": "sigmoid",  # 'sigmoid' 或 'isotonic'
-    "CALIBRATION_HOLDOUT": 0.2,       # 外层训练折里抽 20% 做校准（按 subject）
+    # Calibration options. Only the ridge path uses them.
+    "RIDGE_CALIBRATE": False,         # Uses non-group-aware inner CV and is slightly optimistic.
+    "RIDGE_CALIBRATE_PREFIT": False,  # Splits calibration holdout by subject inside each outer fold.
+    "CALIBRATION_METHOD": "sigmoid",  # 'sigmoid' or 'isotonic'
+    "CALIBRATION_HOLDOUT": 0.2,       # Fraction of each outer-train fold reserved for calibration.
 
-    # —— 18类复合权重开关
+    # Competition-shaped class weighting.
     "USE_COMPOSITE_CLASS_WEIGHTS": True,
 
-    # 模型超参（可按需改）
+    # Meta-model hyperparameters.
     "PARAMS": {
         "ridge": {
-            "alpha": 11,             # ⬅ 主要调这个（建议小网格：0.1/0.3/1/3/10）
+            "alpha": 11,             # Primary ridge knob; a small log grid usually suffices.
             "fit_intercept": True,
-            "solver": "auto",         # 可试 'lbfgs'/'saga'（视 sklearn 版本）
+            "solver": "auto",         # Try 'lbfgs' or 'saga' if your sklearn build supports them.
             "tol": 1e-4,
             "max_iter": None,
             "positive": False,
-            "class_weight": None,     # 使用 sample_weight，通常不再设 class_weight
+            "class_weight": None,     # Sample weights already encode the competition weighting.
         },
         "logistic": {"C": 1.0, "max_iter": 1000, "solver": "lbfgs", "multi_class": "auto"},
         "rf": {"n_estimators": 500, "max_depth": None, "n_jobs": -1, "random_state": 42},
@@ -84,13 +84,13 @@ CONFIG = {
         "catboost": {"iterations": 1200, "learning_rate": 0.05, "depth": 6, "loss_function": "MultiClass", "verbose": False, "random_state": 42},
     },
 
-    # 导出
-    "SAVE_DIR": "./stack_artifacts",          # 导出目录（不存在会自动创建）
-    "SAVE_OOF_STACK_CSV": "./stack_oof.csv",  # 保存二阶段 OOF 概率（可选，设为 None 不保存）
+    # Export paths.
+    "SAVE_DIR": "./stack_artifacts",          # Directory for the trained meta-model artifacts.
+    "SAVE_OOF_STACK_CSV": "./stack_oof.csv",  # Optional second-stage OOF probability dump.
 }
 
 # ============================================================
-# 1) 比赛指标常量
+# Competition metric constants
 # ============================================================
 TARGET_GESTURES = [
     'Forehead - scratch', 'Forehead - pull hairline', 'Neck - scratch',
@@ -106,7 +106,7 @@ def calculate_competition_metric_from_9_classes(
     label_encoder_9_class: LabelEncoder,
     non_target_index: int,
 ):
-    """0.5 * binary_f1 + 0.5 * macro_f1（仅对出现过的标签）"""
+    """Return ``0.5 * binary_f1 + 0.5 * macro_f1`` on the observed labels."""
     present_labels = np.unique(np.concatenate((y_true_9_encoded, y_pred_9_encoded)))
     macro_f1 = f1_score(
         y_true_9_encoded, y_pred_9_encoded,
@@ -122,7 +122,7 @@ def calculate_competition_metric_from_9_classes(
 
 
 # ============================================================
-# 2) 你的“18类复合权重”实现（原样合并）
+# Competition-shaped 18-class weighting
 # ============================================================
 def calculate_composite_weights_18_class(
     y_18_class_series: pd.Series,
@@ -130,7 +130,7 @@ def calculate_composite_weights_18_class(
     target_gesture_names: List[str],
 ) -> Dict[int, float]:
     """
-    为18分类模型计算自定义复合权重字典 {class_index: weight}。
+    Compute the competition-shaped class weights for the 18-class model.
     """
     IMP_BFRB = 25 / 288
     IMP_NON_BFRB_INDIVIDUAL = 11 / 360
@@ -139,7 +139,7 @@ def calculate_composite_weights_18_class(
 
     raw_weights = {}
     for name in label_encoder_18_class.classes_:
-        count = class_counts.get(name, 1)  # 避免除以零
+        count = class_counts.get(name, 1)
         if name in target_gesture_names:
             raw_weights[name] = IMP_BFRB / count
         else:
@@ -160,10 +160,10 @@ def calculate_composite_weights_18_class(
 
 
 # ============================================================
-# 3) 其他工具函数
+# Helper functions
 # ============================================================
 def _safe_normalize_probs(probs: np.ndarray) -> np.ndarray:
-    """按行归一化，NaN/Inf 置换为极小值再归一化"""
+    """Row-normalize probabilities after scrubbing NaN/Inf values."""
     probs = np.nan_to_num(probs, nan=1e-15, posinf=1e-15, neginf=1e-15)
     rs = probs.sum(axis=1, keepdims=True)
     rs[rs == 0] = 1.0
@@ -171,7 +171,7 @@ def _safe_normalize_probs(probs: np.ndarray) -> np.ndarray:
 
 
 def _prob_to_logit(p: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """clip 后做 logit 变换"""
+    """Apply a numerically safe logit transform."""
     p = np.clip(p, eps, 1 - eps)
     return np.log(p) - np.log(1 - p)
 
@@ -184,7 +184,7 @@ def _softmax(z: np.ndarray) -> np.ndarray:
 
 def build_feature_matrix(prob_matrices, model_names, class_names_full, use_logits, with_model_name_prefix=True):
     """
-    把 [M x (N,C)] 概率堆成 X:[N, M*C] 的特征矩阵；返回 (X, feature_names)
+    Stack ``M`` probability matrices into a ``[N, M*C]`` feature matrix.
     """
     M = len(prob_matrices)
     N, C = prob_matrices[0].shape
@@ -202,7 +202,7 @@ def build_feature_matrix(prob_matrices, model_names, class_names_full, use_logit
 
 
 def _extract_final_estimator(estimator):
-    """若是 Pipeline，取最后一步；否则原样返回"""
+    """Return the final estimator when the model is wrapped in a Pipeline."""
     if hasattr(estimator, "steps"):  # sklearn Pipeline
         return estimator.steps[-1][1]
     return estimator
@@ -210,14 +210,15 @@ def _extract_final_estimator(estimator):
 
 def _proba_in_full_order(estimator, X, n_classes: int, le_full: LabelEncoder = None):
     """
-    取得 predict_proba 并对齐到 [0..n_classes-1] 的列顺序。
-    - 若 estimator 没有 predict_proba（如未校准的 RidgeClassifier），使用 decision_function -> softmax 近似概率；
-    - 若 classes_ 缺失或列数已匹配，直接返回；
-    - 若 classes_ 存在但不是 [0..C-1]，据此重排或填充。
+    Return probabilities aligned to the full class order ``[0..n_classes-1]``.
+
+    Models without ``predict_proba`` fall back to ``decision_function`` plus a
+    softmax approximation. If ``classes_`` is available, probabilities are
+    reordered into the full class space.
     """
     est_final = _extract_final_estimator(estimator)
 
-    # 1) 先尝试 predict_proba
+    # Prefer native probabilities when the estimator exposes them.
     if hasattr(estimator, "predict_proba"):
         proba_list = estimator.predict_proba(X)
         if isinstance(proba_list, list):
@@ -225,11 +226,11 @@ def _proba_in_full_order(estimator, X, n_classes: int, le_full: LabelEncoder = N
         else:
             proba = np.asarray(proba_list)
     else:
-        # 2) 无 predict_proba：用 decision_function -> softmax 近似
+        # Uncalibrated ridge models still expose decision_function.
         if hasattr(estimator, "decision_function"):
             df = estimator.decision_function(X)
             df = np.asarray(df)
-            if df.ndim == 1:  # 二分类
+            if df.ndim == 1:
                 df = np.stack([-df, df], axis=1)
             proba = _softmax(df)
         else:
@@ -237,15 +238,12 @@ def _proba_in_full_order(estimator, X, n_classes: int, le_full: LabelEncoder = N
 
     proba = _safe_normalize_probs(proba)
 
-    # 列数已匹配
     if proba.shape[1] == n_classes:
         return proba
 
-    # 二分类只有一列 -> 两列
     if proba.shape[1] == 1 and n_classes == 2:
         return _safe_normalize_probs(np.hstack([1 - proba, proba]))
 
-    # 依据 classes_ 重排/填充
     classes = getattr(est_final, "classes_", None)
     if classes is not None:
         classes = np.array(classes)
@@ -265,11 +263,9 @@ def _proba_in_full_order(estimator, X, n_classes: int, le_full: LabelEncoder = N
 
 def make_meta_model(name: str, n_classes: int, cfg: dict):
     """
-    构造元模型：
-    - ridge: RidgeClassifier（可选 CalibratedClassifierCV，见主流程的 prefit 分支）
-    - logistic: LogisticRegression
-    - rf/lgbm/xgb/catboost: 常见树模型
-    线性模型可选标准化（SCALE_LINEAR）。
+    Construct the configured meta-model.
+
+    Linear models can be wrapped in a scaler depending on ``SCALE_LINEAR``.
     """
     name = name.lower()
     scale = cfg["SCALE_LINEAR"]
@@ -358,8 +354,7 @@ def make_meta_model(name: str, n_classes: int, cfg: dict):
 
 def _fit_with_sample_weight(estimator, X, y, sample_weight: np.ndarray = None):
     """
-    统一处理 sample_weight 传递（兼容 Pipeline / 直接模型）。
-    对不支持 sample_weight 的模型，自动回退为无权训练并提示一次。
+    Fit an estimator while handling ``sample_weight`` for both pipelines and raw models.
     """
     if sample_weight is None:
         return estimator.fit(X, y)
@@ -375,10 +370,10 @@ def _fit_with_sample_weight(estimator, X, y, sample_weight: np.ndarray = None):
 
 
 # ============================================================
-# 4) 主流程（固定 schema）
+# Main flow
 # ============================================================
 def main():
-    # 1) 读取 OOF CSV
+    # Read the base-model OOF predictions.
     input_dir = CONFIG["INPUT_DIR"]
     if not os.path.isdir(input_dir):
         raise FileNotFoundError(f"目录不存在：{input_dir}")
@@ -390,7 +385,7 @@ def main():
 
     all_dfs = {f: pd.read_csv(os.path.join(input_dir, f)) for f in csv_files}
 
-    # 2) 对齐 sequence_id
+    # Keep only sequence_ids shared by every base model.
     for name, df in all_dfs.items():
         if "sequence_id" not in df.columns or "gesture_true" not in df.columns:
             raise ValueError(f"文件 {name} 必须包含 'sequence_id' 和 'gesture_true' 列。")
@@ -399,20 +394,20 @@ def main():
         raise ValueError("不同模型的 OOF 文件之间没有共同的 sequence_id。")
     master_df = pd.DataFrame({"sequence_id": common_seq})
 
-    # 3) 确定类别列（以第一份文件为基准的**字典序**）
+    # Freeze class order from the first file so every matrix shares one schema.
     first_df = next(iter(all_dfs.values()))
     class_names_full = sorted([c for c in first_df.columns if c not in ["sequence_id", "gesture_true"]])
     if not class_names_full:
         raise ValueError("未检测到类别概率列。")
     n_classes = len(class_names_full)
 
-    # 4) y_true（编码）
+    # Encode the ground-truth labels in the full class space.
     truth = master_df.merge(first_df[["sequence_id", "gesture_true"]], on="sequence_id", how="left")
     y_true_names_all = truth["gesture_true"].values
     le_full = LabelEncoder().fit(class_names_full)
     y_all = le_full.transform(y_true_names_all)
 
-    # 5) subject 分组（train.csv 固定两列：sequence_id, subject）
+    # Join subject ids so stage-two CV can stay group-aware.
     train = pd.read_csv(CONFIG["TRAIN_CSV"])
     need_cols = {"sequence_id", CONFIG["SUBJECT_COL"]}
     if not need_cols.issubset(train.columns):
@@ -430,13 +425,13 @@ def main():
             merged = merged.loc[~merged["subject"].isna()].copy()
     groups = merged["subject"].astype(str).values
     if len(merged) != len(master_df):
-        # 若做了过滤，需要同步 master_df & y_all
+        # Any dropped sequence_ids must be removed from every derived array.
         master_df = merged[["sequence_id"]].reset_index(drop=True)
         truth = master_df.merge(first_df[["sequence_id", "gesture_true"]], on="sequence_id", how="left")
         y_true_names_all = truth["gesture_true"].values
         y_all = le_full.transform(y_true_names_all)
 
-    # 6) 组装各模型的概率矩阵（对齐 master_df 顺序）
+    # Align each model's probabilities to the shared sequence_id order.
     prob_matrices, model_names = [], []
     for name, df in all_dfs.items():
         dfm = master_df.merge(df, on="sequence_id", how="left")
@@ -450,11 +445,11 @@ def main():
         prob_matrices.append(probs)
         model_names.append(name)
 
-    # 7) 构建 stacking 特征
+    # Build the second-stage feature matrix.
     use_logits = CONFIG["USE_LOGITS"] and CONFIG["META_MODEL"].lower() in ("logistic", "ridge")
     X, feature_cols = build_feature_matrix(prob_matrices, model_names, class_names_full, use_logits, with_model_name_prefix=True)
 
-    # 8) GroupKFold CV：训练元模型并产二阶段 OOF 概率（带复合权重 & 组感知 prefit 校准）
+    # Train the meta-model with subject-grouped CV and collect second-stage OOF probabilities.
     g_unique = np.unique(groups)
     folds = min(max(2, CONFIG["N_SPLITS"]), len(g_unique))
     gkf = GroupKFold(n_splits=folds)
@@ -467,55 +462,50 @@ def main():
     print(f"       RIDGE_CALIBRATE={CONFIG['RIDGE_CALIBRATE']}, RIDGE_CALIBRATE_PREFIT={CONFIG['RIDGE_CALIBRATE_PREFIT']} ({CONFIG['CALIBRATION_METHOD']}, holdout={CONFIG['CALIBRATION_HOLDOUT']})")
 
     for k, (tr_idx, va_idx) in enumerate(gkf.split(X=np.zeros(len(master_df)), y=y_all, groups=groups), 1):
-        # —— 每折：基于训练折的真实“名称标签”计算 18 类复合权重
+        # Compute fold-specific sample weights from the training labels only.
         if CONFIG["USE_COMPOSITE_CLASS_WEIGHTS"]:
-            y_tr_names = y_true_names_all[tr_idx]  # 字符串标签
+            y_tr_names = y_true_names_all[tr_idx]
             class_weight_dict = calculate_composite_weights_18_class(
                 pd.Series(y_tr_names), le_full, TARGET_GESTURES
-            )  # {class_index: weight}
-            # 转成 sample_weight（逐样本，针对 tr_idx）
+            )
             sw_tr = np.array([class_weight_dict[int(c)] for c in y_all[tr_idx]], dtype=float)
         else:
             sw_tr = None
 
         meta_name = CONFIG["META_MODEL"].lower()
 
-        # —— 训练：普通路径 or Ridge 的组感知 prefit 校准
+        # Ridge can optionally reserve a subject-grouped holdout for calibration.
         if meta_name == "ridge" and CONFIG.get("RIDGE_CALIBRATE_PREFIT", False):
-            # 外层训练折里再切一块“校准子集”，按 subject 分组
             gss = GroupShuffleSplit(n_splits=1, test_size=CONFIG.get("CALIBRATION_HOLDOUT", 0.2),
                                     random_state=CONFIG["RANDOM_STATE"])
             inner_tr_rel, calib_rel = next(gss.split(X[tr_idx], y_all[tr_idx], groups=groups[tr_idx]))
             inner_tr_idx = tr_idx[inner_tr_rel]
             calib_idx    = tr_idx[calib_rel]
 
-            # 构建 Ridge（是否标准化由 SCALE_LINEAR 决定）
             ridge_base = make_meta_model("ridge", n_classes, CONFIG)
             _fit_with_sample_weight(ridge_base, X[inner_tr_idx], y_all[inner_tr_idx],
                                     sample_weight=(sw_tr[inner_tr_rel] if sw_tr is not None else None))
 
-            # 用 calib 子集做概率校准（不传 sample_weight，CCV 多数版本忽略）
+            # CalibratedClassifierCV ignores sample_weight in most versions anyway.
             est = CalibratedClassifierCV(ridge_base, method=CONFIG.get("CALIBRATION_METHOD", "sigmoid"), cv="prefit")
             est.fit(X[calib_idx], y_all[calib_idx])
 
         else:
-            # 1) 若启用有风险的折内校准（默认关闭）
+            # Optional inner-fold calibration is slightly optimistic because it is not group-aware.
             if meta_name == "ridge" and CONFIG.get("RIDGE_CALIBRATE", False):
                 base = make_meta_model("ridge", n_classes, CONFIG)
-                # 在外层训练折上先拟合，再折内 KFold 校准（非组感知，有轻微乐观风险）
                 _fit_with_sample_weight(base, X[tr_idx], y_all[tr_idx], sample_weight=sw_tr)
                 est = CalibratedClassifierCV(base, method=CONFIG.get("CALIBRATION_METHOD", "sigmoid"), cv=3)
                 est.fit(X[tr_idx], y_all[tr_idx])
             else:
-                # 2) 常规：不做校准（logistic/rf/lgbm/xgb/catboost 或未开启校准）
                 est = make_meta_model(CONFIG["META_MODEL"], n_classes, CONFIG)
                 _fit_with_sample_weight(est, X[tr_idx], y_all[tr_idx], sample_weight=sw_tr)
 
-        # 验证集概率
+        # Validation-set probabilities for this fold.
         proba = _proba_in_full_order(est, X[va_idx], n_classes, le_full)
         oof_stack[va_idx] = proba
 
-        # 报告：LogLoss + 比赛分
+        # Report both log-loss and the competition score.
         ll = log_loss(y_all[va_idx], proba, labels=np.arange(n_classes))
         y_pred_idx = np.argmax(proba, axis=1)
         y_pred_names = [class_names_full[i] for i in y_pred_idx]
@@ -531,7 +521,7 @@ def main():
         fold_logloss.append(ll)
         fold_scores.append(comp)
 
-    # 9) OOF 总体指标
+    # Aggregate OOF metrics across all folds.
     oof_ll = log_loss(y_all, oof_stack, labels=np.arange(n_classes))
     oof_pred_idx = np.argmax(oof_stack, axis=1)
     oof_pred_names = [class_names_full[i] for i in oof_pred_idx]
@@ -551,7 +541,7 @@ def main():
     print(f"CV Comp     : {np.mean(fold_scores):.6f} ± {np.std(fold_scores):.6f}")
     print("=================================\n")
 
-    # 10) 可选：保存二阶段 OOF 概率
+    # Optionally persist the second-stage OOF probabilities.
     if CONFIG["SAVE_OOF_STACK_CSV"]:
         out = master_df.copy()
         for i, cls in enumerate(class_names_full):
@@ -560,7 +550,7 @@ def main():
         out.to_csv(CONFIG["SAVE_OOF_STACK_CSV"], index=False)
         print(f"[Saved] 二阶段 OOF 已写入 {CONFIG['SAVE_OOF_STACK_CSV']}")
 
-    # 11) 在全量数据上 refit 元模型（用于线上推理）——与 CV 过程一致
+    # Refit the meta-model on the full dataset for offline/competition inference.
     if CONFIG["USE_COMPOSITE_CLASS_WEIGHTS"]:
         class_weight_full = calculate_composite_weights_18_class(
             pd.Series(y_true_names_all_dec), le_full, TARGET_GESTURES
@@ -573,7 +563,7 @@ def main():
     meta_name = CONFIG["META_MODEL"].lower()
 
     if meta_name == "ridge" and CONFIG.get("RIDGE_CALIBRATE_PREFIT", False):
-        # 在全量上也做组感知 prefit 校准（为线上工件）
+        # Reuse the safer subject-grouped prefit calibration path for the final artifact.
         gss = GroupShuffleSplit(n_splits=1, test_size=CONFIG.get("CALIBRATION_HOLDOUT", 0.2),
                                 random_state=CONFIG["RANDOM_STATE"])
         inner_tr_rel, calib_rel = next(gss.split(X, y_all, groups=groups))
@@ -603,7 +593,7 @@ def main():
 
     print("[Info] 元模型已在全量数据上重拟合，用于线上推理。")
 
-    # 12) 导出推理工件
+    # Export inference artifacts.
     os.makedirs(CONFIG["SAVE_DIR"], exist_ok=True)
     model_path = os.path.join(CONFIG["SAVE_DIR"], "meta_model.pkl")
     info_path = os.path.join(CONFIG["SAVE_DIR"], "meta_info.json")
@@ -617,9 +607,8 @@ def main():
 
     meta_info = {
         "meta_model": CONFIG["META_MODEL"],
-        "feature_columns": X.shape[1],  # 占位，实际下面给详细列名
+        "feature_columns": X.shape[1],
     }
-    # 保存完整信息
     meta_info = {
         "meta_model": CONFIG["META_MODEL"],
         "feature_columns": build_feature_matrix(prob_matrices, model_names, class_names_full, use_logits, True)[1],

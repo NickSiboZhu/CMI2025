@@ -1,28 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CMI – Detect Behavior with Sensor Data (Robust Stacking Inference)
-------------------------------------------------------------------
-**安全/健壮版** 推理脚本：
-- 多提交包 + 多基模型 + 严格类名对齐 + 无回退（缺件直接报错）
-- 关键增强：
-  1) scaler.transform 之前**列对齐 + 缺列补位**；之后 **NaN/Inf 总闸清洗**。
-  2) 频谱图计算对**输入/输出**做 NaN/Inf 清洗；缺失通道→零信号。
-  3) stacking 特征 `x_stack` 在喂给 sklearn 前做**最终清洗**。
-  4) 模型输出若出现非有限值，**回退为均匀分布**，防止污染。
+Robust stacking inference for the Kaggle submission package.
 
-目录约定与上一版一致：
-- 多个提交包：/kaggle/input/cmi2025-ensemble/ensemble learning/cmi-submission (0.844), (0.846), (0.849)
-- 每个提交包的 weights 目录中：
-   model_fold1_imu.pth / model_fold2_imu.pth ... （无 full/imu 子文件夹）
-   scaler_fold1_imu.pkl / spec_stats_fold1_imu.pkl / spec_params_fold1_imu.pkl ...
-   👉 文件名统一形如：{tag}_fold{K}_{variant}.{ext}
-- 元模型工件（stacking）：/kaggle/input/cmi-link/stack_artifacts/{imu,full}/{meta_model.pkl, meta_info.json}
-- 基模型类名文件（用于映射到元模型类空间），优先查找（在每个提交包的 weights 下）：
-   label_encoder_{variant}.pkl  或  classes_{variant}.json
-   （若另有 label_map_{variant}.json 也会自动应用）
-
-【注意】脚本不做“回退为平均”的缺件回退；只对**数值异常/缺列**做兜底，确保隐藏集极端样本不再导致 notebook 异常。
+This script is intentionally strict about artifact availability and class-space
+alignment. It only falls back when numerical issues appear at inference time,
+for example by zero-filling missing spectrogram sources or replacing non-finite
+probabilities with a uniform distribution.
 """
 
 import os
@@ -40,11 +24,11 @@ from scipy import signal
 
 warnings.filterwarnings("ignore")
 
-# ------------------ 你的真实路径（按你要求硬编码） ------------------
+# Hard-coded Kaggle paths expected by the published submission bundle.
 PACKS_PARENT_DIR = "/kaggle/input/cmi2025-ensemble/ensemble learning"
 STACK_DIR        = "/kaggle/input/cmi-link/"
 
-# ------------------ 自定义模块 ------------------
+# Project-local imports.
 from models.multimodality import MultimodalityModel
 from data_utils.data_preprocessing import (
     pad_sequences, feature_engineering, STATIC_FEATURE_COLS,
@@ -52,11 +36,10 @@ from data_utils.data_preprocessing import (
 )
 from data_utils.tof_utils import interpolate_tof
 
-# ------------------ 常量 ------------------
 MAP_NON_TARGET = "Drink from bottle/cup"
 VARIANTS       = ["full", "imu"]
 
-# ------------------ 小工具 ------------------
+# Helper utilities.
 def softmax_nd(z: np.ndarray) -> np.ndarray:
     z = z - np.max(z, axis=1, keepdims=True)
     ez = np.exp(z)
@@ -70,7 +53,7 @@ def _ensure(p: str, what: str):
         raise FileNotFoundError(f"缺少 {what}: {p}")
 
 def _list_submission_dirs(root: str) -> Dict[str, str]:
-    """返回 { '0.844': '<root>/cmi-submission (0.844)', ... }"""
+    """Return a leaderboard-tag to submission-directory mapping."""
     dmap = {}
     if not os.path.isdir(root):
         raise FileNotFoundError(f"根路径不存在：{root}")
@@ -82,7 +65,7 @@ def _list_submission_dirs(root: str) -> Dict[str, str]:
         raise FileNotFoundError(f"在 {root} 下未找到任何 cmi-submission (X.XXX) 目录")
     return dmap
 
-# ------------------ 加载元模型（只从 STACK_DIR） ------------------
+# Meta-model loading.
 def _load_meta_for_variant(variant: str):
     mdir = os.path.join(STACK_DIR, "stack_artifacts", variant)
     model_path = os.path.join(mdir, "meta_model.pkl")
@@ -101,7 +84,7 @@ def _load_meta_for_variant(variant: str):
 
 
 def _list_bases_from_meta(meta_info: Dict) -> List[str]:
-    """从 meta_info['feature_columns'] 取基模型前缀（保持顺序去重）"""
+    """Extract unique base-model prefixes from ``meta_info['feature_columns']``."""
     bases = []
     for col in meta_info["feature_columns"]:
         prefix = col.split("::", 1)[0]
@@ -111,7 +94,7 @@ def _list_bases_from_meta(meta_info: Dict) -> List[str]:
         raise ValueError("meta_info['feature_columns'] 为空，无法确定基模型列表")
     return bases
 
-# ------------------ OOF 基模型前缀解析 -> 提交包 + 变体 ------------------
+# Map stacking feature prefixes back to submission packs and variants.
 def _parse_base_key(base_key: str) -> Tuple[str, str]:
     m = re.fullmatch(r"(\d+\.\d{3})_(imu|full)\.csv", base_key)
     if not m:
@@ -130,7 +113,7 @@ def _weights_dir_for_key(base_key: str) -> Tuple[str, str]:
         raise FileNotFoundError(f"权重目录不存在：{wdir}")
     return wdir, pack_root
 
-# ------------------ 基模型类信息（在 weights 根目录，按 variant 区分） ------------------
+# Base-model class metadata lives next to the fold weights.
 def _load_base_classes(weights_dir: str, variant: str) -> List[str]:
     cand = [
         os.path.join(weights_dir, f"label_encoder_{variant}.pkl"),
@@ -171,11 +154,11 @@ def _load_label_map(weights_dir: str, variant: str) -> Dict[str, str]:
             return {str(k): str(v) for k, v in d.items()}
     return {}
 
-# ------------------ 模型加载（按文件名后缀 _{variant} + fold 号） ------------------
+# Load all fold artifacts for one base model.
 def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> List[Tuple]:
     files = os.listdir(weights_dir)
 
-    # 识别可用的 fold 号
+    # Discover whichever fold numbers are present instead of assuming 1..K.
     fold_nums = set()
     pat_model = re.compile(rf"^model_fold_?(\d+)_({variant})\.pth$")
     pat_model2 = re.compile(rf"^model_fold(\d+)_({variant})\.pth$")
@@ -226,7 +209,7 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
         state_dict = ckpt['state_dict']
         model = MultimodalityModel(**model_cfg)
 
-        # 处理 torch.compile 保存的 _orig_mod 前缀
+        # torch.compile checkpoints prefix parameters with ``_orig_mod.``.
         is_compiled = any(key.startswith('_orig_mod.') for key in state_dict.keys())
         if is_compiled:
             from collections import OrderedDict
@@ -234,14 +217,14 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
         model.load_state_dict(state_dict, strict=True)
         model.eval()
 
-        # 推断 seq_len
+        # Recover the expected sequence length from whichever config field exists.
         seq_len = None
         if 'sequence_length' in model_cfg: seq_len = model_cfg['sequence_length']
         elif 'seq_len' in model_cfg:      seq_len = model_cfg['seq_len']
         elif 'tof_branch_cfg' in model_cfg and 'seq_len' in model_cfg['tof_branch_cfg']:
             seq_len = model_cfg['tof_branch_cfg']['seq_len']
 
-        # 校验 spec_params 的 max_length
+        # The saved spectrogram length must agree with the model's sequence length.
         try:
             max_len_from_spec = spec_params.get('max_length', None)
         except Exception:
@@ -252,7 +235,7 @@ def _load_models_from_weights_dir(device, weights_dir: str, variant: str) -> Lis
         folds.append((model, scaler, spec_stats, spec_params, seq_len))
     return folds
 
-# ------------------ 变体判定 & 预处理 ------------------
+# Variant detection and per-sequence preprocessing.
 def _decide_variant(seq_df: "pd.DataFrame") -> str:
     thm_cols = [c for c in seq_df.columns if c.startswith("thm_")]
     tof_cols = [c for c in seq_df.columns if c.startswith("tof_")]
@@ -292,7 +275,7 @@ def preprocess_single_sequence(seq_pl: pl.DataFrame, demog_pl: pl.DataFrame):
     final_features_df = final_features_df[[c for c in feature_cols if c in final_features_df.columns]]
     return variant, final_features_df
 
-# ------------------ 频谱图安全生成（包一层总闸） ------------------
+# Safe spectrogram helpers.
 _BASE_SPEC_ORDER = ['linear_acc_x','linear_acc_y','linear_acc_z','angular_vel_x','angular_vel_y','angular_vel_z']
 
 def _make_zero_spec(seq_len: int, spec_params: dict) -> np.ndarray:
@@ -302,13 +285,13 @@ def _make_zero_spec(seq_len: int, spec_params: dict) -> np.ndarray:
     spec = np.nan_to_num(spec, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     return spec
 
-# ------------------ 单折推理（与训练折一致的 scaler/spec） ------------------
+# Run one fold using the scaler and spectrogram settings saved with that fold.
 def _predict_one_fold(
     fold_entry: Tuple, features_df: pd.DataFrame, device: torch.device
 ) -> np.ndarray:
     model, scaler, spec_stats, spec_params, sequence_length = fold_entry
 
-    # --- 列对齐 + 缺列补位 ---
+    # Align to the training feature order and synthesize missing columns as NaN.
     if hasattr(scaler, 'feature_names_'):
         needed_cols = list(scaler.feature_names_)
         missing_cols = [c for c in needed_cols if c not in features_df.columns]
@@ -317,25 +300,24 @@ def _predict_one_fold(
                 features_df[c] = np.nan
         features_df = features_df[needed_cols]
 
-    # 1) 标准化 + 数值清洗
+    # Sanitize immediately after scaling so every downstream branch sees finite data.
     X_scaled_unpadded = scaler.transform(features_df).astype(np.float32)
     X_scaled_unpadded = np.nan_to_num(X_scaled_unpadded, nan=0.0, posinf=0.0, neginf=0.0)
     scaled_feature_names = scaler.get_feature_names_out().tolist()
 
-    # 2) 列分派
+    # Re-split the flattened frame into the modality groups expected by the model.
     static_cols = [c for c in scaled_feature_names if c in STATIC_FEATURE_COLS or c.endswith('_missing')]
     thm_cols, tof_cols = generate_feature_columns(scaled_feature_names)
     thm_cols = [c for c in thm_cols if c in scaled_feature_names]
     tof_cols = [c for c in tof_cols if c in scaled_feature_names]
     imu_cols = [c for c in scaled_feature_names if c not in static_cols + tof_cols + thm_cols]
 
-    # 频谱源按固定顺序（缺列→零信号）
+    # Keep spectrogram channels in the same fixed order used during training.
     spec_source_cols = [c for c in _BASE_SPEC_ORDER]
 
     static_idx = [scaled_feature_names.index(c) for c in static_cols]
     static_arr = X_scaled_unpadded[0:1, static_idx]
 
-    # 时域分量
     tof_idx    = [scaled_feature_names.index(c) for c in tof_cols]
     thm_idx    = [scaled_feature_names.index(c) for c in thm_cols]
     imu_idx    = [scaled_feature_names.index(c) for c in imu_cols]
@@ -346,7 +328,7 @@ def _predict_one_fold(
         X_scaled_unpadded[:, imu_idx] if len(imu_idx) else np.zeros((X_scaled_unpadded.shape[0], 0), dtype=np.float32),
     )
 
-    # TOF mask（按传感器）
+    # ToF masking is sensor-level, not pixel-level, so one flag gates 64 values.
     tof_sensor_ids = []
     for c in scaled_feature_names:
         if c.startswith('tof_') and c.endswith('_missing') and c.count('_') == 2:
@@ -377,16 +359,16 @@ def _predict_one_fold(
         ch_mask_vals.append(valid)
     tof_channel_mask_arr = np.array(ch_mask_vals, dtype=np.float32)[np.newaxis, :] if ch_mask_vals else np.ones((1,0), dtype=np.float32)
 
-    # 3) Padding（严格长度）
+    # Pad to the exact sequence length saved with the fold artifacts.
     X_imu_pad, imu_mask = pad_sequences([imu_arr], max_length=sequence_length)
     X_thm_pad, _        = pad_sequences([thm_arr], max_length=sequence_length)
     X_tof_pad, _        = pad_sequences([tof_arr], max_length=sequence_length)
 
-    # 4) 频谱图（缺列→零信号；输入/输出 NaN→0）
+    # Missing channels become zero signals; any non-finite STFT values are scrubbed.
     sequence_spectrograms = []
     spec_mean, spec_std = spec_stats['mean'], spec_stats['std']
 
-    # 预计算零谱，保证形状
+    # Precompute one zero spectrogram so every missing source uses the same shape.
     zero_spec = _make_zero_spec(sequence_length, spec_params)
 
     for name in spec_source_cols:
@@ -455,7 +437,7 @@ def _predict_one_fold(
     xb_imu_ch_mask = torch.from_numpy(imu_rot_mask).to(DEVICE)
 
     model = model.to(DEVICE)
-    # 6) 前向
+    # Forward pass.
     with torch.no_grad():
         logits = model(
             xb_imu, xb_thm, xb_tof, xb_spec, xb_static,
@@ -466,7 +448,7 @@ def _predict_one_fold(
         )
         probs = torch.softmax(logits, dim=1).cpu().numpy()
 
-    # 数值守护：若出现 NaN/Inf，回退为均匀分布
+    # Never propagate NaN/Inf probabilities into the stacking model.
     if not np.isfinite(probs).all():
         C = probs.shape[1]
         probs = np.full((1, C), 1.0 / C, dtype=np.float32)
@@ -512,7 +494,7 @@ def _map_base_to_meta_proba(
         out = out / s
     return out
 
-# ------------------ 初始化资源（严格，无回退） ------------------
+# Resource initialization stays strict: missing artifacts should fail loudly.
 print("🔧  Initialising inference resources …")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -520,13 +502,13 @@ print(f"Using device: {DEVICE}")
 RESOURCES: Dict[str, Dict] = {}
 META: Dict[str, Dict] = {}  # {variant: {"est":..., "info":...}}
 
-# 1) 加载元模型（仅从 STACK_DIR）
+# Load meta-model artifacts only from STACK_DIR.
 for v in VARIANTS:
     est, meta_info = _load_meta_for_variant(v)
     META[v] = {"est": est, "info": meta_info}
     print(f"✅ [{v}] meta loaded with {len(_list_bases_from_meta(meta_info))} base(s).")
 
-# 2) 根据 meta 决定要加载的所有基模型（跨多个提交包）
+# Meta-info decides which base models to load across submission packs.
 packs = _list_submission_dirs(PACKS_PARENT_DIR)
 
 for v in VARIANTS:
@@ -562,7 +544,7 @@ for v in VARIANTS:
 
 print("✅  Resource initialization complete. Ready for inference.")
 
-# ------------------ 预测（严格 stacking） ------------------
+# Strict stacking prediction.
 
 def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
     res_v = RESOURCES[variant]
@@ -570,7 +552,7 @@ def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.
     meta_info = res_v["meta"]["info"]
     meta_classes = meta_info["class_names_full"]
 
-    # 逐 base（按 meta 的顺序）取概率并映射到元空间
+    # Collect one probability vector per base model in meta-feature order.
     probs_by_base: Dict[str, np.ndarray] = {}
     for col in meta_info["feature_columns"]:
         bk = col.split("::", 1)[0]
@@ -583,7 +565,7 @@ def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.
         p_meta = _map_base_to_meta_proba(p_base, base_entry["base_classes"], meta_classes, base_entry["label_map"])
         probs_by_base[bk] = p_meta
 
-    # 按 feature_columns 拼 stacking 特征
+    # Rebuild the exact stacking feature layout used by the trained meta-model.
     x_stack = np.zeros((1, len(meta_info["feature_columns"])), dtype=np.float32)
     cls_to_idx = {c: i for i, c in enumerate(meta_classes)}
     for j, col in enumerate(meta_info["feature_columns"]):
@@ -593,10 +575,10 @@ def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.
         else:
             x_stack[0, j] = float(probs_by_base[prefix][cls_to_idx[cls]])
 
-    # NEW: stacking 特征最终清洗，确保 sklearn 不吃到 NaN
+    # Final guard before handing features to scikit-learn.
     x_stack = np.nan_to_num(x_stack, nan=1e-6, posinf=1e-6, neginf=1e-6)
 
-    # 元模型输出概率
+    # Meta-model probabilities.
     if hasattr(est, "predict_proba"):
         proba = est.predict_proba(x_stack)
         if isinstance(proba, list):
@@ -612,7 +594,7 @@ def _predict_with_stacking(variant: str, features_df: pd.DataFrame) -> Tuple[np.
 
     proba = _safe_clip01(np.asarray(proba))
     proba = np.nan_to_num(proba, nan=1e-9, posinf=1.0, neginf=0.0)
-    # 归一化
+    # Normalize again to protect against downstream numeric drift.
     s = proba.sum(axis=1, keepdims=True)
     s[s == 0] = 1.0
     proba = proba / s
@@ -632,7 +614,7 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     return pred_name
 
 
-# ------------------ 启动评测服务器 ------------------
+# Launch the Kaggle evaluation server.
 if __name__ == "__main__":
     import kaggle_evaluation.cmi_inference_server as kis
     print("🚀 Starting CMIInferenceServer …")
@@ -640,7 +622,7 @@ if __name__ == "__main__":
     if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         inference_server.serve()
     else:
-        # 本地测试网关
+        # Local testing gateway.
         os.chdir("/kaggle/working")
         inference_server.run_local_gateway(
             data_paths=(

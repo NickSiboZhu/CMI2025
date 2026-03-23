@@ -1,26 +1,22 @@
-# This file is copied from development/data/tof_utils.py so that the submission
-# package is self-contained when uploaded to Kaggle.
+# This file is copied from development/data/tof_utils.py so the submission
+# package remains self-contained on Kaggle.
 
 #!/usr/bin/env python3
-"""Utility functions for 2-D interpolation of the 8×8 TOF sensor grids."""
+"""Utility functions for 2-D interpolation of the 8x8 ToF sensor grids."""
 import numpy as np
 import pandas as pd
 from scipy.interpolate import griddata
 from scipy.spatial import QhullError
 
-"""
-ToF utilities. Dynamic detection is used; no hard-coded defaults required.
-"""
-
-
 def get_tof_columns(df_columns) -> dict:
     """
-    Return a mapping: sensor_id -> list of column names (tof_X_v0 … v63).
-    Requires df_columns so detection is always data-driven.
+    Return a mapping from sensor id to the matching ``tof_<id>_v*`` columns.
+
+    The layout is derived from the dataframe itself so the submission package
+    does not depend on a hard-coded sensor configuration.
     """
     if df_columns is None:
         raise ValueError("df_columns is required for get_tof_columns")
-    # Dynamically detect from actual columns
     from .data_preprocessing import get_sensor_config
     config = get_sensor_config(df_columns)
     sensor_ids = config['tof_sensor_ids']
@@ -33,29 +29,28 @@ def get_tof_columns(df_columns) -> dict:
 
 def _interpolate_block(values: np.ndarray, replacement_value: int = 255) -> np.ndarray:
     """
-    Robustly interpolates a single 8x8 spatial grid. Handles various edge cases.
+    Interpolate one 8x8 sensor frame while guarding sparse and degenerate cases.
     """
     values = values.copy()
     grid = values.astype(float).reshape(8, 8)
 
-    # 替换 -1
+    # Treat the sentinel as a concrete distance before spatial interpolation.
     grid[grid == -1] = replacement_value
     
-    # 如果没有NaN，直接返回
     nan_mask = np.isnan(grid)
     if not np.any(nan_mask):
         return grid.flatten()
 
-    # 如果全部是NaN，也直接返回（让主函数处理）
+    # Defer completely missing frames to the sequence-level fallback.
     if np.all(nan_mask):
-        return values # 返回原始的全NaN数组
+        return values
 
     x, y = np.mgrid[0:8, 0:8]
     valid_points_coords = np.column_stack((x[~nan_mask], y[~nan_mask]))
     valid_points_values = grid[~nan_mask]
     points_to_interpolate = np.column_stack((x[nan_mask], y[nan_mask]))
 
-    # 3D线性插值至少需要3个非共线的点
+    # Linear interpolation needs enough spatial support; otherwise nearest is safer.
     if valid_points_coords.shape[0] < 3:
         method = 'nearest'
     else:
@@ -72,7 +67,7 @@ def _interpolate_block(values: np.ndarray, replacement_value: int = 255) -> np.n
 
     grid[nan_mask] = interpolated_values
     
-    # 最终保险：如果还有NaN，用中位数或替换值填充
+    # Leave no non-finite values behind before the model sees the frame.
     if np.isnan(grid).any():
         grid[np.isnan(grid)] = 128
 
@@ -81,27 +76,23 @@ def _interpolate_block(values: np.ndarray, replacement_value: int = 255) -> np.n
 
 def interpolate_tof(df: pd.DataFrame, replacement_value: int = 255) -> pd.DataFrame:
     """
-    A self-contained, robust function to handle all ToF data interpolation using
-    a two-stage hierarchical strategy: Temporal fill -> Spatial interpolation.
+    Interpolate ToF values in two stages: temporal fill, then per-frame spatial fill.
     """
     print("\nStarting robust ToF interpolation...")
     df_processed = df.copy()
     
-    # Dynamically detect TOF columns from the dataframe
     tof_mapping = get_tof_columns(df.columns) 
     all_tof_cols = [col for sensor_cols in tof_mapping.values() for col in sensor_cols]
 
-    # STAGE 1: Temporal Filling for large gaps (all-NaN blocks)
     if all_tof_cols:
         print("  Stage 1 (Temporal): Applying forward/backward fill to handle large gaps...")
         df_processed = df_processed.sort_values(['sequence_id', 'sequence_counter'])
         df_processed[all_tof_cols] = df_processed.groupby('sequence_id')[all_tof_cols].ffill()
         df_processed[all_tof_cols] = df_processed.groupby('sequence_id')[all_tof_cols].bfill()
-        # 对于整个序列都是NaN的极端情况，填充一个中性值
+        # Use a neutral midpoint when an entire sequence is missing for a sensor.
         df_processed[all_tof_cols] = df_processed[all_tof_cols].fillna(128)
 
 
-    # STAGE 2: Spatial Interpolation for scattered NaNs
     print("  Stage 2 (Spatial): Applying 2D interpolation for scattered NaNs...")
     for sensor_id, cols in tof_mapping.items():
         sensor_data_block = df_processed[cols].to_numpy()
@@ -112,5 +103,5 @@ def interpolate_tof(df: pd.DataFrame, replacement_value: int = 255) -> pd.DataFr
             
         df_processed[cols] = processed_block
 
-    print("✅ Robust ToF Interpolation complete.")
+    print("Robust ToF interpolation complete.")
     return df_processed

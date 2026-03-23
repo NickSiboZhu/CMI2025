@@ -1,5 +1,3 @@
-# 文件路径: development/utils/scheduler.py
-
 import math
 from torch.optim.optimizer import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, ReduceLROnPlateau
